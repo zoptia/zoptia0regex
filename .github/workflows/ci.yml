@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Check formatting
+        run: zig fmt --check src/*.zig build.zig
+
+      - name: Build
+        run: zig build
+
+      - name: Unit & behaviour tests
+        run: zig build test
+
+      # The differential corpora are committed, so this runs without a Go
+      # toolchain — it replays ~30k cases recorded from Go and asserts the
+      # results are byte-for-byte identical (and leak-free).
+      - name: Differential tests vs Go
+        run: zig build difftest
