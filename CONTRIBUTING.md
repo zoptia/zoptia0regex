@@ -52,5 +52,5 @@ This rewrites `src/fold_table.zig`, `src/unicode_tables.zig`, and the
 
 Optimizations that don't change results (e.g. the alternation `factor()` pass)
 and a wider `\p{...}` table set are welcome. New *semantics* should first be
-shown to match Go (or explicitly documented as a deviation in the README scope
-table).
+shown to match Go (or explicitly documented as a deviation in the
+"Scope" section of [docs/usage.md](docs/usage.md)).
