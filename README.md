@@ -37,7 +37,7 @@ stages, and this port keeps the same stages in the same files:
 | 1. Parse | `syntax/parse.go` | `src/parse.zig` | Pattern string → AST, via a stack machine. |
 | 2. Simplify | `syntax/simplify.go` | `src/simplify.zig` | Rewrite counted repetition `x{n,m}` into `*`/`+`/`?`/concat. |
 | 3. Compile | `syntax/compile.go` + `prog.go` | `src/compile.zig` + `src/prog.zig` | AST → `Prog`, a flat list of NFA instructions. |
-| 4. Execute | `exec.go` | `src/exec.zig` | Pike VM: simulate the NFA with submatch tracking. |
+| 4. Execute | `exec.go` + `backtrack.go` | `src/exec.zig` | Pike VM + bitstate backtracker; submatch tracking, prefix accel. |
 | Public API | `regexp.go` | `src/regexp.zig` | `compile`, `find*`, `replace*`, `split`, `expand`. |
 | Unicode | `unicode` pkg | `src/unicode.zig` + generated tables | `SimpleFold`, `\b` word test, `\p{...}` classes. |
 | AST node | `syntax/regexp.go` | `src/ast.zig` | `Regexp` node, `Op` enum, `Flags`. |
@@ -77,10 +77,13 @@ reached all lower-priority threads are discarded — giving **leftmost-first**
 (Perl/RE2) semantics without backtracking. Setting `setLongest()` switches to
 **POSIX leftmost-longest**.
 
-> Go additionally ships two *optimization-only* engines — a one-pass engine and
-> a bitstate backtracker — that produce identical results on the patterns they
-> accept. This port implements only the general Pike VM, which alone is correct
-> for every pattern (see [Scope](#scope--differences-from-go)).
+> For small programs and inputs the port also dispatches to a **bitstate
+> backtracker** (`exec.zig`), exactly as Go does — a (pc, pos)-visited bitmap
+> keeps it linear-time while beating the Pike VM on small nested-quantifier
+> patterns. Plus **literal-prefix acceleration** (a vectorized substring scan)
+> to skip ahead in unanchored searches. Go's third engine, the one-pass
+> optimizer, is the only one not ported (it changes speed, not results — see
+> [BENCHMARKS.md](BENCHMARKS.md)).
 
 ---
 
@@ -176,7 +179,8 @@ or **clearly-scoped data limits**:
 
 | Area | Status |
 |------|--------|
-| One-pass engine, bitstate backtracker | Not ported. They are speed optimizations; the Pike VM gives identical results. (They are the only two cases where Go still outruns this port — see [BENCHMARKS.md](BENCHMARKS.md).) |
+| Bitstate backtracker | **Implemented** — Go's small-program/small-input engine, dispatched the same way; closes the nested-quantifier gap. |
+| One-pass engine | Not ported (a pure speed optimization; the Pike VM gives identical results). The only workload where Go still outruns this port — see [BENCHMARKS.md](BENCHMARKS.md). |
 | Alternation prefix `factor()` | Not ported. A pure AST optimization; does not change the matched language or priority. |
 | Literal-prefix search acceleration | **Implemented** (vectorized first-byte scan + verify); closes the literal-search gap with Go. See [BENCHMARKS.md](BENCHMARKS.md). |
 | `\p{...}` script/category set | A **curated subset** (common general categories `L,N,P,…` and major scripts: Latin, Greek, Cyrillic, Han, Hiragana, Katakana, Hangul, Arabic, Hebrew, Thai, Devanagari, Armenian, Georgian, Common). Unknown names return `error.InvalidCharRange`. |
