@@ -1,6 +1,6 @@
 # zoptia0regex
 
-[![CI](https://github.com/OWNER/zoptia0regex/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/zoptia0regex/actions/workflows/ci.yml)
+[![CI](https://github.com/zoptia/zoptia0regex/actions/workflows/ci.yml/badge.svg)](https://github.com/zoptia/zoptia0regex/actions/workflows/ci.yml)
 ![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d)
 ![License](https://img.shields.io/badge/License-Apache_2.0-blue)
 
@@ -50,7 +50,7 @@ find    : [8,24) = "john@example.com"
 Requires **Zig 0.16**. Add it to your `build.zig.zon`:
 
 ```sh
-zig fetch --save git+https://github.com/OWNER/zoptia0regex
+zig fetch --save git+https://github.com/zoptia/zoptia0regex
 ```
 
 Then wire the `regex` module into your `build.zig`:
