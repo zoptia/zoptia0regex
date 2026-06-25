@@ -14,6 +14,7 @@ const simplify = @import("simplify.zig");
 const compile_ = @import("compile.zig");
 const prog = @import("prog.zig");
 const exec = @import("exec.zig");
+const unicode = @import("unicode.zig");
 
 pub const ParseError = parse.ParseError;
 pub const ExecError = std.mem.Allocator.Error;
@@ -29,7 +30,6 @@ pub const Regexp = struct {
     num_subexp: usize,
     subexp_names: []const []const u8,
     cond: prog.EmptyOp,
-    matchcap: usize, // max(prog.num_cap, 2)
     min_input_len: usize,
     longest: bool,
     prefix: []const u8,
@@ -455,10 +455,8 @@ fn extract(str0: []const u8) Extracted {
 }
 
 fn isLetterDigitUnderscore(r: u21) bool {
-    // ASCII letters/digits/_ plus the broad Unicode letter/digit ranges via
-    // our class tables would be heavy here; Go uses unicode.IsLetter/IsDigit.
-    // Capture names in this port are ASCII, so ASCII suffices.
-    return (r >= '0' and r <= '9') or (r >= 'A' and r <= 'Z') or (r >= 'a' and r <= 'z') or r == '_';
+    // Matches Go's extract: unicode.IsLetter(r) || unicode.IsDigit(r) || '_'.
+    return r == '_' or unicode.isLetterOrDigit(r);
 }
 
 // --- compilation ---
@@ -482,9 +480,6 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
     const simplified = try simplify.simplify(al, re_ast);
     const p = try compile_.compile(al, simplified);
 
-    var matchcap = p.num_cap;
-    if (matchcap < 2) matchcap = 2;
-
     const pfx = try p.prefix(al);
     const expr_owned = try al.dupe(u8, expr);
 
@@ -496,7 +491,6 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
         .num_subexp = @intCast(max_cap),
         .subexp_names = names,
         .cond = p.startCond(),
-        .matchcap = matchcap,
         .min_input_len = minInputLen(simplified),
         .longest = longest,
         .prefix = pfx.str,

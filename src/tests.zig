@@ -162,12 +162,12 @@ test "leftmost-first vs longest" {
 
 test "invalid patterns error (no crash)" {
     const bad = [_][]const u8{
-        "(",            "(abc",        ")",          "a)",
-        "[",            "[a-",         "a{2,1}",     "a**",
-        "\\",           "(?P<>x)",     "[z-a]",      "(?P<a)x)",
-        "x{1001}",      "*",           "+",          "?",
-        "(?",           "(?<",         "\\x{110000}", "\\xG",
-        "[[:bogus:]]",  "\\p{Nonexistent}", "{2}",
+        "(",           "(abc",             ")",           "a)",
+        "[",           "[a-",              "a{2,1}",      "a**",
+        "\\",          "(?P<>x)",          "[z-a]",       "(?P<a)x)",
+        "x{1001}",     "*",                "+",           "?",
+        "(?",          "(?<",              "\\x{110000}", "\\xG",
+        "[[:bogus:]]", "\\p{Nonexistent}", "{2}",
     };
     for (bad) |p| {
         if (regex.compile(ta, p)) |*re| {
@@ -245,6 +245,27 @@ test "invalid-UTF-8 error codes match Go" {
     try std.testing.expectError(error.InvalidUTF8, regex.compile(ta, "(?<\xff"));
     // \p{ with invalid UTF-8 inside braces -> InvalidUTF8 (not InvalidCharRange).
     try std.testing.expectError(error.InvalidUTF8, regex.compile(ta, "\\p{\xff}"));
+}
+
+test "deep nesting returns NestingDepth (no stack overflow)" {
+    const pat = ("(" ** 3000) ++ "a" ++ (")" ** 3000);
+    try std.testing.expectError(error.NestingDepth, regex.compile(ta, pat));
+}
+
+test "unicode names in replacement templates match Go" {
+    var re = try regex.compile(ta, "(a)");
+    defer re.deinit();
+    // "café" is all Unicode letters -> a (missing) group name -> expands empty.
+    const a = try re.replaceAllString(ta, "a", "[$café]");
+    defer ta.free(a);
+    try std.testing.expectEqualStrings("[]", a);
+    const b = try re.replaceAllString(ta, "a", "x${café}y");
+    defer ta.free(b);
+    try std.testing.expectEqualStrings("xy", b);
+    // "$1é" -> the name is "1é" (digit+letter), not group 1.
+    const c = try re.replaceAllString(ta, "a", "$1é");
+    defer ta.free(c);
+    try std.testing.expectEqualStrings("", c);
 }
 
 test "replace func" {

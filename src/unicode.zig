@@ -110,6 +110,30 @@ pub fn unicodeTable(allocator: std.mem.Allocator, name: []const u8) !?TableResul
 const any_ranges = [_]URange{.{ .lo = 0, .hi = max_rune, .stride = 1 }};
 const ascii_ranges = [_]URange{.{ .lo = 0, .hi = 0x7F, .stride = 1 }};
 
+fn classRanges(comptime name: []const u8) []const URange {
+    for (utbl.unicode_classes) |cls| {
+        if (std.mem.eql(u8, cls.name, name)) return cls.ranges;
+    }
+    @compileError("missing unicode class: " ++ name);
+}
+
+fn inRanges(r: u21, ranges: []const URange) bool {
+    for (ranges) |xr| {
+        if (r < xr.lo or r > xr.hi) continue;
+        if (xr.stride == 1 or (r - xr.lo) % xr.stride == 0) return true;
+    }
+    return false;
+}
+
+/// Reports whether r is a Unicode letter (category L) or decimal digit (Nd),
+/// matching `unicode.IsLetter(r) || unicode.IsDigit(r)` used by Go's `extract`
+/// for `$name` / `${name}` template parsing.
+pub fn isLetterOrDigit(r: u21) bool {
+    const letters = comptime classRanges("L");
+    const digits = comptime classRanges("Nd");
+    return inRanges(r, letters) or inRanges(r, digits);
+}
+
 test "simpleFold ASCII and Unicode" {
     try std.testing.expectEqual(@as(u21, 'a'), simpleFold('A'));
     try std.testing.expectEqual(@as(u21, 'A'), simpleFold('a'));

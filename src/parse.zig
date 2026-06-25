@@ -19,6 +19,12 @@ const Flags = ast.Flags;
 
 const max_rune: u21 = unicode.max_rune;
 
+// Resource limits mirroring Go's parser (parse.go). Without these, a deeply
+// nested pattern builds an over-deep AST that overflows the native stack in the
+// recursive simplify/compile passes; Go rejects it at parse time instead.
+const max_height: u32 = 1000; // Go's maxHeight: max nesting depth
+const max_runes: usize = (128 << 20) / 4; // Go's maxRunes: total class runes
+
 pub const RuneRest = struct { r: u21, rest: []const u8 };
 
 pub const ParseError = error{
@@ -142,6 +148,8 @@ const Parser = struct {
     whole: []const u8,
     stack: std.ArrayList(*Regexp) = .empty,
     num_cap: i32 = 0,
+    paren_depth: u32 = 0, // current open '(' nesting, bounds AST height
+    num_runes: usize = 0, // total runes across all char classes
 
     fn newRegexp(p: *Parser, o: Op) !*Regexp {
         const re = try p.al.create(Regexp);
@@ -150,6 +158,8 @@ const Parser = struct {
     }
 
     fn push(p: *Parser, re: *Regexp) !void {
+        p.num_runes += re.runes.len;
+        if (p.num_runes > max_runes) return error.TooLarge;
         try p.stack.append(p.al, re);
         if (p.stack.items.len > 2_000_000) return error.TooLarge;
     }
@@ -158,6 +168,12 @@ const Parser = struct {
         const re = try p.newRegexp(o);
         re.flags = p.flags;
         try p.push(re);
+        if (o == .left_paren) {
+            // Bound nesting depth so the recursive AST passes can't overflow
+            // the stack (Go rejects over-deep patterns with ErrNestingDepth).
+            p.paren_depth += 1;
+            if (p.paren_depth > max_height) return error.NestingDepth;
+        }
         return re;
     }
 
@@ -353,6 +369,7 @@ const Parser = struct {
         const re2 = p.stack.items[n - 2];
         p.stack.shrinkRetainingCapacity(n - 2);
         if (re2.op != .left_paren) return error.UnexpectedParen;
+        if (p.paren_depth > 0) p.paren_depth -= 1;
 
         p.flags = re2.flags; // restore flags at time of paren
         if (re2.cap == 0) {
