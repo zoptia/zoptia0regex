@@ -24,6 +24,7 @@ pub const syntax = struct {
     pub const prog = @import("prog.zig");
     pub const compileProg = @import("compile.zig");
     pub const exec = @import("exec.zig");
+    pub const onepass = @import("onepass.zig");
     pub const unicode = @import("unicode.zig");
 };
 

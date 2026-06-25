@@ -8,8 +8,8 @@ The implementation is validated by **differential testing against the actual Go
 `regexp` package**: tens of thousands of (pattern, input) pairs are run through
 both engines and the results are required to be byte-for-byte identical (see
 [Validation](#validation)). It is also **benchmarked head-to-head against Go** —
-competitive-to-faster on most patterns, and faster to compile (see
-[BENCHMARKS.md](BENCHMARKS.md)).
+~11% faster on average (all three of Go's engines are ported) and ~1.7× faster
+to compile (see [BENCHMARKS.md](BENCHMARKS.md)).
 
 ```
 $ zig build demo -- '(\w+)@(\w+)\.(\w+)' 'contact john@example.com today'
@@ -37,7 +37,7 @@ stages, and this port keeps the same stages in the same files:
 | 1. Parse | `syntax/parse.go` | `src/parse.zig` | Pattern string → AST, via a stack machine. |
 | 2. Simplify | `syntax/simplify.go` | `src/simplify.zig` | Rewrite counted repetition `x{n,m}` into `*`/`+`/`?`/concat. |
 | 3. Compile | `syntax/compile.go` + `prog.go` | `src/compile.zig` + `src/prog.zig` | AST → `Prog`, a flat list of NFA instructions. |
-| 4. Execute | `exec.go` + `backtrack.go` | `src/exec.zig` | Pike VM + bitstate backtracker; submatch tracking, prefix accel. |
+| 4. Execute | `exec.go` + `backtrack.go` + `onepass.go` | `src/exec.zig` + `src/onepass.zig` | Pike VM + bitstate backtracker + one-pass; submatch tracking, prefix accel. |
 | Public API | `regexp.go` | `src/regexp.zig` | `compile`, `find*`, `replace*`, `split`, `expand`. |
 | Unicode | `unicode` pkg | `src/unicode.zig` + generated tables | `SimpleFold`, `\b` word test, `\p{...}` classes. |
 | AST node | `syntax/regexp.go` | `src/ast.zig` | `Regexp` node, `Op` enum, `Flags`. |
@@ -77,13 +77,13 @@ reached all lower-priority threads are discarded — giving **leftmost-first**
 (Perl/RE2) semantics without backtracking. Setting `setLongest()` switches to
 **POSIX leftmost-longest**.
 
-> For small programs and inputs the port also dispatches to a **bitstate
-> backtracker** (`exec.zig`), exactly as Go does — a (pc, pos)-visited bitmap
-> keeps it linear-time while beating the Pike VM on small nested-quantifier
-> patterns. Plus **literal-prefix acceleration** (a vectorized substring scan)
-> to skip ahead in unanchored searches. Go's third engine, the one-pass
-> optimizer, is the only one not ported (it changes speed, not results — see
-> [BENCHMARKS.md](BENCHMARKS.md)).
+> The port ships **all three of Go's engines**, dispatched the same way: a
+> **one-pass** engine (`onepass.zig`) for qualifying anchored regexps (the
+> fastest path — a single deterministic pass), a **bitstate backtracker**
+> (`exec.zig`) for small programs/inputs (a (pc, pos)-visited bitmap keeps it
+> linear-time), and the **Pike VM** for everything else — all with
+> **literal-prefix acceleration** (a vectorized substring scan). The result is
+> on average faster than Go (see [BENCHMARKS.md](BENCHMARKS.md)).
 
 ---
 
@@ -180,7 +180,7 @@ or **clearly-scoped data limits**:
 | Area | Status |
 |------|--------|
 | Bitstate backtracker | **Implemented** — Go's small-program/small-input engine, dispatched the same way; closes the nested-quantifier gap. |
-| One-pass engine | Not ported (a pure speed optimization; the Pike VM gives identical results). The only workload where Go still outruns this port — see [BENCHMARKS.md](BENCHMARKS.md). |
+| One-pass engine | **Implemented** — Go's fastest engine for qualifying anchored regexps; makes this port faster than Go on `\A…\z` validation patterns. See [BENCHMARKS.md](BENCHMARKS.md). |
 | Alternation prefix `factor()` | Not ported. A pure AST optimization; does not change the matched language or priority. |
 | Literal-prefix search acceleration | **Implemented** (vectorized first-byte scan + verify); closes the literal-search gap with Go. See [BENCHMARKS.md](BENCHMARKS.md). |
 | `\p{...}` script/category set | A **curated subset** (common general categories `L,N,P,…` and major scripts: Latin, Greek, Cyrillic, Han, Hiragana, Katakana, Hangul, Arabic, Hebrew, Thai, Devanagari, Armenian, Georgian, Common). Unknown names return `error.InvalidCharRange`. |
@@ -244,7 +244,8 @@ src/
   simplify.zig       counted-repetition elimination
   prog.zig           Inst / Prog / EmptyOp, MatchRune
   compile.zig        AST -> Prog (patch-list compiler)
-  exec.zig           Pike VM (NFA simulation, submatch capture)
+  exec.zig           Pike VM + bitstate backtracker, prefix accel, dispatch
+  onepass.zig        one-pass engine (analysis + dispatch tables)
   regexp.zig         public API: find / replace / split / expand
   unicode.zig        SimpleFold, word-char test, \p{} lookup
   fold_table.zig     generated: unicode.SimpleFold (all of Unicode)

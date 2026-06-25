@@ -14,6 +14,7 @@ type Case struct {
 	P    string `json:"p"`
 	Op   string `json:"op"`  // match | find | findall | submatch
 	In   string `json:"in"`  // "corpus" | "aaa"  (reference, not the bytes)
+	Lit  string `json:"lit"` // inline literal input (when non-empty)
 }
 
 var words = strings.Fields(`the quick brown fox jumps over lazy dog lorem ipsum dolor sit amet consectetur
@@ -54,21 +55,27 @@ func main() {
 	os.WriteFile("../src/bench_aaa.txt", []byte(aaa), 0644)
 
 	cases := []Case{
-		{"literal_hit", "performance", "find", "corpus"},
-		{"literal_miss", "zzqqxxjjkk", "find", "corpus"},
-		{"alternation", "performance|benchmark|expression|throughput", "findall", "corpus"},
-		{"charclass_word", "[A-Za-z]+", "findall", "corpus"},
-		{"perl_word", "\\w+", "findall", "corpus"},
-		{"digits", "\\d+", "findall", "corpus"},
-		{"date", "\\d{4}-\\d{2}-\\d{2}", "findall", "corpus"},
-		{"email", "[\\w.]+@[\\w.]+\\.\\w+", "findall", "corpus"},
-		{"email_submatch", "([\\w.]+)@([\\w.]+)\\.(\\w+)", "submatch", "corpus"},
-		{"anchored_multiline", "(?m)^\\w+", "findall", "corpus"},
-		{"unicode_letters", "\\p{L}+", "findall", "corpus"},
-		{"dotstar_greedy", "p.*e", "find", "corpus"},
-		{"redos_linear", "(a+)+$", "match", "aaa"},
-		{"nested_groups", "(\\w+)\\s+(\\w+)\\s+(\\w+)", "findall", "corpus"},
-		{"caseins_literal", "(?i)performance", "findall", "corpus"},
+		{"literal_hit", "performance", "find", "corpus", ""},
+		{"literal_miss", "zzqqxxjjkk", "find", "corpus", ""},
+		{"alternation", "performance|benchmark|expression|throughput", "findall", "corpus", ""},
+		{"charclass_word", "[A-Za-z]+", "findall", "corpus", ""},
+		{"perl_word", "\\w+", "findall", "corpus", ""},
+		{"digits", "\\d+", "findall", "corpus", ""},
+		{"date", "\\d{4}-\\d{2}-\\d{2}", "findall", "corpus", ""},
+		{"email", "[\\w.]+@[\\w.]+\\.\\w+", "findall", "corpus", ""},
+		{"email_submatch", "([\\w.]+)@([\\w.]+)\\.(\\w+)", "submatch", "corpus", ""},
+		{"anchored_multiline", "(?m)^\\w+", "findall", "corpus", ""},
+		{"unicode_letters", "\\p{L}+", "findall", "corpus", ""},
+		{"dotstar_greedy", "p.*e", "find", "corpus", ""},
+		{"redos_linear", "(a+)+$", "match", "aaa", ""},
+		{"nested_groups", "(\\w+)\\s+(\\w+)\\s+(\\w+)", "findall", "corpus", ""},
+		{"caseins_literal", "(?i)performance", "findall", "corpus", ""},
+		// anchored "validation" patterns -> one-pass engine, short whole-string inputs
+		{"anchored_caseins", "\\A(?i)performance\\z", "match", "", "performance"},
+		{"anchored_word", "\\A[a-z]+\\z", "match", "", "performance"},
+		{"anchored_date", "\\A\\d{4}-\\d{2}-\\d{2}\\z", "match", "", "2024-01-15"},
+		{"anchored_digits", "\\A\\d+\\z", "match", "", "1234567890"},
+		{"anchored_email", "\\A([\\w.]+)@(\\w+)\\.(\\w+)\\z", "submatch", "", "john.doe@example.com"},
 	}
 	w := bufio.NewWriter(os.Stdout)
 	defer w.Flush()

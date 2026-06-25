@@ -19,6 +19,7 @@ type Case struct {
 	P    string `json:"p"`
 	Op   string `json:"op"`
 	In   string `json:"in"`
+	Lit  string `json:"lit"`
 }
 
 const calibrateNs = 250_000_000 // grow iterations until a run exceeds 250ms
@@ -57,7 +58,10 @@ func main() {
 		}
 		var c Case
 		json.Unmarshal(line, &c)
-		input := inputs[c.In]
+		input := c.Lit
+		if input == "" {
+			input = inputs[c.In]
+		}
 
 		// Compile timing.
 		compileNs, _ := calibrate(func() uint64 {

@@ -16,7 +16,7 @@ const cases_data = @embedFile("bench.jsonl");
 const corpus = @embedFile("bench_corpus.txt");
 const aaa = @embedFile("bench_aaa.txt");
 
-const Case = struct { name: []const u8, p: []const u8, op: []const u8, in: []const u8 };
+const Case = struct { name: []const u8, p: []const u8, op: []const u8, in: []const u8, lit: []const u8 };
 const Op = enum { match, find, findall, submatch };
 
 const calibrate_ns: i128 = 250_000_000;
@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
         const parsed = try std.json.parseFromSlice(Case, gpa, line, .{});
         defer parsed.deinit();
         const c = parsed.value;
-        const input = if (std.mem.eql(u8, c.in, "aaa")) aaa else corpus;
+        const input = if (c.lit.len > 0) c.lit else if (std.mem.eql(u8, c.in, "aaa")) aaa else corpus;
         const op: Op = if (std.mem.eql(u8, c.op, "match")) .match else if (std.mem.eql(u8, c.op, "find")) .find else if (std.mem.eql(u8, c.op, "submatch")) .submatch else .findall;
 
         const comp_ns = calibrateCompile(io, gpa, c.p);

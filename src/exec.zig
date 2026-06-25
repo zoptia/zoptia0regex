@@ -11,10 +11,12 @@
 const std = @import("std");
 const prog = @import("prog.zig");
 const unicode = @import("unicode.zig");
+const onepass = @import("onepass.zig");
 
 const Prog = prog.Prog;
 const Inst = prog.Inst;
 const EmptyOp = prog.EmptyOp;
+const OnePassProg = onepass.OnePassProg;
 
 const end_of_text: i32 = -1;
 
@@ -590,16 +592,87 @@ fn backtrack(allocator: std.mem.Allocator, p: *const Prog, longest: bool, cond: 
     return false;
 }
 
+/// The one-pass engine: a single deterministic pass following per-instruction
+/// `Next` dispatch tables. Used only for qualifying anchored regexps. Mirrors
+/// Go's `doOnePass`.
+fn doOnePass(op: *const OnePassProg, cond: EmptyOp, input: Input, pos0: usize, caps: []i64) bool {
+    if (cond == prog.impossible) return false;
+    var pos = pos0;
+    for (caps) |*c| c.* = -1;
+
+    var r: i32 = end_of_text;
+    var r1: i32 = end_of_text;
+    var width: usize = 0;
+    var width1: usize = 0;
+    const s0 = input.step(pos);
+    r = s0.r;
+    width = s0.w;
+    if (r != end_of_text) {
+        const s1 = input.step(pos + width);
+        r1 = s1.r;
+        width1 = s1.w;
+    }
+    var flag: LazyFlag = if (pos == 0) LazyFlag.init(-1, r) else input.context(pos);
+    var pc = op.start;
+    var matched = false;
+
+    loop: while (true) {
+        const inst = &op.insts[pc];
+        pc = inst.out;
+        switch (inst.op) {
+            .match => {
+                matched = true;
+                if (caps.len > 0) {
+                    caps[0] = 0;
+                    caps[1] = @intCast(pos);
+                }
+                break :loop;
+            },
+            .rune => if (r < 0 or prog.matchRunePos(inst.runes, inst.arg, @intCast(r)) < 0) break :loop,
+            .rune1 => if (r != @as(i32, @intCast(inst.runes[0]))) break :loop,
+            .rune_any => {},
+            .rune_any_not_nl => if (r == '\n') break :loop,
+            .alt, .alt_match => {
+                pc = onepass.onePassNext(inst, r);
+                continue :loop;
+            },
+            .fail => break :loop,
+            .nop => continue :loop,
+            .empty_width => {
+                if (!flag.match(@intCast(inst.arg))) break :loop;
+                continue :loop;
+            },
+            .capture => {
+                if (inst.arg < caps.len) caps[@intCast(inst.arg)] = @intCast(pos);
+                continue :loop;
+            },
+        }
+        // Reached only by the rune-consuming instructions: advance one rune.
+        if (width == 0) break :loop;
+        flag = LazyFlag.init(r, r1);
+        pos += width;
+        r = r1;
+        width = width1;
+        if (r != end_of_text) {
+            const sc = input.step(pos + width);
+            r1 = sc.r;
+            width1 = sc.w;
+        }
+    }
+    return matched;
+}
+
 /// Execute the program over `input` starting at byte offset `pos`, writing the
 /// submatch byte offsets into `caps` (length determines the number of captures
 /// recorded; pairs are [start,end], -1 when unset). Returns whether a match was
 /// found. `caps` is only meaningful when `true` is returned.
 ///
-/// Dispatches to the bitstate backtracker for small programs/inputs (Go's
-/// engine selection) and to the Pike VM otherwise.
+/// Dispatches like Go: the one-pass engine if the regexp qualifies, else the
+/// bitstate backtracker for small programs/inputs, else the Pike VM.
 pub fn execute(
     allocator: std.mem.Allocator,
     p: *const Prog,
+    op: ?*const OnePassProg,
     longest: bool,
     cond: EmptyOp,
     prefix: []const u8,
@@ -607,6 +680,7 @@ pub fn execute(
     pos: usize,
     caps: []i64,
 ) !bool {
+    if (op) |onep| return doOnePass(onep, cond, input, pos, caps);
     const ninst = p.insts.len;
     if (ninst <= max_backtrack_prog and ninst > 0 and input.s.len < max_backtrack_vector / ninst) {
         return backtrack(allocator, p, longest, cond, prefix, input, pos, caps);

@@ -268,6 +268,38 @@ test "unicode names in replacement templates match Go" {
     try std.testing.expectEqualStrings("", c);
 }
 
+test "one-pass engine on anchored patterns" {
+    // Anchored regexps qualify for the one-pass engine; results must match the
+    // other engines exactly.
+    {
+        var re = try regex.compile(ta, "\\A(?i)performance\\z");
+        defer re.deinit();
+        try std.testing.expect(re.onepass != null); // one-pass active
+        try std.testing.expect(try re.match(ta, "PERFORMANCE"));
+        try std.testing.expect(try re.match(ta, "Performance"));
+        try std.testing.expect(!try re.match(ta, "performances"));
+        try std.testing.expect(!try re.match(ta, "xperformance"));
+    }
+    {
+        var re = try regex.compile(ta, "\\A([\\w.]+)@(\\w+)\\.(\\w+)\\z");
+        defer re.deinit();
+        try std.testing.expect(re.onepass != null);
+        const subs = (try re.findSubmatch(ta, "john.doe@example.com")).?;
+        defer ta.free(subs);
+        try std.testing.expectEqualStrings("john.doe", subs[1].?);
+        try std.testing.expectEqualStrings("example", subs[2].?);
+        try std.testing.expectEqualStrings("com", subs[3].?);
+        try std.testing.expect((try re.findSubmatch(ta, "not an email")) == null);
+    }
+    {
+        var re = try regex.compile(ta, "\\A\\d{4}-\\d{2}-\\d{2}\\z");
+        defer re.deinit();
+        try std.testing.expect(re.onepass != null);
+        try std.testing.expect(try re.match(ta, "2024-01-15"));
+        try std.testing.expect(!try re.match(ta, "2024-1-15"));
+    }
+}
+
 test "replace func" {
     var re = try regex.compile(ta, "\\d+");
     defer re.deinit();

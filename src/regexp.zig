@@ -15,6 +15,7 @@ const compile_ = @import("compile.zig");
 const prog = @import("prog.zig");
 const exec = @import("exec.zig");
 const unicode = @import("unicode.zig");
+const onepass = @import("onepass.zig");
 
 pub const ParseError = parse.ParseError;
 pub const ExecError = std.mem.Allocator.Error;
@@ -34,6 +35,7 @@ pub const Regexp = struct {
     longest: bool,
     prefix: []const u8,
     prefix_complete: bool,
+    onepass: ?*onepass.OnePassProg,
 
     pub fn deinit(re: *Regexp) void {
         const gpa = re.base_allocator;
@@ -91,7 +93,7 @@ pub const Regexp = struct {
     pub fn match(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!bool {
         if (input.len < re.min_input_len) return false;
         var caps: [0]i64 = .{};
-        return try exec.execute(allocator, &re.prog, re.longest, re.cond, re.prefix, .{ .s = input }, 0, &caps);
+        return try exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.prefix, .{ .s = input }, 0, &caps);
     }
 
     /// Alias of `match` (Go distinguishes `[]byte` and `string`; here both are
@@ -106,7 +108,7 @@ pub const Regexp = struct {
     pub fn findIndex(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!?Match {
         if (input.len < re.min_input_len) return null;
         var caps: [2]i64 = .{ -1, -1 };
-        const matched = try exec.execute(allocator, &re.prog, re.longest, re.cond, re.prefix, .{ .s = input }, 0, &caps);
+        const matched = try exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.prefix, .{ .s = input }, 0, &caps);
         if (!matched) return null;
         return Match{ .start = @intCast(caps[0]), .end = @intCast(caps[1]) };
     }
@@ -125,7 +127,7 @@ pub const Regexp = struct {
     pub fn findSubmatchIndex(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!?[]i64 {
         if (input.len < re.min_input_len) return null;
         const caps = try allocator.alloc(i64, re.padLen());
-        const matched = try exec.execute(allocator, &re.prog, re.longest, re.cond, re.prefix, .{ .s = input }, 0, caps);
+        const matched = try exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.prefix, .{ .s = input }, 0, caps);
         if (!matched) {
             allocator.free(caps);
             return null;
@@ -170,7 +172,7 @@ pub const Regexp = struct {
 
         while (count < limit and pos <= end) {
             const caps = try allocator.alloc(i64, re.padLen());
-            const matched = try exec.execute(allocator, &re.prog, re.longest, re.cond, re.prefix, in, pos, caps);
+            const matched = try exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.prefix, in, pos, caps);
             if (!matched) {
                 allocator.free(caps);
                 break;
@@ -306,7 +308,7 @@ pub const Regexp = struct {
         const in = exec.Input{ .s = src };
 
         while (search_pos <= end_pos) {
-            const matched = try exec.execute(allocator, &re.prog, re.longest, re.cond, re.prefix, in, search_pos, caps);
+            const matched = try exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.prefix, in, search_pos, caps);
             if (!matched) break;
             const a0: usize = @intCast(caps[0]);
             const a1: usize = @intCast(caps[1]);
@@ -483,6 +485,16 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
     const pfx = try p.prefix(al);
     const expr_owned = try al.dupe(u8, expr);
 
+    // Build the one-pass program if the regexp qualifies (anchored, unambiguous).
+    const op_prog: ?*onepass.OnePassProg = blk: {
+        if (try onepass.compileOnePass(al, &p)) |opp| {
+            const ptr = try al.create(onepass.OnePassProg);
+            ptr.* = opp;
+            break :blk ptr;
+        }
+        break :blk null;
+    };
+
     return Regexp{
         .base_allocator = gpa,
         .arena = arena,
@@ -495,6 +507,7 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
         .longest = longest,
         .prefix = pfx.str,
         .prefix_complete = pfx.complete,
+        .onepass = op_prog,
     };
 }
 

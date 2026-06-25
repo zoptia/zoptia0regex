@@ -41,49 +41,53 @@ pub const Inst = struct {
     /// Only valid for `rune` (the general case); the VM handles rune1/any
     /// directly. Replicates Go's `Inst.MatchRune`.
     pub fn matchRune(i: *const Inst, r: u21) bool {
-        const rs = i.runes;
-        switch (rs.len) {
-            0 => return false,
-            1 => {
-                // Single-rune slice: from a literal string, not a char class.
-                const r0 = rs[0];
-                if (r == r0) return true;
-                if (ast.FoldCase & @as(ast.Flags, @intCast(i.arg)) != 0) {
-                    var r1 = unicode.simpleFold(r0);
-                    while (r1 != r0) : (r1 = unicode.simpleFold(r1)) {
-                        if (r == r1) return true;
-                    }
-                }
-                return false;
-            },
-            2 => return r >= rs[0] and r <= rs[1],
-            else => {
-                // Linear scan for a few pairs, binary search otherwise.
-                if (rs.len <= 8) {
-                    var j: usize = 0;
-                    while (j < rs.len) : (j += 2) {
-                        if (r < rs[j]) return false;
-                        if (r <= rs[j + 1]) return true;
-                    }
-                    return false;
-                }
-                var lo: usize = 0;
-                var hi: usize = rs.len / 2;
-                while (lo < hi) {
-                    const m = lo + (hi - lo) / 2;
-                    const c = rs[2 * m];
-                    if (c <= r) {
-                        if (r <= rs[2 * m + 1]) return true;
-                        lo = m + 1;
-                    } else {
-                        hi = m;
-                    }
-                }
-                return false;
-            },
-        }
+        return matchRunePos(i.runes, i.arg, r) >= 0;
     }
 };
+
+/// The index of the rune pair that matches `r` in the sorted range-pair list
+/// `runes` (with optional `FoldCase` in `arg` for a single-rune literal), or
+/// -1 if none. Mirrors Go's `Inst.MatchRunePos`; the index feeds the one-pass
+/// `Next` dispatch table.
+pub fn matchRunePos(rs: []const u21, arg: u32, r: u21) i32 {
+    switch (rs.len) {
+        0 => return -1,
+        1 => {
+            const r0 = rs[0];
+            if (r == r0) return 0;
+            if (ast.FoldCase & @as(ast.Flags, @intCast(arg)) != 0) {
+                var r1 = unicode.simpleFold(r0);
+                while (r1 != r0) : (r1 = unicode.simpleFold(r1)) {
+                    if (r == r1) return 0;
+                }
+            }
+            return -1;
+        },
+        2 => return if (r >= rs[0] and r <= rs[1]) 0 else -1,
+        else => {
+            if (rs.len <= 8) {
+                var j: usize = 0;
+                while (j < rs.len) : (j += 2) {
+                    if (r < rs[j]) return -1;
+                    if (r <= rs[j + 1]) return @intCast(j / 2);
+                }
+                return -1;
+            }
+            var lo: usize = 0;
+            var hi: usize = rs.len / 2;
+            while (lo < hi) {
+                const m = lo + (hi - lo) / 2;
+                if (rs[2 * m] <= r) {
+                    if (r <= rs[2 * m + 1]) return @intCast(m);
+                    lo = m + 1;
+                } else {
+                    hi = m;
+                }
+            }
+            return -1;
+        },
+    }
+}
 
 /// A compiled program.
 pub const Prog = struct {
