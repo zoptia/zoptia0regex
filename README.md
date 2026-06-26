@@ -4,8 +4,9 @@
 
 ### Go's `regexp`, faithfully replicated in Zig — and faster.
 
-A high-fidelity port of the RE2 engine with a linear-time guarantee and
-**~30,000 tests proving byte-for-byte parity with Go**.
+A **regular-expression (regex) library for Zig** — a high-fidelity port of the
+RE2 engine, with a linear-time guarantee and **~30,000 tests proving
+byte-for-byte parity with Go**.
 
 [![CI](https://github.com/zoptia/zoptia0regex/actions/workflows/ci.yml/badge.svg)](https://github.com/zoptia/zoptia0regex/actions)
 [![Zig](https://img.shields.io/badge/Zig-0.16-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/)
