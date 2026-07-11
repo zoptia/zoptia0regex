@@ -57,6 +57,9 @@ pub const OneLine: Flags = 1 << 4; // treat ^ and $ as only matching begin/end o
 pub const NonGreedy: Flags = 1 << 5; // make repetition operators default to non-greedy
 pub const PerlX: Flags = 1 << 6; // allow Perl extensions
 pub const UnicodeGroups: Flags = 1 << 7; // allow \p{Han}, \P{Han}
+// WasDollar, Simple, and MatchNL mirror Go's Flags bit layout for fidelity;
+// no code in this port consumes them (Go reads WasDollar/Simple only when
+// printing or re-simplifying an AST).
 pub const WasDollar: Flags = 1 << 8; // OpEndText was $, not \z
 pub const Simple: Flags = 1 << 9; // regexp contains no counted repetition
 

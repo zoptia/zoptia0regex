@@ -36,9 +36,6 @@ pub fn build(b: *std.Build) void {
     const demo_step = b.step("demo", "Run the regex demo (pass: <pattern> <input>)");
     demo_step.dependOn(&run_demo.step);
 
-    // Differential tests against Go's regexp output (golden reference).
-    // The curated corpus (src/cases.jsonl) is committed; the large fuzz corpus
-    // (src/fuzz.jsonl) is generated on demand by tools/regen.sh.
     // Benchmark (always ReleaseFast). Compare with `cd tools && go run benchgo.go`.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
@@ -59,7 +56,11 @@ pub fn build(b: *std.Build) void {
     const bench_scratch_step = b.step("bench-scratch", "Benchmark the Scratch reuse API vs allocating match (ReleaseFast)");
     bench_scratch_step.dependOn(&b.addRunArtifact(bench_scratch_exe).step);
 
-    const difftest_step = b.step("difftest", "Differential test vs Go's regexp (curated + fuzz corpora)");
+    // Differential tests against Go's regexp output (golden reference). All
+    // three corpora (src/cases.jsonl, src/fuzz.jsonl, src/longest.jsonl) are
+    // committed — regenerate them with tools/regen.sh only when the generators
+    // change; running the tests needs no Go toolchain.
+    const difftest_step = b.step("difftest", "Differential test vs Go's regexp (curated + fuzz + POSIX corpora)");
     inline for (.{ "src/difftest.zig", "src/fuzztest.zig", "src/longesttest.zig" }) |src| {
         const mod = b.createModule(.{
             .root_source_file = b.path(src),
@@ -69,4 +70,11 @@ pub fn build(b: *std.Build) void {
         const t = b.addTest(.{ .root_module = mod });
         difftest_step.dependOn(&b.addRunArtifact(t).step);
     }
+
+    // Formatting gate, same as CI: `zig build fmt` fails on unformatted files.
+    const fmt_step = b.step("fmt", "Check that all Zig sources are formatted");
+    fmt_step.dependOn(&b.addFmt(.{
+        .paths = &.{ "src", "build.zig" },
+        .check = true,
+    }).step);
 }

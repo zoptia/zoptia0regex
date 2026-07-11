@@ -23,9 +23,16 @@ const max_rune: u21 = unicode.max_rune;
 // nested pattern builds an over-deep AST that overflows the native stack in the
 // recursive simplify/compile passes; Go rejects it at parse time instead.
 const max_height: u32 = 1000; // Go's maxHeight: max nesting depth
-const max_runes: usize = (128 << 20) / 4; // Go's maxRunes: total class runes
+const max_runes: usize = (128 << 20) / rune_size; // Go's maxRunes: 128 MB budget of class runes
+const rune_size = 4; // Go's runeSize: bytes per rune in a class list
+// Hard cap on parser-stack nodes. Go instead tracks a byte-size budget over the
+// whole AST (checkSize, maxSize = 128<<20/instSize); this coarser proxy exists
+// only to stop a pathological pattern from growing the stack without bound, and
+// is far above anything a real pattern reaches (patterns are also bounded by
+// max_runes and max_height first).
+const max_stack_nodes = 2_000_000;
 
-pub const RuneRest = struct { r: u21, rest: []const u8 };
+const RuneRest = struct { r: u21, rest: []const u8 };
 
 pub const ParseError = error{
     InvalidCharClass,
@@ -48,7 +55,7 @@ pub const ParseError = error{
 
 /// Parse `pattern` under `flags` and return the AST root.
 pub fn parse(arena: std.mem.Allocator, pattern: []const u8, flags: Flags) ParseError!*Regexp {
-    var p = Parser{ .al = arena, .flags = flags, .whole = pattern };
+    var p = Parser{ .al = arena, .flags = flags };
 
     if (flags & ast.Literal != 0) {
         try checkUTF8(pattern);
@@ -90,6 +97,8 @@ pub fn parse(arena: std.mem.Allocator, pattern: []const u8, flags: Flags) ParseE
             },
             '$' => {
                 if (p.flags & ast.OneLine != 0) {
+                    // WasDollar mirrors Go, which reads it only when printing
+                    // an AST; nothing in this port consumes it.
                     (try p.op(.end_text)).flags |= ast.WasDollar;
                 } else {
                     _ = try p.op(.end_line);
@@ -110,7 +119,7 @@ pub fn parse(arena: std.mem.Allocator, pattern: []const u8, flags: Flags) ParseE
                     '+' => .plus,
                     else => .quest,
                 };
-                t = try p.repeat(o, 0, 0, before, t[1..], lastRepeat);
+                t = try p.repeat(o, 0, 0, t[1..], lastRepeat);
                 repeat = before;
             },
             '{' => {
@@ -124,7 +133,7 @@ pub fn parse(arena: std.mem.Allocator, pattern: []const u8, flags: Flags) ParseE
                     if (pr.min < 0 or pr.min > 1000 or pr.max > 1000 or (pr.max >= 0 and pr.min > pr.max)) {
                         return error.InvalidRepeatSize;
                     }
-                    t = try p.repeat(.repeat, pr.min, pr.max, before, pr.rest, lastRepeat);
+                    t = try p.repeat(.repeat, pr.min, pr.max, pr.rest, lastRepeat);
                     repeat = before;
                 }
             },
@@ -145,10 +154,12 @@ pub fn parse(arena: std.mem.Allocator, pattern: []const u8, flags: Flags) ParseE
 const Parser = struct {
     al: std.mem.Allocator,
     flags: Flags,
-    whole: []const u8,
     stack: std.ArrayList(*Regexp) = .empty,
     num_cap: i32 = 0,
-    paren_depth: u32 = 0, // current open '(' nesting, bounds AST height
+    // Current open '(' nesting. A proxy for Go's calcHeight (which measures
+    // full AST height including concat/alternate nesting); parens are the only
+    // way a *pattern* nests the recursive passes deeply enough to matter.
+    paren_depth: u32 = 0,
     num_runes: usize = 0, // total runes across all char classes
 
     fn newRegexp(p: *Parser, o: Op) !*Regexp {
@@ -161,7 +172,7 @@ const Parser = struct {
         p.num_runes += re.runes.len;
         if (p.num_runes > max_runes) return error.TooLarge;
         try p.stack.append(p.al, re);
-        if (p.stack.items.len > 2_000_000) return error.TooLarge;
+        if (p.stack.items.len > max_stack_nodes) return error.TooLarge;
     }
 
     fn op(p: *Parser, o: Op) !*Regexp {
@@ -197,8 +208,10 @@ const Parser = struct {
 
     // --- repetition ---
 
-    fn repeat(p: *Parser, o: Op, min: i32, max: i32, before: []const u8, after0: []const u8, lastRepeat: []const u8) ![]const u8 {
-        _ = before;
+    // Go's repeat additionally takes `before` to slice the pattern text into
+    // its positional error messages; this port's errors carry no position, so
+    // the parameter is dropped.
+    fn repeat(p: *Parser, o: Op, min: i32, max: i32, after0: []const u8, lastRepeat: []const u8) ![]const u8 {
         var after = after0;
         var flags = p.flags;
         if (p.flags & ast.PerlX != 0) {
@@ -280,7 +293,7 @@ const Parser = struct {
         const digits = t[0 .. t.len - s.len];
         var n: i32 = 0;
         for (digits) |d| {
-            if (n >= 1e8) {
+            if (n >= 100_000_000) {
                 n = -1;
                 break;
             }
@@ -857,8 +870,13 @@ fn appendNegatedTable(al: std.mem.Allocator, list: *std.ArrayList(u21), ranges: 
 /// abutting/overlapping ranges. Mirrors Go's `cleanClass`.
 fn cleanClass(list: *std.ArrayList(u21)) void {
     const r = list.items;
+    // A class list is always (lo, hi) pairs; the pair-cast and the i+1 reads
+    // below depend on it.
+    std.debug.assert(r.len % 2 == 0);
     if (r.len < 2) return;
     const n2 = r.len / 2;
+    // Reinterpret as pairs for sorting; u21 is stored as a 4-byte int, so
+    // [2]u21 is exactly two adjacent elements with no padding.
     const pairs: [][2]u21 = @as([*][2]u21, @ptrCast(@alignCast(r.ptr)))[0..n2];
     std.mem.sort([2]u21, pairs, {}, struct {
         fn lt(_: void, a: [2]u21, b: [2]u21) bool {
@@ -1012,8 +1030,46 @@ fn posixGroup(token: []const u8) ?CharGroup {
     return .{ .sign = sign, .class = class };
 }
 
+test "cleanClass sorts and merges overlapping/abutting ranges" {
+    const gpa = std.testing.allocator;
+    var list: std.ArrayList(u21) = .empty;
+    defer list.deinit(gpa);
+    // Unsorted with overlap: (30,40) (10,20) (15,35) → (10,40).
+    try list.appendSlice(gpa, &[_]u21{ 30, 40, 10, 20, 15, 35 });
+    cleanClass(&list);
+    try std.testing.expectEqualSlices(u21, &[_]u21{ 10, 40 }, list.items);
+
+    // Abutting ranges merge: (10,20) (21,30) → (10,30); (32,40) stays apart.
+    list.clearRetainingCapacity();
+    try list.appendSlice(gpa, &[_]u21{ 21, 30, 10, 20, 32, 40 });
+    cleanClass(&list);
+    try std.testing.expectEqualSlices(u21, &[_]u21{ 10, 30, 32, 40 }, list.items);
+}
+
+test "negateClass edges at 0 and max_rune" {
+    const gpa = std.testing.allocator;
+    var list: std.ArrayList(u21) = .empty;
+    defer list.deinit(gpa);
+
+    // Negating a middle range yields both flanks.
+    try list.appendSlice(gpa, &[_]u21{ 5, 10 });
+    try negateClass(gpa, &list);
+    try std.testing.expectEqualSlices(u21, &[_]u21{ 0, 4, 11, max_rune }, list.items);
+
+    // Negating everything yields the empty class.
+    list.clearRetainingCapacity();
+    try list.appendSlice(gpa, &[_]u21{ 0, max_rune });
+    try negateClass(gpa, &list);
+    try std.testing.expectEqualSlices(u21, &[_]u21{}, list.items);
+
+    // Negating the empty class yields everything.
+    list.clearRetainingCapacity();
+    try negateClass(gpa, &list);
+    try std.testing.expectEqualSlices(u21, &[_]u21{ 0, max_rune }, list.items);
+}
+
 test "parseInt basics" {
-    var p = Parser{ .al = std.testing.allocator, .flags = 0, .whole = "" };
+    var p = Parser{ .al = std.testing.allocator, .flags = 0 };
     const a = p.parseInt("123}");
     try std.testing.expect(a.ok and a.n == 123);
     const b = p.parseInt("01");

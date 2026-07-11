@@ -47,10 +47,6 @@ pub fn onePassNext(inst: *const OnePassInst, r: i32) u32 {
     return 0;
 }
 
-fn iop(op: InstOp) InstOp {
-    return prog.mergedOp(op);
-}
-
 // --- sparse-set queue ---
 
 const Queue = struct {
@@ -119,6 +115,8 @@ fn mergeRuneSets(al: std.mem.Allocator, left: []const u21, right: []const u21, l
         const pc = if (take_left) left_pc else right_pc;
         // extend, detecting overlap with the last appended hi
         if (ix > 0 and arr[idx.*] <= merged.items[@intCast(ix)]) {
+            merged.deinit(al);
+            next.deinit(al);
             return .{ .merged = &.{}, .next = try al.dupe(u32, &[_]u32{merge_failed}) };
         }
         try merged.append(al, arr[idx.*]);
@@ -128,6 +126,28 @@ fn mergeRuneSets(al: std.mem.Allocator, left: []const u21, right: []const u21, l
         try next.append(al, pc);
     }
     return .{ .merged = try merged.toOwnedSlice(al), .next = try next.toOwnedSlice(al) };
+}
+
+test "mergeRuneSets merges disjoint sets and rejects intersecting ones" {
+    const gpa = std.testing.allocator;
+
+    // Disjoint: ordering interleaves by lo, next[] records the source pc.
+    const ok = try mergeRuneSets(gpa, &[_]u21{ 'd', 'e' }, &[_]u21{ 'a', 'b' }, 1, 2);
+    defer {
+        gpa.free(ok.merged);
+        gpa.free(ok.next);
+    }
+    try std.testing.expectEqualSlices(u21, &[_]u21{ 'a', 'b', 'd', 'e' }, ok.merged);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 2, 1 }, ok.next);
+
+    // Intersecting: (a,c) overlaps (b,e) → merge_failed sentinel.
+    const bad = try mergeRuneSets(gpa, &[_]u21{ 'a', 'c' }, &[_]u21{ 'b', 'e' }, 1, 2);
+    defer {
+        gpa.free(bad.merged);
+        gpa.free(bad.next);
+    }
+    try std.testing.expectEqual(@as(usize, 1), bad.next.len);
+    try std.testing.expectEqual(merge_failed, bad.next[0]);
 }
 
 const any_rune = [_]u21{ 0, unicode.max_rune };
@@ -297,9 +317,10 @@ fn makeOnePass(al: std.mem.Allocator, p: *OnePassProg) !bool {
 }
 
 /// Build a one-pass program from `prog` if it qualifies (anchored, unambiguous
-/// at every Alt), else null. Mirrors Go's `compileOnePass`. Allocates from `al`
-/// (the owning Regexp's arena).
-pub fn compileOnePass(al: std.mem.Allocator, p: *const Prog) !?OnePassProg {
+/// at every Alt), else null. Mirrors Go's `compileOnePass`. The returned
+/// program is allocated from `al` (the owning Regexp's arena); `gpa` backs the
+/// transient analysis state, which is freed before returning.
+pub fn compileOnePass(gpa: std.mem.Allocator, al: std.mem.Allocator, p: *const Prog) !?OnePassProg {
     if (p.start == 0) return null;
     // One-pass regexps are anchored at the beginning of text.
     const start = &p.insts[p.start];
@@ -334,8 +355,28 @@ pub fn compileOnePass(al: std.mem.Allocator, p: *const Prog) !?OnePassProg {
         }
     }
 
-    var opp = try onePassCopy(al, p);
-    if (!try makeOnePass(al, &opp)) return null;
+    // Run the copy + analysis in a temporary arena: makeOnePass allocates
+    // queues, visit maps and intermediate rune sets that Go simply leaves to
+    // the GC. Under the Regexp's arena they would be pinned for its whole
+    // lifetime (and entirely wasted when the program fails to qualify), so
+    // only the qualifying program is deep-copied into `al`.
+    var tmp = std.heap.ArenaAllocator.init(gpa);
+    defer tmp.deinit();
+    const tal = tmp.allocator();
+
+    var opp = try onePassCopy(tal, p);
+    if (!try makeOnePass(tal, &opp)) return null;
     cleanupOnePass(&opp, p);
-    return opp;
+
+    const insts = try al.alloc(OnePassInst, opp.insts.len);
+    for (opp.insts, 0..) |inst, i| {
+        insts[i] = .{
+            .op = inst.op,
+            .out = inst.out,
+            .arg = inst.arg,
+            .runes = if (inst.runes.len > 0) try al.dupe(u21, inst.runes) else &.{},
+            .next = if (inst.next.len > 0) try al.dupe(u32, inst.next) else &.{},
+        };
+    }
+    return .{ .insts = insts, .start = opp.start, .num_cap = opp.num_cap };
 }

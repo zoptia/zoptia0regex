@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const regex = @import("regexp.zig");
+const eqOptInts = @import("difftest_common.zig").eqOptInts;
 
 const Case = struct {
     p: []const u8,
@@ -70,15 +71,7 @@ fn checkCase(gpa: std.mem.Allocator, c: Case) !bool {
     const got = try re.findSubmatchIndex(gpa, c.i);
     defer if (got) |g| gpa.free(g);
 
-    if (c.m == null) return got == null;
-    if (got == null) return false;
-    const want = c.m.?;
-    const g = got.?;
-    if (want.len != g.len) return false;
-    for (want, g) |a, b| {
-        if (a != b) return false;
-    }
-    return true;
+    return eqOptInts(c.m, got);
 }
 
 fn reportMismatch(gpa: std.mem.Allocator, c: Case) void {

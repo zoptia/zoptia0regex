@@ -9,6 +9,9 @@
 
 const std = @import("std");
 const regex = @import("regexp.zig");
+const common = @import("difftest_common.zig");
+const eqOptInts = common.eqOptInts;
+const eqOptNested = common.eqOptNested;
 
 const LCase = struct {
     p: []const u8,
@@ -69,23 +72,4 @@ test "leftmost-longest differential vs Go" {
 
     std.debug.print("\n[longest] total={d} passed={d} m_fail={d} all_fail={d}\n", .{ total, passed, m_fail, all_fail });
     try std.testing.expectEqual(@as(usize, 0), m_fail + all_fail);
-}
-
-fn eqOptInts(want: ?[]i64, got: ?[]i64) bool {
-    if (want == null) return got == null;
-    if (got == null) return false;
-    if (want.?.len != got.?.len) return false;
-    for (want.?, got.?) |x, y| if (x != y) return false;
-    return true;
-}
-
-fn eqOptNested(want: ?[][]i64, got: ?[][]i64) bool {
-    if (want == null) return got == null;
-    if (got == null) return false;
-    if (want.?.len != got.?.len) return false;
-    for (want.?, got.?) |x, y| {
-        if (x.len != y.len) return false;
-        for (x, y) |p, q| if (p != q) return false;
-    }
-    return true;
 }

@@ -55,6 +55,18 @@ pub const Regexp = struct {
         return (re.num_subexp + 1) * 2;
     }
 
+    /// Run the engines over `input` starting at `pos` with a per-call scratch.
+    /// `caps` receives the submatch offsets (its length bounds how many are
+    /// recorded); returns whether a match was found.
+    fn execAt(re: *const Regexp, allocator: std.mem.Allocator, input: exec.Input, pos: usize, caps: []i64) ExecError!bool {
+        return exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.prefix, input, pos, caps);
+    }
+
+    /// `execAt` borrowing all engine storage from a caller-owned `Scratch`.
+    fn execAtScratch(re: *const Regexp, scratch: *Scratch, input: exec.Input, pos: usize, caps: []i64) ExecError!bool {
+        return exec.executeReuse(scratch, &re.prog, re.onepass, re.longest, re.cond, re.prefix, input, pos, caps);
+    }
+
     // --- introspection ---
 
     /// The source text the regexp was compiled from.
@@ -98,7 +110,7 @@ pub const Regexp = struct {
     pub fn match(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!bool {
         if (input.len < re.min_input_len) return false;
         var caps: [0]i64 = .{};
-        return try exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.prefix, .{ .s = input }, 0, &caps);
+        return try re.execAt(allocator, .{ .s = input }, 0, &caps);
     }
 
     /// Alias of `match` (Go distinguishes `[]byte` and `string`; here both are
@@ -115,7 +127,17 @@ pub const Regexp = struct {
     pub fn matchScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!bool {
         if (input.len < re.min_input_len) return false;
         var caps: [0]i64 = .{};
-        return try exec.executeReuse(scratch, &re.prog, re.onepass, re.longest, re.cond, re.prefix, .{ .s = input }, 0, &caps);
+        return try re.execAtScratch(scratch, .{ .s = input }, 0, &caps);
+    }
+
+    /// Like `findIndex`, but reuses a caller-owned `Scratch` instead of
+    /// allocating per call. See `matchScratch` for the reuse contract.
+    pub fn findIndexScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!?Match {
+        if (input.len < re.min_input_len) return null;
+        var caps: [2]i64 = .{ -1, -1 };
+        const matched = try re.execAtScratch(scratch, .{ .s = input }, 0, &caps);
+        if (!matched) return null;
+        return Match{ .start = @intCast(caps[0]), .end = @intCast(caps[1]) };
     }
 
     /// Like `findSubmatchIndex`, but reuses a caller-owned `Scratch`. The
@@ -125,7 +147,7 @@ pub const Regexp = struct {
     pub fn findSubmatchIndexScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!?[]i64 {
         if (input.len < re.min_input_len) return null;
         const caps = try scratch.resultBuf(re.padLen());
-        const matched = try exec.executeReuse(scratch, &re.prog, re.onepass, re.longest, re.cond, re.prefix, .{ .s = input }, 0, caps);
+        const matched = try re.execAtScratch(scratch, .{ .s = input }, 0, caps);
         if (!matched) return null;
         return caps;
     }
@@ -136,7 +158,7 @@ pub const Regexp = struct {
     pub fn findIndex(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!?Match {
         if (input.len < re.min_input_len) return null;
         var caps: [2]i64 = .{ -1, -1 };
-        const matched = try exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.prefix, .{ .s = input }, 0, &caps);
+        const matched = try re.execAt(allocator, .{ .s = input }, 0, &caps);
         if (!matched) return null;
         return Match{ .start = @intCast(caps[0]), .end = @intCast(caps[1]) };
     }
@@ -155,7 +177,8 @@ pub const Regexp = struct {
     pub fn findSubmatchIndex(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!?[]i64 {
         if (input.len < re.min_input_len) return null;
         const caps = try allocator.alloc(i64, re.padLen());
-        const matched = try exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.prefix, .{ .s = input }, 0, caps);
+        errdefer allocator.free(caps);
+        const matched = try re.execAt(allocator, .{ .s = input }, 0, caps);
         if (!matched) {
             allocator.free(caps);
             return null;
@@ -200,7 +223,8 @@ pub const Regexp = struct {
 
         while (count < limit and pos <= end) {
             const caps = try allocator.alloc(i64, re.padLen());
-            const matched = try exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.prefix, in, pos, caps);
+            errdefer allocator.free(caps);
+            const matched = try re.execAt(allocator, in, pos, caps);
             if (!matched) {
                 allocator.free(caps);
                 break;
@@ -336,7 +360,7 @@ pub const Regexp = struct {
         const in = exec.Input{ .s = src };
 
         while (search_pos <= end_pos) {
-            const matched = try exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.prefix, in, search_pos, caps);
+            const matched = try re.execAt(allocator, in, search_pos, caps);
             if (!matched) break;
             const a0: usize = @intCast(caps[0]);
             const a1: usize = @intCast(caps[1]);
@@ -470,7 +494,7 @@ fn extract(str0: []const u8) Extracted {
     var num: i64 = 0;
     var isnum = true;
     for (name) |c| {
-        if (c < '0' or c > '9' or num >= 1e8) {
+        if (c < '0' or c > '9' or num >= 100_000_000) {
             isnum = false;
             break;
         }
@@ -515,7 +539,7 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
 
     // Build the one-pass program if the regexp qualifies (anchored, unambiguous).
     const op_prog: ?*onepass.OnePassProg = blk: {
-        if (try onepass.compileOnePass(al, &p)) |opp| {
+        if (try onepass.compileOnePass(gpa, al, &p)) |opp| {
             const ptr = try al.create(onepass.OnePassProg);
             ptr.* = opp;
             break :blk ptr;

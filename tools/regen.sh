@@ -4,11 +4,13 @@
 #
 #   tools/regen.sh        # regenerate everything
 #
-# Outputs:
+# Outputs (all committed; rerun only when a generator changes):
 #   src/fold_table.zig      faithful unicode.SimpleFold table (all of Unicode)
 #   src/unicode_tables.zig  curated \p{...} category/script tables
-#   src/cases.jsonl         curated differential corpus (committed)
-#   src/fuzz.jsonl          large random differential corpus (gitignored)
+#   src/cases.jsonl         curated differential corpus
+#   src/fuzz.jsonl          large random differential corpus
+#   src/longest.jsonl       POSIX leftmost-longest corpus
+#   src/bench.jsonl + src/bench_*.txt  benchmark workloads and corpus
 set -e
 cd "$(dirname "$0")/.."
 
@@ -31,4 +33,4 @@ echo "generating benchmark corpus (src/bench*.{jsonl,txt}) ..."
 ( cd tools && go run genbench.go ) > src/bench.jsonl
 
 echo "done. counts:"
-wc -l src/cases.jsonl src/fuzz.jsonl src/longest.jsonl
+wc -l src/cases.jsonl src/fuzz.jsonl src/longest.jsonl src/bench.jsonl

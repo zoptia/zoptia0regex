@@ -10,6 +10,9 @@
 
 const std = @import("std");
 const regex = @import("regexp.zig");
+const common = @import("difftest_common.zig");
+const eqOptInts = common.eqOptInts;
+const eqOptNested = common.eqOptNested;
 
 const repl_template = "[$0/$1]";
 
@@ -113,27 +116,4 @@ fn checkAll(gpa: std.mem.Allocator, re: *regex.Regexp, c: Case) !usize {
         }
     }
     return 0;
-}
-
-fn eqOptInts(want: ?[]i64, got: ?[]i64) bool {
-    if (want == null) return got == null;
-    if (got == null) return false;
-    const a = want.?;
-    const b = got.?;
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| if (x != y) return false;
-    return true;
-}
-
-fn eqOptNested(want: ?[][]i64, got: ?[][]i64) bool {
-    if (want == null) return got == null;
-    if (got == null) return false;
-    const a = want.?;
-    const b = got.?;
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (x.len != y.len) return false;
-        for (x, y) |p, q| if (p != q) return false;
-    }
-    return true;
 }

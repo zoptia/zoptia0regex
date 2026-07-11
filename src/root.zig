@@ -37,6 +37,7 @@ test {
     _ = @import("simplify.zig");
     _ = @import("compile.zig");
     _ = @import("exec.zig");
+    _ = @import("onepass.zig");
     _ = @import("regexp.zig");
     _ = @import("tests.zig");
 }

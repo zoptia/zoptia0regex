@@ -64,7 +64,7 @@ pub fn isWordChar(r: i32) bool {
 /// canonicalName returns the canonical lookup string for a `\p{...}` name:
 /// leading uppercase, the rest lowercase, omitting `_`, `-`, and spaces.
 /// Caller owns the returned slice.
-pub fn canonicalName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+fn canonicalName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var first = true;

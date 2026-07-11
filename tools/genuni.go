@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"sort"
 	"unicode"
 )
 
@@ -42,7 +41,11 @@ func emit(f *os.File, varname string, t *unicode.RangeTable) int {
 }
 
 func main() {
-	f, _ := os.Create("unicode_tables.zig")
+	f, err := os.Create("unicode_tables.zig")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	defer f.Close()
 	fmt.Fprintln(f, "// Code generated from Go unicode.Categories / unicode.Scripts; DO NOT EDIT.")
 	fmt.Fprintln(f, "// A curated subset of the most common general categories and scripts,")
@@ -58,8 +61,6 @@ func main() {
 			names = append(names, c)
 		}
 	}
-	scriptNames := append([]string{}, scripts...)
-	sort.Strings(scriptNames)
 	for _, s := range scripts {
 		if t := unicode.Scripts[s]; t != nil {
 			total += emit(f, s, t)

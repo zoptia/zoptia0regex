@@ -122,3 +122,64 @@ fn concatOf(al: std.mem.Allocator, list: *std.ArrayList(*Regexp)) Error!*Regexp 
     re.sub = try list.toOwnedSlice(al);
     return re;
 }
+
+// The counted-repetition expansion below is the delicate part of this pass;
+// these tests pin its shape (behaviour is separately proven by the
+// differential suite).
+
+const parse = @import("parse.zig");
+
+fn parseAndSimplify(al: std.mem.Allocator, pattern: []const u8) !*Regexp {
+    return simplify(al, try parse.parse(al, pattern, ast.Perl));
+}
+
+test "simplify x{n,m} expands to prefix + nested quest" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // a{2,4} -> aa(a(a)?)? : two literals then a quest.
+    const re = try parseAndSimplify(al, "a{2,4}");
+    try std.testing.expectEqual(Op.concat, re.op);
+    try std.testing.expectEqual(@as(usize, 3), re.sub.len);
+    try std.testing.expectEqual(Op.literal, re.sub[0].op);
+    try std.testing.expectEqual(Op.literal, re.sub[1].op);
+    try std.testing.expectEqual(Op.quest, re.sub[2].op);
+    // The quest nests one more optional copy: (a(a)?)?.
+    const inner = re.sub[2].sub[0];
+    try std.testing.expectEqual(Op.concat, inner.op);
+    try std.testing.expectEqual(@as(usize, 2), inner.sub.len);
+    try std.testing.expectEqual(Op.quest, inner.sub[1].op);
+}
+
+test "simplify x{n,} expands to copies + plus" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // a{3,} -> aaa+ : two literals then a plus.
+    const re = try parseAndSimplify(al, "a{3,}");
+    try std.testing.expectEqual(Op.concat, re.op);
+    try std.testing.expectEqual(@as(usize, 3), re.sub.len);
+    try std.testing.expectEqual(Op.literal, re.sub[0].op);
+    try std.testing.expectEqual(Op.literal, re.sub[1].op);
+    try std.testing.expectEqual(Op.plus, re.sub[2].op);
+}
+
+test "simplify degenerate repeats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // x{1,1} is x itself.
+    try std.testing.expectEqual(Op.literal, (try parseAndSimplify(al, "a{1,1}")).op);
+    // x{0,0} matches only the empty string.
+    try std.testing.expectEqual(Op.empty_match, (try parseAndSimplify(al, "a{0,0}")).op);
+    // x{0,} / x{1,} reduce to star / plus.
+    try std.testing.expectEqual(Op.star, (try parseAndSimplify(al, "a{0,}")).op);
+    try std.testing.expectEqual(Op.plus, (try parseAndSimplify(al, "a{1,}")).op);
+    // Nested idempotent operators collapse: (?:a+)+ -> a+.
+    const re = try parseAndSimplify(al, "(?:a+)+");
+    try std.testing.expectEqual(Op.plus, re.op);
+    try std.testing.expectEqual(Op.literal, re.sub[0].op);
+}

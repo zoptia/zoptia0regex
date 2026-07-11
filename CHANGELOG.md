@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `findIndexScratch`: the `findIndex` companion to `matchScratch` /
+  `findSubmatchIndexScratch`, completing the allocation-free family for hot
+  loops that need match offsets.
+- `zig build fmt`: the CI formatting gate as a build step.
+- Unit tests for the delicate internal helpers (`simplify` counted-repeat
+  expansion, `cleanClass` / `negateClass`, `mergeRuneSets`, `decodeLastRune`,
+  `prefixIndex`); `onepass.zig` is now included in the `zig build test` tree.
+- The `Scratch` API is now documented in the usage guide (it shipped in 0.2.0
+  undocumented).
+
+### Fixed
+
+- `findSubmatchIndex` and the `findAll*` family no longer leak the caps buffer
+  if the engine reports `OutOfMemory` mid-search.
+- `mergeRuneSets` no longer leaks its partially-built buffers when the rune
+  sets intersect (previously masked by arena allocation).
+- One-pass compilation no longer pins its transient analysis state (queues,
+  visit maps, intermediate rune sets) in the `Regexp`'s arena for the pattern's
+  whole lifetime; a failed qualification now allocates nothing lasting.
+
+### Internal
+
+- Removed dead code: the parser's unused `whole` field and `before` parameter,
+  `onepass.iop`, and dead statements in the corpus generators.
+- The three differential-test drivers share one comparison-helper module; the
+  public exec entry points in `regexp.zig` share `execAt` helpers.
+- Documentation/comment drift corrected (stale "single engine" module header in
+  `exec.zig`, misplaced difftest comment in `build.zig`, wrong "gitignored"
+  claims about committed corpora, `regen.sh` output list).
+
 ## [0.2.0] — 2026-06-28
 
 ### Added

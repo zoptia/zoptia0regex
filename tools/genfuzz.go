@@ -94,8 +94,6 @@ func main() {
 			enc.Encode(Case{P: p, Err: true})
 			continue
 		}
-		repl := regexp.MustCompile(p) // same
-		_ = repl
 		for j := 0; j < 6; j++ {
 			in := genInput(r)
 			c := Case{

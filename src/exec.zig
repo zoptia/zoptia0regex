@@ -1,7 +1,9 @@
-//! The Pike VM: an NFA simulation with submatch tracking, faithfully porting
-//! Go's `regexp/exec.go`. This is the single execution engine (Go additionally
-//! has one-pass and bitstate-backtracking engines purely for speed; the Pike
-//! VM alone produces identical results for every supported pattern).
+//! The execution engines, faithfully porting Go's `regexp/exec.go` and
+//! `backtrack.go`. `execute` dispatches exactly like Go: the one-pass engine
+//! (see `onepass.zig`) for qualifying anchored regexps, the bitstate
+//! backtracker for small programs/inputs, and the Pike VM (an NFA simulation
+//! with submatch tracking) for everything else. All three produce identical
+//! results; the fast engines exist purely for speed.
 //!
 //! Match priority is leftmost-first (RE2 / Perl semantics): `add` performs the
 //! epsilon-closure in greedy-priority order, and in first-match mode `step`
@@ -796,6 +798,25 @@ pub fn executeReuse(
     if (!try m.run(input, pos)) return false;
     @memcpy(caps, m.matchcap);
     return true;
+}
+
+test "decodeLastRune handles ASCII, multibyte, and malformed tails" {
+    const expectEqual = std.testing.expectEqual;
+    try expectEqual(@as(i32, 'a'), decodeLastRune("xa"));
+    try expectEqual(@as(i32, 0x65E5), decodeLastRune("ab日")); // 3-byte rune
+    try expectEqual(end_of_text, decodeLastRune(""));
+    try expectEqual(@as(i32, 0xFFFD), decodeLastRune("\xE6\x97")); // truncated lead
+    try expectEqual(@as(i32, 0xFFFD), decodeLastRune("a\x80")); // lone continuation
+    try expectEqual(@as(i32, 0xFFFD), decodeLastRune("\xFF")); // invalid byte
+}
+
+test "prefixIndex finds first occurrence or null" {
+    const expectEqual = std.testing.expectEqual;
+    try expectEqual(@as(?usize, 0), prefixIndex("hello", ""));
+    try expectEqual(@as(?usize, 1), prefixIndex("xyz", "y"));
+    try expectEqual(@as(?usize, 2), prefixIndex("ababc", "abc")); // first-byte false start
+    try expectEqual(@as(?usize, null), prefixIndex("ababab", "abc"));
+    try expectEqual(@as(?usize, null), prefixIndex("ab", "abc")); // needle longer than haystack
 }
 
 /// Allocating variant: the existing public entry point. Wraps `executeReuse`

@@ -347,6 +347,10 @@ test "scratch reuse carries no stale state across patterns" {
         } else {
             try std.testing.expect(got == null);
         }
+        // findIndexScratch must agree with the allocating findIndex.
+        const want_idx = try re.findIndex(ta, c.in);
+        const got_idx = try re.findIndexScratch(&scratch, c.in);
+        try std.testing.expectEqual(want_idx, got_idx);
     }
 }
 

@@ -323,6 +323,35 @@ pub fn Regexp.literalPrefix(re: *const Regexp) struct { prefix: []const u8, comp
 
 ---
 
+### Allocation-free matching (`Scratch`)
+
+The methods above allocate (and free) their engine working memory on every
+call. For a hot loop over one compiled pattern, allocate a reusable `Scratch`
+once instead — after warm-up each call does zero heap allocation, like Go's
+pooled `*machine`:
+
+| Method | Description | No match |
+|---|---|---|
+| `matchScratch` | `match` reusing a caller-owned `Scratch`. | `false` |
+| `findIndexScratch` | `findIndex` reusing a caller-owned `Scratch`. | `null` |
+| `findSubmatchIndexScratch` | `findSubmatchIndex` reusing a caller-owned `Scratch`. **The returned slice is borrowed from the scratch** — valid only until the next call that reuses it; copy it to keep it, and do *not* free it. | `null` |
+
+```zig
+var scratch = regex.Scratch.init(gpa);
+defer scratch.deinit();
+
+for (lines) |line| {
+    if (try re.matchScratch(&scratch, line)) hits += 1;
+}
+```
+
+A `Scratch` may be reused across different `Regexp`s (its buffers regrow as
+needed), but it carries no synchronisation: never share one `Scratch` between
+concurrent matches. The rest of the API is unchanged and remains safe to use
+concurrently with per-call allocators.
+
+---
+
 ## 4. Memory model
 
 The split is deliberate and consistent:
@@ -357,6 +386,11 @@ The split is deliberate and consistent:
   - `replaceAll*` and `quoteMeta` return owned `[]u8` — free with
     `allocator.free`.
   - `expand` appends into a `buf` you own and free yourself.
+
+- **`Scratch` owns its buffers.** The `*Scratch` variants borrow all working
+  memory (and, for `findSubmatchIndexScratch`, the result slice) from the
+  `Scratch` you pass; `scratch.deinit()` frees it all. Nothing they return is
+  yours to free.
 
 - **No-match is `null`, not an error.** The find/match family return
   `?...`; only allocation failure produces an error (`ExecError`).
