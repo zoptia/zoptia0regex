@@ -63,13 +63,15 @@ three engines.
 **Three execution engines, dispatched in `exec.zig:execute()` exactly as Go
 does** (`onepass != null` → one-pass; small prog+input → bitstate; else Pike VM),
 all sharing the compile-time acceleration data in `exec.Accel`: a literal
-prefix (`prefixIndex` — vectorized first-byte scan with a Rabin-Karp fallback,
-like Go's `bytes.Index`; for one-pass regexps `onePassPrefix` also yields the
-pc to resume at after the prefix), and — a port-specific addition with no Go
+prefix (`prefixIndexAnchored` — scan anchored on the prefix's rarest byte,
+precomputed into `Accel.prefix_anchor`, with a Rabin-Karp fallback like Go's
+`bytes.Index`; for one-pass regexps `onePassPrefix` also yields the pc to
+resume at after the prefix), and — a port-specific addition with no Go
 counterpart — a `first_bytes` set (`regexp.zig:firstBytes`): when there is no
-literal prefix, a ≤4-byte ASCII set of possible match-start bytes that the
-Pike VM / bitstate engines skip ahead to (this is what makes unanchored `(?i)`
-literals fast). `first_bytes` must stay a *superset* of the true start bytes —
+literal prefix, a ≤16-byte ASCII set of possible match-start bytes that the
+Pike VM / bitstate engines skip ahead to via `exec.indexOfAnyByte`, a portable
+`@Vector` SIMD sweep (this is what makes unanchored `(?i)` and `\d`-led scans
+fast). `first_bytes` must stay a *superset* of the true start bytes —
 e.g. it is disabled when a case-fold cycle leaves ASCII (`(?i)k` matches
 U+212A) — and the Pike VM must recompute the boundary `flag` after a
 first-bytes skip (`\b` before the first rune). All three engines must produce

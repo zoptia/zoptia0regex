@@ -22,6 +22,11 @@ const OnePassProg = onepass.OnePassProg;
 
 const end_of_text: i32 = -1;
 
+/// Max size of the accelerated first-byte set. The SIMD scan's cost grows
+/// only slowly with the set size; past ~16 bytes the set stops *filtering*
+/// (too many positions qualify) rather than costing too much to scan.
+pub const max_first_bytes = 16;
+
 /// Match-acceleration data computed at compile time (see `regexp.compileInternal`).
 pub const Accel = struct {
     /// Literal string every match must start with ("" = none). For one-pass
@@ -29,9 +34,13 @@ pub const Accel = struct {
     prefix: []const u8 = "",
     /// One-pass only: the pc to resume at after `prefix` has been consumed.
     prefix_end: u32 = 0,
-    /// When `prefix` is empty: the (ASCII) bytes a match can start with, or
-    /// empty when no such small set exists. A superset of the true first
-    /// bytes, so skipping to the next occurrence can never skip a match.
+    /// Offset of `prefix`'s rarest byte (see `prefixAnchor`), precomputed at
+    /// compile time so the per-call search does not rescan the needle.
+    prefix_anchor: u32 = 0,
+    /// When `prefix` is empty: the (ASCII) bytes a match can start with
+    /// (at most `max_first_bytes`), or empty when no such small set exists.
+    /// A superset of the true first bytes, so skipping to the next
+    /// occurrence can never skip a match.
     first_bytes: []const u8 = "",
 };
 
@@ -42,6 +51,78 @@ fn inFirstBytes(set: []const u8, r: i32) bool {
         if (x == b) return true;
     }
     return false;
+}
+
+/// Vectorized first-index-of-any-byte — the memchr2/…/memchr16 analogue used
+/// by the first-byte prefilter. One portable implementation: `@Vector`
+/// compiles to NEON on aarch64, SSE2 on baseline x86_64 (wider with
+/// `-Dcpu=native` on AVX2 machines), and degrades to the scalar std search on
+/// targets without SIMD registers.
+fn indexOfAnyByte(haystack: []const u8, set: []const u8) ?usize {
+    std.debug.assert(set.len >= 1 and set.len <= max_first_bytes);
+    if (set.len == 1) return std.mem.indexOfScalar(u8, haystack, set[0]);
+    const width = comptime std.simd.suggestVectorLength(u8) orelse
+        return std.mem.indexOfAny(u8, haystack, set);
+    const V = @Vector(width, u8);
+    const Mask = std.meta.Int(.unsigned, width);
+
+    var splats: [max_first_bytes]V = undefined;
+    for (set, 0..) |b, k| splats[k] = @splat(b);
+
+    var i: usize = 0;
+    while (i + width <= haystack.len) : (i += width) {
+        const chunk: V = haystack[i..][0..width].*;
+        var mask: Mask = 0;
+        for (splats[0..set.len]) |s| mask |= @as(Mask, @bitCast(chunk == s));
+        if (mask != 0) return i + @ctz(mask);
+    }
+    while (i < haystack.len) : (i += 1) {
+        const c = haystack[i];
+        for (set) |b| {
+            if (c == b) return i;
+        }
+    }
+    return null;
+}
+
+/// Heuristic byte-frequency ranks (higher = more common in typical text and
+/// code). Only the relative order matters: `prefixIndex` anchors its scan on
+/// the needle's lowest-ranked byte, the idea behind rust-memmem's rare-byte
+/// heuristic — scanning for `-` or `@` false-starts far less often than
+/// scanning for `a`.
+const byte_rank: [256]u8 = blk: {
+    @setEvalBranchQuota(10_000);
+    var r = [_]u8{15} ** 256;
+    for (0..0x20) |c| r[c] = 3; // control bytes: rare
+    r['\n'] = 180;
+    r['\t'] = 120;
+    r[' '] = 255;
+    const order = "etaoinsrhldcumfpgwybvkxjqz"; // approximate English order
+    for (order, 0..) |c, idx| {
+        const common: u8 = 240 - @as(u8, @intCast(idx)) * 6;
+        r[c] = common;
+        r[std.ascii.toUpper(c)] = common / 3;
+    }
+    for ('0'..'9' + 1) |c| r[c] = 100;
+    for (".,-_'\"()/:;=") |c| r[c] = 90;
+    for (0x80..0x100) |c| r[c] = 30; // UTF-8 lead/continuation bytes
+    break :blk r;
+};
+
+fn rarestByteOffset(needle: []const u8) usize {
+    var best: usize = 0;
+    for (needle, 0..) |b, i| {
+        if (byte_rank[b] < byte_rank[needle[best]]) best = i;
+    }
+    return best;
+}
+
+/// The scan anchor for a literal prefix: the offset of its rarest byte.
+/// Computed once at compile time (`regexp.compileInternal`) and carried in
+/// `Accel.prefix_anchor`.
+pub fn prefixAnchor(prefix: []const u8) u32 {
+    if (prefix.len < 2) return 0;
+    return @intCast(rarestByteOffset(prefix));
 }
 
 /// A lazily-evaluated pair of boundary runes, for checking zero-width
@@ -114,21 +195,32 @@ pub const Input = struct {
     }
 };
 
-/// Find the first occurrence of `needle` in `haystack`. Like Go's bytes.Index,
-/// it scans for the first byte with a vectorized search (`indexOfScalar`) and
-/// verifies the rest — much faster than a generic substring search for the
-/// common "rare first byte" case — and, like Go, switches to Rabin-Karp when
-/// the first byte produces too many false starts (a periodic needle over a
-/// periodic haystack is otherwise O(n·m)).
+/// Find the first occurrence of `needle` in `haystack`. Scans for the
+/// needle's *rarest* byte with a vectorized search (`indexOfScalar`) and
+/// verifies the rest around each hit — anchoring on the rarest byte (rust
+/// memmem's heuristic) false-starts far less often than anchoring on the
+/// first byte when the first byte is common. Like Go's bytes.Index, it
+/// switches to Rabin-Karp when the anchor still produces too many false
+/// starts (a periodic needle over a periodic haystack is otherwise O(n·m)).
 fn prefixIndex(haystack: []const u8, needle: []const u8) ?usize {
+    return prefixIndexAnchored(haystack, needle, prefixAnchor(needle));
+}
+
+fn prefixIndexAnchored(haystack: []const u8, needle: []const u8, anchor: usize) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len == 1) return std.mem.indexOfScalar(u8, haystack, needle[0]);
-    var start: usize = 0;
+    if (haystack.len < needle.len) return null;
+    const tail = needle.len - anchor; // needle bytes at/after the anchor
+    var start: usize = 0; // candidate needle start
     var fails: usize = 0;
     while (start + needle.len <= haystack.len) {
-        const rel = std.mem.indexOfScalar(u8, haystack[start..], needle[0]) orelse return null;
-        const at = start + rel;
-        if (at + needle.len > haystack.len) return null;
+        const found = std.mem.indexOfScalarPos(
+            u8,
+            haystack[0 .. haystack.len - tail + 1],
+            start + anchor,
+            needle[anchor],
+        ) orelse return null;
+        const at = found - anchor;
         if (std.mem.eql(u8, haystack[at .. at + needle.len], needle)) return at;
         start = at + 1;
         fails += 1;
@@ -523,7 +615,7 @@ const Machine = struct {
                 // prefix, so fast-forward to its next occurrence (memchr-class
                 // substring search) instead of stepping the NFA at every byte.
                 if (m.accel.prefix.len > 0 and r1 != m.prefix_rune and pos <= input.s.len) {
-                    if (prefixIndex(input.s[pos..], m.accel.prefix)) |adv| {
+                    if (prefixIndexAnchored(input.s[pos..], m.accel.prefix, m.accel.prefix_anchor)) |adv| {
                         pos += adv;
                         const sa = input.step(pos);
                         r = sa.r;
@@ -539,7 +631,7 @@ const Machine = struct {
                     // scan ahead to the next candidate. Unlike the prefix
                     // path, the closure may pass zero-width assertions, so
                     // the boundary flag must be recomputed for the new pos.
-                    if (std.mem.indexOfAny(u8, input.s[pos..], m.accel.first_bytes)) |adv| {
+                    if (indexOfAnyByte(input.s[pos..], m.accel.first_bytes)) |adv| {
                         if (adv > 0) {
                             pos += adv;
                             const sa = input.step(pos);
@@ -765,12 +857,12 @@ fn backtrack(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, ac
     const end_i: i64 = @intCast(end);
     while (p_pos <= end_i and width != 0) {
         if (accel.prefix.len > 0) {
-            const adv = prefixIndex(input.s[@intCast(p_pos)..], accel.prefix) orelse return false;
+            const adv = prefixIndexAnchored(input.s[@intCast(p_pos)..], accel.prefix, accel.prefix_anchor) orelse return false;
             p_pos += @intCast(adv);
         } else if (accel.first_bytes.len > 0) {
             // No literal prefix, but every match starts with one of a few
             // ASCII bytes: jump to the next candidate start.
-            const adv = std.mem.indexOfAny(u8, input.s[@intCast(p_pos)..], accel.first_bytes) orelse return false;
+            const adv = indexOfAnyByte(input.s[@intCast(p_pos)..], accel.first_bytes) orelse return false;
             p_pos += @intCast(adv);
         }
         if (b.cap.len > 0) b.cap[0] = p_pos;
@@ -919,12 +1011,50 @@ test "prefixIndex finds first occurrence or null" {
     try expectEqual(@as(?usize, null), prefixIndex("ab", "abc")); // needle longer than haystack
 }
 
+test "indexOfAnyByte agrees with the scalar std search" {
+    var prng = std.Random.DefaultPrng.init(42);
+    const rand = prng.random();
+    var hay: [300]u8 = undefined;
+    for (&hay) |*b| b.* = 'a' + rand.uintLessThan(u8, 20);
+    const sets = [_][]const u8{
+        "xy",
+        "qzv",
+        "abcd",
+        "abcdefghijklmnop", // max_first_bytes = 16
+        "QZ", // absent from the haystack
+    };
+    // Slide both endpoints so hits land before, inside, and after the last
+    // full SIMD chunk, plus empty and sub-width slices.
+    for (sets) |set| {
+        var lo: usize = 0;
+        while (lo < hay.len) : (lo += 37) {
+            var hi = lo;
+            while (hi <= hay.len) : (hi += 23) {
+                const want = std.mem.indexOfAny(u8, hay[lo..hi], set);
+                try std.testing.expectEqual(want, indexOfAnyByte(hay[lo..hi], set));
+            }
+        }
+    }
+}
+
+test "prefixIndex anchors on the rarest byte" {
+    // 'x' is rarer than 'a'/'e'; a common-first-byte needle must still be
+    // found correctly wherever it sits.
+    try std.testing.expectEqual(@as(?usize, 6), prefixIndex("aeaeaeaext", "aext"));
+    try std.testing.expectEqual(@as(?usize, 0), prefixIndex("aext", "aext"));
+    try std.testing.expectEqual(@as(?usize, null), prefixIndex("aeaeaeae", "aext"));
+}
+
 test "prefixIndex Rabin-Karp fallback on periodic input" {
     const expectEqual = std.testing.expectEqual;
-    // Every 'a' is a false start, so the cutover to Rabin-Karp fires.
     const hay = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"; // 39 a's + b
     try expectEqual(@as(?usize, 35), prefixIndex(hay, "aaaab"));
     try expectEqual(@as(?usize, null), prefixIndex(hay[0..39], "aaaab"));
+    // A needle whose rarest byte is itself the periodic byte: every anchor
+    // hit is a false start, so the cutover to Rabin-Karp fires.
+    const hay2 = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxy"; // 30 x's + y
+    try expectEqual(@as(?usize, 26), prefixIndex(hay2, "xxxxy"));
+    try expectEqual(@as(?usize, null), prefixIndex(hay2[0..30], "xxxxy"));
     try expectEqual(@as(?usize, 0), indexRabinKarp("abcabd", "abc"));
     try expectEqual(@as(?usize, 3), indexRabinKarp("abdabc", "abc"));
     try expectEqual(@as(?usize, null), indexRabinKarp("ab", "abc"));

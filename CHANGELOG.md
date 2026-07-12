@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Performance
+
+Prefilter upgrades, all behaviour-neutral (~30k differential cases still
+byte-for-byte identical to Go). Benchmark geomean vs Go: **0.64×**
+(0.3.0: 0.73×); details in BENCHMARKS.md.
+
+- **SIMD first-byte scan.** The prefilter now scans with `exec.indexOfAnyByte`,
+  a portable `@Vector` sweep (NEON on aarch64, SSE2 on baseline x86_64, wider
+  with `-Dcpu=native`, scalar fallback on vector-less targets) instead of the
+  scalar `std.mem.indexOfAny`.
+- **First-byte set widened from 4 to 16 bytes** — `\d`-led patterns now
+  qualify: the `date` and `digits` corpus scans drop from 0.81×/0.87× vs Go
+  to **0.21×/0.27×**; unanchored `(?i)performance` reaches **0.25×**.
+- **Rarest-byte anchoring for the literal-prefix search** (rust-memmem's
+  heuristic): `prefixIndex` scans for the prefix's least-frequent byte rather
+  than its first byte, with the anchor offset precomputed at compile time
+  (`Accel.prefix_anchor`) so short-input hot loops pay nothing.
+
 ## [0.3.0] — 2026-07-11
 
 ### Performance

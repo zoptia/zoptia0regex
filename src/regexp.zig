@@ -41,6 +41,7 @@ pub const Regexp = struct {
     prefix: []const u8,
     prefix_complete: bool,
     prefix_end: u32,
+    prefix_anchor: u32,
     first_bytes: []const u8,
     onepass: ?*onepass.OnePassProg,
 
@@ -61,7 +62,12 @@ pub const Regexp = struct {
     /// `caps` receives the submatch offsets (its length bounds how many are
     /// recorded); returns whether a match was found.
     fn accel(re: *const Regexp) exec.Accel {
-        return .{ .prefix = re.prefix, .prefix_end = re.prefix_end, .first_bytes = re.first_bytes };
+        return .{
+            .prefix = re.prefix,
+            .prefix_end = re.prefix_end,
+            .prefix_anchor = re.prefix_anchor,
+            .first_bytes = re.first_bytes,
+        };
     }
 
     fn execAt(re: *const Regexp, allocator: std.mem.Allocator, input: exec.Input, pos: usize, caps: []i64) ExecError!bool {
@@ -592,14 +598,15 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
         .prefix = prefix_str,
         .prefix_complete = prefix_complete,
         .prefix_end = prefix_end,
+        .prefix_anchor = exec.prefixAnchor(prefix_str),
         .first_bytes = first_bytes,
         .onepass = op_prog,
     };
 }
 
-/// Max size of the accelerated first-byte set; a wider set filters too little
-/// to pay for the scan.
-const max_first_bytes = 4;
+/// Max size of the accelerated first-byte set (the SIMD scan in exec.zig
+/// handles up to this many bytes at flat cost; wider sets stop filtering).
+const max_first_bytes = exec.max_first_bytes;
 
 /// The set of bytes that can begin a match, computed from the epsilon-closure
 /// of the program start. Returns null (no acceleration) when the pattern can

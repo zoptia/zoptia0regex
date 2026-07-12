@@ -204,24 +204,28 @@ if (m.accel.prefix.len > 0 and r1 != m.prefix_rune and pos <= input.s.len) {
 }
 ```
 
-`prefixIndex` verifies candidates found by a first-byte scan and — like Go's
-`bytes.Index` — falls back to Rabin-Karp when the first byte produces too many
-false starts, keeping the search linear on periodic inputs. One-pass regexps
-use `onePassPrefix` instead, which additionally records the pc to resume at,
-so `doOnePass` checks the prefix with one `startsWith` and jumps straight past
-its instructions.
+The prefix scan anchors on the prefix's *rarest* byte (rust-memmem's
+heuristic, precomputed at compile time into `Accel.prefix_anchor`), verifies
+the full needle around each hit, and — like Go's `bytes.Index` — falls back
+to Rabin-Karp when the anchor produces too many false starts, keeping the
+search linear on periodic inputs. One-pass regexps use `onePassPrefix`
+instead, which additionally records the pc to resume at, so `doOnePass`
+checks the prefix with one `startsWith` and jumps straight past its
+instructions.
 
 **First-byte sets.** When there is no literal prefix (a case-insensitive
-literal, a small leading class), the compiler computes `first_bytes`: the
-ASCII bytes a match can possibly start with, from the epsilon-closure of the
-program start (≤ 4 bytes, else disabled — see `regexp.zig:firstBytes`). The
-Pike VM and bitstate engines skip ahead to the next such byte instead of
-stepping every position. This accelerator has no Go counterpart; it is safe
-because the set is a *superset* of the true start bytes (every zero-width
-assertion is treated as satisfiable, and it is disabled entirely when a
-case-fold cycle leaves ASCII — `(?i)k` also matches U+212A). It is what makes
-an unanchored `(?i)performance` scan run at memchr speed rather than NFA
-speed.
+literal, `\d`, a small leading class), the compiler computes `first_bytes`:
+the ASCII bytes a match can possibly start with, from the epsilon-closure of
+the program start (≤ 16 bytes, else disabled — see `regexp.zig:firstBytes`).
+The Pike VM and bitstate engines skip ahead to the next such byte with
+`exec.indexOfAnyByte` — a portable `@Vector` SIMD sweep that compiles to NEON
+on aarch64 and SSE2 on baseline x86_64 (one source implementation for every
+target; scalar fallback where the target has no vectors). This accelerator
+has no Go counterpart; it is safe because the set is a *superset* of the true
+start bytes (every zero-width assertion is treated as satisfiable, and it is
+disabled entirely when a case-fold cycle leaves ASCII — `(?i)k` also matches
+U+212A). It is what makes an unanchored `(?i)performance` or date scan run at
+memchr speed rather than NFA speed.
 
 `prefixIndex` finds the prefix's first byte with `std.mem.indexOfScalar` (a
 SIMD/`memchr`-class scalar scan) and verifies the rest — exactly Go's
