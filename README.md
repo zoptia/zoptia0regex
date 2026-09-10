@@ -5,7 +5,7 @@
 ### Go's `regexp`, faithfully replicated in Zig — and faster.
 
 A **regular-expression (regex) library for Zig** — a high-fidelity port of the
-RE2 engine, with a linear-time guarantee and **~30,000 tests proving
+RE2 engine, with a linear-time guarantee and **~35,000 tests proving
 byte-for-byte parity with Go**.
 
 [![CI](https://github.com/zoptia/zoptia0regex/actions/workflows/ci.yml/badge.svg)](https://github.com/zoptia/zoptia0regex/actions)
@@ -20,20 +20,20 @@ byte-for-byte parity with Go**.
 
 Head-to-head against Go's standard-library `regexp` — same patterns, same
 inputs, same 256 KB corpus, same calibration, Zig built `ReleaseFast` —
-**zoptia0regex is ~36% faster on average** and compiles patterns **~1.5×
-faster**. And it doesn't trade correctness for speed: ~30,000 differential tests
-prove its output is **byte-for-byte identical to Go's**.
+**zoptia0regex is ~44% faster on average** and compiles patterns **~1.4×
+faster**. And it doesn't trade correctness for speed: ~35,000 differential tests
+prove its output is **byte-for-byte identical to Go's** (go1.27.1, Unicode 17).
 
 Not "inspired by." **Proven identical.**
 
 - 🚀 **Faster than Go at matching.** Geometric mean across 20 workloads:
-  **0.64×** Go's time. Anchored "validation" patterns hit the one-pass engine
+  **0.56×** Go's time. Anchored "validation" patterns hit the one-pass engine
   and fly — up to **~2× faster** — and a SIMD first-byte prefilter Go doesn't
-  have runs unanchored `(?i)` and `\d`-led scans at **4–5× Go's speed**.
+  have runs unanchored `(?i)` and `\d`-led scans at **4.5–6× Go's speed**.
 - 🛡️ **Linear-time. ReDoS-proof.** Thompson NFA simulation means no catastrophic
   backtracking, ever. A pattern like `(a+)+` that hangs PCRE, JS, and Python
   runs in linear time here.
-- ✅ **Proven identical to Go.** ~30,000 differential cases run the *real* Go
+- ✅ **Proven identical to Go.** ~35,000 differential cases run the *real* Go
   `regexp` and this engine on the same inputs and require identical results.
   **Zero mismatches. Zero leaks.** The fidelity isn't a claim — it's enforced by
   the suite on every push.
@@ -59,22 +59,23 @@ wins.
 
 | Workload | Engine | Zig / Go |
 |---|---|---|
-| date scan (`\d{4}-…`) | first-bytes + Pike VM | **0.21×** |
-| `(?i)performance` (unanchored scan) | first-bytes + Pike VM | **0.25×** |
-| `\d+` | first-bytes + Pike VM | **0.27×** |
-| alternation | first-bytes + Pike VM | **0.36×** |
-| `\A\d+\z` (anchored validation) | one-pass | **0.47×** |
-| `\A[a-z]+\z` (anchored validation) | one-pass | **0.48×** |
-| `\A(?i)performance\z` | one-pass | **0.62×** |
-| `\A(...)@(...)\z` with captures | one-pass | **0.79×** |
-| **Geometric mean (20 workloads)** | — | **0.64×** |
-| Pattern compilation | — | **0.65×** (~1.5× faster) |
+| `\d+` | first-bytes + Pike VM | **0.17×** |
+| date scan (`\d{4}-…`) | first-bytes + Pike VM | **0.18×** |
+| `(?i)performance` (unanchored scan) | first-bytes + Pike VM | **0.22×** |
+| alternation | first-bytes + Pike VM | **0.33×** |
+| `\A[a-z]+\z` (anchored validation) | one-pass | **0.47×** |
+| `\A\d+\z` (anchored validation) | one-pass | **0.48×** |
+| `\A(?i)performance\z` | one-pass | **0.56×** |
+| `\w+` / `\p{L}+` (find all) | Pike VM | **0.64×** |
+| `\A(...)@(...)\z` with captures | one-pass | **0.78×** |
+| **Geometric mean (20 workloads)** | — | **0.56×** |
+| Pattern compilation | — | **0.72×** (~1.4× faster) |
 
-**The honest caveat:** there is exactly **one** workload where Go wins — a
-nested-quantifier match on a small input (`(a+)+$`, bitstate engine) at
-**1.09×**, both sides in single-digit microseconds. Everything else is on par
-or faster. Full methodology and the complete table:
-**[BENCHMARKS.md](BENCHMARKS.md)**.
+**The honest caveat:** there are **two** workloads where Go is on par or
+ahead — a literal hit that is a pure memchr race (**1.02×**, ~200 ns each) and
+a nested-quantifier match on a small input (`(a+)+$`, bitstate engine) at
+**1.14×**, both sides in single-digit microseconds. Everything else is faster.
+Full methodology and the complete table: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Why this exists
 
@@ -101,8 +102,8 @@ walkthrough, see **[docs/internals.md](docs/internals.md)**.
 ## Features
 
 - 🧩 Full Go `regexp/syntax`: literals, alternation, character classes (`[...]`,
-  `[^...]`, ranges, Perl `\d\w\s`, POSIX `[[:alpha:]]`, Unicode `\p{...}` curated
-  subset), `.`, anchors `^ $ \A \z \b \B`.
+  `[^...]`, ranges, Perl `\d\w\s`, POSIX `[[:alpha:]]`, every Unicode `\p{...}`
+  category, script and alias Go accepts), `.`, anchors `^ $ \A \z \b \B`.
 - 🔁 Quantifiers `* + ? {n,m}`, greedy and non-greedy.
 - 🏷️ Capturing, non-capturing, and named groups; inline flags `(?imsU)`;
   escapes; `\Q...\E`.
@@ -110,7 +111,8 @@ walkthrough, see **[docs/internals.md](docs/internals.md)**.
 - 🛡️ Linear-time guarantee — immune to ReDoS.
 - ⚡ Allocation-free hot loops: reuse a `Scratch` across matches
   (`matchScratch`) for zero-allocation steady state, like Go's machine pool.
-- 🌍 Full-Unicode case folding via Go-derived tables.
+- 🌍 Full-Unicode case folding via Go-derived tables (Unicode 17.0, in step
+  with Go 1.27).
 - 🚫 Same intentional limits as RE2/Go: **no backreferences, no `\C`**.
 
 ## Install & use
@@ -135,12 +137,12 @@ wiring the dependency into `build.zig`, every `Find` / `FindAll` / `Replace` /
 
 ## Trust & validation
 
-Every push runs the **full ~30,000-case differential suite** in CI, across three
+Every push runs the **full ~35,000-case differential suite** in CI, across three
 corpora:
 
 | Corpus | Cases | What it checks |
 |---|---|---|
-| Curated | ~5.9k | Hand-picked edge cases across every feature |
+| Curated | ~11.7k | Hand-picked edge cases across every feature |
 | Random / fuzz | ~9k | Grammar-generated patterns & inputs |
 | POSIX leftmost-longest | ~15k | POSIX match semantics |
 
@@ -151,7 +153,7 @@ under `std.testing.allocator`). CI stays green.
 
 ```sh
 zig build test        # unit + behaviour tests
-zig build difftest    # the full ~30k differential suite (no Go toolchain needed)
+zig build difftest    # the full ~35k differential suite (no Go toolchain needed)
 zig build bench       # benchmark vs Go (ReleaseFast)
 ```
 

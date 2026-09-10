@@ -6,7 +6,7 @@
 #
 # Outputs (all committed; rerun only when a generator changes):
 #   src/fold_table.zig      faithful unicode.SimpleFold table (all of Unicode)
-#   src/unicode_tables.zig  curated \p{...} category/script tables
+#   src/unicode_tables.zig  full \p{...} category/script/fold/alias tables
 #   src/cases.jsonl         curated differential corpus
 #   src/fuzz.jsonl          large random differential corpus
 #   src/longest.jsonl       POSIX leftmost-longest corpus

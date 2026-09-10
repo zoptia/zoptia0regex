@@ -38,9 +38,24 @@ func main() {
 		// escapes
 		"a\\.b", "a\\*b", "\\$", "\\^", "\\(", "\\n", "\\t", "\\x{1F600}",
 		"\\101", "\\0", "\\\\",
-		// unicode classes (supported subset)
+		// unicode classes: Go's full category/script set, aliases, canonical
+		// names (Go 1.27 script lookup), special cases, and the (?i) fold merge
 		"\\pL+", "\\p{Greek}+", "\\p{Latin}+", "\\PL+", "\\p{Nd}+",
-		"[\\p{L}\\d]+", "\\p{Han}+",
+		"[\\p{L}\\d]+", "\\p{Han}+", "\\pN+", "\\p{Lu}+", "\\p{Ll}+", "\\p{Lt}+",
+		"\\p{Zs}+", "\\p{Sm}+", "\\p{So}+", "\\p{Cn}+", "\\p{LC}+", "\\p{Lc}+", "\\p{lc}+",
+		"\\p{Any}+", "\\p{Assigned}+", "\\P{Assigned}+", "\\p{ASCII}+", "\\P{ASCII}+", "\\p{ascii}+",
+		"(?i)\\p{Lu}+", "(?i)\\p{Ll}+", "(?i)\\P{Lu}+", "(?i)\\P{Ll}+", "(?i)\\p{Lt}+", "(?i)\\p{L}+",
+		"(?i)\\p{M}+", "(?i)\\p{Mn}+", "(?i)\\p{Greek}+", "(?i)\\p{Common}+", "(?i)\\p{Inherited}+",
+		"(?i)\\p{ASCII}+", "(?i)\\P{ASCII}+", "(?i)[\\p{Lu}]+", "(?i)[^\\p{Lu}]+", "(?i)[\\p{Lu}\\d]+",
+		"(?i)\\p{Nd}+", "(?i)\\p{Any}+", "(?i)\\p{Assigned}+",
+		"\\p{Letter}+", "\\p{Uppercase_Letter}+", "\\p{upper case-let ter}+", "\\p{__upper case-let ter}+",
+		"\\p{Decimal_Number}+", "\\p{digit}+", "\\p{punct}+", "\\p{cntrl}+", "\\p{Unassigned}+",
+		"\\p{Cased_Letter}+", "(?i)\\p{Lowercase_Letter}+", "\\P{Letter}+",
+		"\\p{Old_Italic}+", "\\p{old italic}+", "\\p{OldItalic}+", "\\p{Canadian_Aboriginal}+",
+		"\\p{canadianaboriginal}+", "\\p{Garay}+", "\\p{latin}+", "\\p{LATIN}+", "\\p{greek}+",
+		"\\p{Inherited}+", "\\p{Common}+", "\\p{Sidetic}+", "\\p{Tai_Yo}+",
+		"\\p{^Greek}+", "\\P{^Greek}+", "[^\\p{L}]+", "[\\p{Lu}\\p{Nd}]+", "[\\P{L}\\P{N}]+",
+		"\\p{Nonexistent}", "\\p{Letters}", "\\p{}", "\\p", "\\pX", "\\p{L", "\\p{^}",
 		// real-world-ish
 		"https?://[\\w.]+", "\\w+@\\w+\\.\\w+", "\\d{4}-\\d{2}-\\d{2}",
 		"#[0-9a-fA-F]{6}", "(\\d+)\\.(\\d+)", "[A-Za-z]+\\s+\\d+",
@@ -69,6 +84,11 @@ func main() {
 		"123abc456def", "AaBbCc", "ABCDEF", "abcdef", "x", "xx", "xxx",
 		"a-b-c", "[a]", "]", "-", "\U0001F600 emoji", "abcXYZ123",
 		"aaAAaa", "STRASSE", "ﬀ ﬁ",
+		// Unicode 16/17 additions and fold-table edge cases
+		"\U00010D50\U00010D70 garay", "\U0001CC00 legacy symbol", "\U00010300 old italic",
+		"\u1401\u1403 canadian", "\u01C5\u01C8 titlecase", "\u0345 ypogegrammeni \u03B9",
+		"\u00AA\u00BA ordinal", "\U000E0001 tag", "\uFDD0\uFFFF noncharacter", "\u2167 \u2177 roman",
+		"\u017F long s", "\u212A kelvin", "\U00010940 sidetic", "\U0001E5D0 ol onal",
 	}
 
 	w := bufio.NewWriter(os.Stdout)

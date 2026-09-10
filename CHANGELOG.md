@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Upstream sync: Go 1.27.1 / Unicode 17.0
+
+The reference toolchain moves from go1.26.4 to go1.27.1. Every generated
+table and corpus is regenerated from it; the differential suite grows to
+~35.7k cases and still reports zero mismatches.
+
+- **Unicode 17.0 tables.** `fold_table.zig` (`unicode.SimpleFold`) and
+  `unicode_tables.zig` now come from Go 1.27's `unicode` package, so `(?i)`
+  and `\p{…}` see the Unicode 16/17 additions (e.g. the cased Garay script).
+- **Full `\p{…}` name set.** The tables are no longer a curated subset: every
+  general category and script Go accepts is included, plus
+  `unicode.CategoryAliases` (`\p{Letter}`, `\p{Uppercase_Letter}`, …), the
+  special names `Any`, `Assigned`, `ASCII`, `LC`, and — following Go 1.27's
+  "apply canonicalization to scripts lookup" — script names matched ignoring
+  case, `_`, `-` and spaces (`\p{Old_Italic}`, `\p{old italic}`).
+- **`(?i)\p{…}` fold merge (fidelity fix).** Go merges `unicode.FoldCategory` /
+  `FoldScript` into the class under `(?i)` (`(?i)\p{Lu}` matches lowercase
+  letters too); the port previously skipped that step. Now ported exactly,
+  including the negated form and `(?i)\p{ASCII}` (adds `ſ` and `K`).
+- **`Regexp.matches` iterator.** Port of Go 1.27's `matches` (the engine
+  behind its new `All*` iterators and `FindAll*`): `findAll`, `findAllIndex`,
+  `findAllSubmatchIndex`, `split` and the `replaceAll*` family now share one
+  engine `Scratch` per call instead of re-allocating it per match, and the
+  index/text variants track only the whole-match slots (Go's `ncap = 2`).
+  `findAll` over `\w+` on the 256 KB corpus drops from ~14 allocations per
+  match to none; benchmark geomean vs Go: **0.56×** (0.4.0: 0.64×).
+- Curated corpus (`gencases.go`) gains ~90 `\p{…}` patterns and inputs
+  covering aliases, canonical names, fold merges and new Unicode characters.
+
 ## [0.4.0] — 2026-07-11
 
 ### Performance

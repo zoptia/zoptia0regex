@@ -217,92 +217,133 @@ pub const Regexp = struct {
 
     // --- find all ---
 
-    /// Collect up to `n` (n < 0 means all) successive match cap-arrays, each of
-    /// length `re.prog.num_cap`. Mirrors Go's `allMatches`, including the
-    /// empty-match advancement rule.
-    fn allMatches(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8, n: i64) ExecError!std.ArrayList([]i64) {
-        var matches: std.ArrayList([]i64) = .empty;
-        errdefer {
-            for (matches.items) |c| allocator.free(c);
-            matches.deinit(allocator);
-        }
-        const end = input.len;
-        const limit: i64 = if (n < 0) std.math.maxInt(i64) else n;
-        var pos: usize = 0;
-        var count: i64 = 0;
-        var prev_match_end: i64 = -1;
-        const in = exec.Input{ .s = input };
+    /// Iterator over successive non-overlapping matches, the engine behind
+    /// `findAll*` and `split`. Mirrors Go 1.27's `Regexp.matches` (which backs
+    /// Go's `All*` iterators and `FindAll*`), including the empty-match rule:
+    /// an empty match abutting the previous match is skipped. The engine
+    /// scratch is allocated once and reused for every match, so a long scan
+    /// allocates nothing per match. Build one with `Regexp.matches`.
+    pub const Matches = struct {
+        re: *const Regexp,
+        input: []const u8,
+        scratch: Scratch,
+        caps: []i64,
+        pos: usize = 0,
+        prev_match_end: i64 = -1,
+        remaining: i64, // matches still to yield; < 0 means unlimited
+        done: bool = false,
 
-        while (count < limit and pos <= end) {
-            const caps = try allocator.alloc(i64, re.padLen());
-            errdefer allocator.free(caps);
-            const matched = try re.execAt(allocator, in, pos, caps);
-            if (!matched) {
-                allocator.free(caps);
-                break;
-            }
-            var accept = true;
-            if (caps[1] == @as(i64, @intCast(pos))) {
-                // Empty match: don't allow it right after a previous match.
-                if (caps[0] == prev_match_end) accept = false;
-                const w = in.step(pos).w;
-                if (w > 0) pos += w else pos = end + 1;
-            } else {
-                pos = @intCast(caps[1]);
-            }
-            prev_match_end = caps[1];
-            if (accept) {
-                try matches.append(allocator, caps);
-                count += 1;
-            } else {
-                allocator.free(caps);
-            }
+        pub fn deinit(it: *Matches) void {
+            it.scratch.allocator.free(it.caps);
+            it.scratch.deinit();
+            it.* = undefined;
         }
-        return matches;
+
+        /// The next match's submatch byte offsets, or null when exhausted.
+        /// The slice is owned by the iterator and overwritten by the next
+        /// call; copy it to keep it.
+        pub fn next(it: *Matches) ExecError!?[]const i64 {
+            const in = exec.Input{ .s = it.input };
+            while (!it.done and it.pos <= it.input.len) {
+                const matched = try it.re.execAtScratch(&it.scratch, in, it.pos, it.caps);
+                if (!matched) break;
+                var accept = true;
+                if (it.caps[1] == @as(i64, @intCast(it.pos))) {
+                    // Empty match: don't allow it right after a previous match.
+                    if (it.caps[0] == it.prev_match_end) accept = false;
+                    const w = in.step(it.pos).w;
+                    if (w > 0) it.pos += w else it.pos = it.input.len + 1;
+                } else {
+                    it.pos = @intCast(it.caps[1]);
+                }
+                it.prev_match_end = it.caps[1];
+                if (accept) {
+                    if (it.remaining > 0) {
+                        it.remaining -= 1;
+                        if (it.remaining == 0) it.done = true;
+                    }
+                    return it.caps;
+                }
+            }
+            it.done = true;
+            return null;
+        }
+    };
+
+    /// Iterate over at most `n` (n < 0: all) successive matches of `input`,
+    /// each reported as submatch offsets of length `2*(numSubexp+1)` (-1 for
+    /// groups that did not participate). Free the iterator with `deinit`.
+    pub fn matches(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8, n: i64) ExecError!Matches {
+        return re.matchesN(allocator, input, n, re.padLen());
+    }
+
+    /// `matches` recording only the first `ncap` capture slots (2 when only
+    /// the whole-match location is needed, like Go's `all` / `allIndex`).
+    fn matchesN(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8, n: i64, ncap: usize) ExecError!Matches {
+        const caps = try allocator.alloc(i64, ncap);
+        return .{
+            .re = re,
+            .input = input,
+            .scratch = Scratch.init(allocator),
+            .caps = caps,
+            .remaining = n,
+            .done = n == 0 or input.len < re.min_input_len,
+        };
     }
 
     /// Locations of all successive matches (n < 0: all). Caller owns the slice.
     /// Null if there are no matches.
     pub fn findAllIndex(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8, n: i64) ExecError!?[]Match {
-        var matches = try re.allMatches(allocator, input, n);
-        defer {
-            for (matches.items) |c| allocator.free(c);
-            matches.deinit(allocator);
+        var it = try re.matchesN(allocator, input, n, 2);
+        defer it.deinit();
+        var out: std.ArrayList(Match) = .empty;
+        errdefer out.deinit(allocator);
+        while (try it.next()) |m| {
+            try out.append(allocator, .{ .start = @intCast(m[0]), .end = @intCast(m[1]) });
         }
-        if (matches.items.len == 0) return null;
-        const out = try allocator.alloc(Match, matches.items.len);
-        for (matches.items, 0..) |c, i| out[i] = .{ .start = @intCast(c[0]), .end = @intCast(c[1]) };
-        return out;
+        if (out.items.len == 0) {
+            out.deinit(allocator);
+            return null;
+        }
+        return try out.toOwnedSlice(allocator);
     }
 
     /// Texts of all successive matches (sub-slices of `input`). Caller owns the
     /// outer slice. Null if there are no matches.
     pub fn findAll(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8, n: i64) ExecError!?[][]const u8 {
-        var matches = try re.allMatches(allocator, input, n);
-        defer {
-            for (matches.items) |c| allocator.free(c);
-            matches.deinit(allocator);
+        var it = try re.matchesN(allocator, input, n, 2);
+        defer it.deinit();
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer out.deinit(allocator);
+        while (try it.next()) |m| {
+            try out.append(allocator, input[@intCast(m[0])..@intCast(m[1])]);
         }
-        if (matches.items.len == 0) return null;
-        const out = try allocator.alloc([]const u8, matches.items.len);
-        for (matches.items, 0..) |c, i| out[i] = input[@intCast(c[0])..@intCast(c[1])];
-        return out;
+        if (out.items.len == 0) {
+            out.deinit(allocator);
+            return null;
+        }
+        return try out.toOwnedSlice(allocator);
     }
 
     /// Submatch offsets of all successive matches. Each inner slice has length
     /// `2*(numSubexp+1)`. Caller owns every inner slice and the outer slice;
     /// free with `freeAllSubmatchIndex`. Null if there are no matches.
     pub fn findAllSubmatchIndex(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8, n: i64) ExecError!?[][]i64 {
-        var matches = try re.allMatches(allocator, input, n);
+        var it = try re.matches(allocator, input, n);
+        defer it.deinit();
+        var out: std.ArrayList([]i64) = .empty;
         errdefer {
-            for (matches.items) |c| allocator.free(c);
-            matches.deinit(allocator);
+            for (out.items) |c| allocator.free(c);
+            out.deinit(allocator);
         }
-        if (matches.items.len == 0) {
-            matches.deinit(allocator);
+        while (try it.next()) |m| {
+            try out.append(allocator, try allocator.dupe(i64, m));
+        }
+        if (out.items.len == 0) {
+            out.deinit(allocator);
             return null;
         }
-        return try matches.toOwnedSlice(allocator);
+        return try out.toOwnedSlice(allocator);
     }
 
     pub fn freeAllSubmatchIndex(allocator: std.mem.Allocator, x: [][]i64) void {
@@ -369,10 +410,14 @@ pub const Regexp = struct {
         const end_pos = src.len;
         const caps = try allocator.alloc(i64, ncap);
         defer allocator.free(caps);
+        // One scratch for the whole loop: like Go's pooled machine, no
+        // per-match engine allocation.
+        var scratch = Scratch.init(allocator);
+        defer scratch.deinit();
         const in = exec.Input{ .s = src };
 
         while (search_pos <= end_pos) {
-            const matched = try re.execAt(allocator, in, search_pos, caps);
+            const matched = try re.execAtScratch(&scratch, in, search_pos, caps);
             if (!matched) break;
             const a0: usize = @intCast(caps[0]);
             const a1: usize = @intCast(caps[1]);
@@ -452,17 +497,14 @@ pub const Regexp = struct {
             return out;
         }
 
-        var matches = try re.allMatches(allocator, src, n);
-        defer {
-            for (matches.items) |c| allocator.free(c);
-            matches.deinit(allocator);
-        }
+        var it = try re.matchesN(allocator, src, n, 2);
+        defer it.deinit();
 
         var out: std.ArrayList([]const u8) = .empty;
         errdefer out.deinit(allocator);
         var beg: usize = 0;
         var end: usize = 0;
-        for (matches.items) |c| {
+        while (try it.next()) |c| {
             if (n > 0 and out.items.len >= @as(usize, @intCast(n - 1))) break;
             end = @intCast(c[0]);
             // Skip a zero-length match (does not contribute a split point).

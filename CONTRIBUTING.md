@@ -8,7 +8,7 @@ feature set.
 
 ```sh
 zig build test         # unit + behaviour tests (fast)
-zig build difftest     # ~30k differential cases vs Go's recorded output
+zig build difftest     # ~35k differential cases vs Go's recorded output
 zig fmt --check src/*.zig build.zig
 ```
 
@@ -51,6 +51,6 @@ This rewrites `src/fold_table.zig`, `src/unicode_tables.zig`, and the
 ## Scope
 
 Optimizations that don't change results (e.g. the alternation `factor()` pass)
-and a wider `\p{...}` table set are welcome. New *semantics* should first be
+are welcome. New *semantics* should first be
 shown to match Go (or explicitly documented as a deviation in the
 "Scope" section of [docs/usage.md](docs/usage.md)).

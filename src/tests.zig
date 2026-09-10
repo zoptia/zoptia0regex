@@ -144,6 +144,44 @@ test "unicode property class" {
     try expectFind("\\pL+", "  hello  ", "hello");
 }
 
+test "matches iterator: limits, empty-match rule, reuse" {
+    var re = try regex.compile(ta, "a*");
+    defer re.deinit();
+    // Same sequence Go's FindAllStringIndex("baaab", -1) yields: [0,0] [1,4] [5,5].
+    var it = try re.matches(ta, "baaab", -1);
+    defer it.deinit();
+    const want = [_][2]i64{ .{ 0, 0 }, .{ 1, 4 }, .{ 5, 5 } };
+    for (want) |w| {
+        const m = (try it.next()).?;
+        try std.testing.expectEqual(w[0], m[0]);
+        try std.testing.expectEqual(w[1], m[1]);
+    }
+    try std.testing.expect((try it.next()) == null);
+    try std.testing.expect((try it.next()) == null); // stays exhausted
+
+    // n limits the count; n == 0 yields nothing.
+    var two = try re.matches(ta, "baaab", 2);
+    defer two.deinit();
+    _ = (try two.next()).?;
+    _ = (try two.next()).?;
+    try std.testing.expect((try two.next()) == null);
+    var none = try re.matches(ta, "baaab", 0);
+    defer none.deinit();
+    try std.testing.expect((try none.next()) == null);
+
+    // Submatch slots are padded to 2*(numSubexp+1) and reused between calls.
+    var grp = try regex.compile(ta, "(a)|(b)");
+    defer grp.deinit();
+    var git = try grp.matches(ta, "ab", -1);
+    defer git.deinit();
+    const m1 = (try git.next()).?;
+    try std.testing.expectEqual(@as(usize, 6), m1.len);
+    try std.testing.expectEqual(@as(i64, -1), m1[4]);
+    const m2 = (try git.next()).?;
+    try std.testing.expectEqual(m1.ptr, m2.ptr);
+    try std.testing.expectEqual(@as(i64, 1), m2[4]);
+}
+
 test "posix longest" {
     var re = try regex.compilePOSIX(ta, "a|ab");
     defer re.deinit();

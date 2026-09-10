@@ -194,12 +194,16 @@ always the whole match.
 | `findAllIndex` | `Match` locations of all successive matches. | `null` | yes |
 | `findAllSubmatchIndex` | Submatch offsets for every match; each inner slice has length `2*(numSubexp+1)`. | `null` | outer **and** every inner slice |
 | `freeAllSubmatchIndex` | Frees the result of `findAllSubmatchIndex`. | — | — |
+| `matches` | Iterator over successive matches (Go 1.27's `matches` / `All*`): `next()` yields borrowed submatch offsets, `deinit()` frees it. | `next()` → `null` | the iterator only |
 
 ```zig
 pub fn Regexp.findAll(re: *const Regexp, allocator, input: []const u8, n: i64) ExecError!?[][]const u8
 pub fn Regexp.findAllIndex(re: *const Regexp, allocator, input: []const u8, n: i64) ExecError!?[]Match
 pub fn Regexp.findAllSubmatchIndex(re: *const Regexp, allocator, input: []const u8, n: i64) ExecError!?[][]i64
 pub fn Regexp.freeAllSubmatchIndex(allocator: std.mem.Allocator, x: [][]i64) void
+pub fn Regexp.matches(re: *const Regexp, allocator, input: []const u8, n: i64) ExecError!Regexp.Matches
+pub fn Regexp.Matches.next(it: *Matches) ExecError!?[]const i64
+pub fn Regexp.Matches.deinit(it: *Matches) void
 ```
 
 `n` caps the number of matches: `n < 0` means "all", `n == 0` yields no matches,
@@ -215,6 +219,21 @@ if (try re.findAllSubmatchIndex(gpa, input, -1)) |all| {
 
 For `findAll` / `findAllIndex`, free the single returned slice with
 `allocator.free`.
+
+All of the above are built on `matches`, the port of Go 1.27's `matches`
+iterator: it allocates the engine scratch once and reuses it for every match,
+so scanning a large input allocates nothing per match. Use it directly when you
+want to stream matches instead of collecting them:
+
+```zig
+var it = try re.matches(gpa, input, -1);
+defer it.deinit();
+while (try it.next()) |m| {
+    // m[0..2] is the whole match, m[2*k..2*k+2] group k (-1 = unset).
+    // m is borrowed: it is overwritten by the next call to next().
+    std.debug.print("{s}\n", .{input[@intCast(m[0])..@intCast(m[1])]});
+}
+```
 
 ### Replace
 
@@ -413,7 +432,7 @@ to `[]const u8` here.
 | Char class | `[abc]`, `[^abc]`, `[a-z]` | Sets, negation, ranges. |
 | Perl classes | `\d \D \w \W \s \S` | Digit / word / space and negations. |
 | POSIX classes | `[[:alpha:]]`, `[[:digit:]]`, … | Inside `[...]`. |
-| Unicode classes | `\p{L}`, `\P{L}`, `\pL` | Curated `\p{...}` subset (see §6). |
+| Unicode classes | `\p{L}`, `\P{L}`, `\pL`, `\p{Greek}`, `\p{Letter}` | Every general category, script and alias Go accepts (Unicode 17.0); names are matched like Go 1.27, ignoring case, `_`, `-` and spaces. |
 | Anchors | `^ $ \A \z \b \B` | Line/text anchors and word boundaries. |
 | Quantifiers | `* + ? {n} {n,} {n,m}` | Greedy by default; suffix `?` makes them non-greedy. |
 | Groups | `(...)`, `(?:...)`, `(?P<name>...)`, `(?<name>...)` | Capturing, non-capturing, named. |
@@ -427,15 +446,16 @@ generated from Go's `unicode.SimpleFold` — not just ASCII.
 
 ## 6. Scope & differences from Go
 
-This is a high-fidelity replica, and the differential test suite (~30,000 cases
+This is a high-fidelity replica, and the differential test suite (~35,000 cases
 across curated, fuzz, and POSIX-leftmost-longest corpora) requires byte-for-byte
 identical results against the real Go `regexp` for `FindSubmatchIndex`,
 `FindAll`, `ReplaceAll`, and `Split`. The intentional differences are:
 
-- **`\p{...}` is a curated subset.** The most common Unicode property names and
-  general categories are supported; exotic or rarely used property names from
-  Go's full `unicode` set may not be. Everything in the curated subset matches
-  Go exactly.
+- **Tracks Go 1.27.1 / Unicode 17.0.** The `\p{...}` tables, the
+  case-folding table and the differential corpora are generated from that Go
+  toolchain. Every property name Go accepts (`\p{Lu}`, `\p{Old_Italic}`,
+  `\p{Uppercase_Letter}`, `\p{Assigned}`, …) is accepted here with the same
+  `(?i)` fold behaviour; unknown names fail with `InvalidCharRange` as in Go.
 - **No backreferences, no `\C` — same as Go.** RE2/`regexp` does not support
   backreferences or the `\C` "any byte" escape, and neither does this library.
   This is what guarantees linear-time matching.

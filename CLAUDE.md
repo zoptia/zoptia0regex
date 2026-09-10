@@ -11,8 +11,10 @@ specific Go source file, and correctness is enforced by **differential testing
 against Go's actual recorded output** — not hand-written expectations alone.
 
 The Go reference source is on this machine at
-`~/.zvk/go/versions/go1.26.4/src/regexp/` — **read the corresponding Go
-file before changing any matching/parsing behaviour.** The port-to-Go file map:
+`~/.zvk/go/versions/go1.27.1/src/regexp/` (the port tracks **go1.27.1 /
+Unicode 17.0**; `tools/regen.sh` must run with that toolchain so the generated
+tables and corpora stay in step) — **read the corresponding Go file before
+changing any matching/parsing behaviour.** The port-to-Go file map:
 
 | Zig | Go |
 |-----|-----|
@@ -29,7 +31,7 @@ file before changing any matching/parsing behaviour.** The port-to-Go file map:
 
 ```sh
 zig build test                          # unit + behaviour tests (fast)
-zig build difftest                      # ~30k differential cases vs Go (slow-ish)
+zig build difftest                      # ~35k differential cases vs Go (slow-ish)
 zig build bench                         # benchmark, ReleaseFast (stderr TSV)
 zig build demo -- '<pattern>' '<input>' # CLI demo
 zig fmt --check src/*.zig build.zig     # must be clean; CI enforces it
@@ -97,6 +99,11 @@ into the engine/tests. To change them, edit the generator in `tools/` and run
 `tools/regen.sh`. The corpora are committed, so `zig build difftest` needs no Go
 toolchain (only `regen.sh` does).
 
+**Find-all loops:** `findAll*`, `split` and the `replaceAll*` family run on
+`Regexp.Matches` (`regexp.zig`), the port of Go 1.27's `matches` iterator: one
+`Scratch` for the whole loop, `ncap = 2` when only the whole-match location is
+needed (like Go's `all`/`allIndex`), full `padLen` captures otherwise.
+
 **Memory model:** a compiled `Regexp` owns a heap-allocated arena (`re.arena`)
 holding its program, capture names and prefix; `deinit()` frees it. Execution /
 result methods each take an `allocator` for transient VM scratch and (where they
@@ -115,9 +122,9 @@ runs under `std.testing.allocator`, so any leak fails the build.
 
 These diverge from Go's *source* but never from its *results*: the alternation
 `factor()` pass is omitted (it only changes the compiled program's shape / raw
-speed). The `\p{...}` table set is a **curated subset** (unknown names →
-`error.InvalidCharRange`). Backreferences and `\C` are unsupported — **same as
-Go** (RE2). Inputs are `[]const u8` only (no `io.RuneReader`). See the README
+speed). Backreferences and `\C` are unsupported — **same as Go** (RE2). Inputs
+are `[]const u8` only (no `io.RuneReader`), and Go 1.27's `All*` iterator
+methods collapse into the single `Regexp.matches` iterator. See the README
 "Scope" table.
 
 (Once also omitted, now ported: `onePassCopy`'s Prog-idiom rewrites and

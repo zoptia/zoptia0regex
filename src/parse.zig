@@ -731,12 +731,27 @@ const Parser = struct {
         }
         const tr = (try unicode.unicodeTable(p.al, name)) orelse return error.InvalidCharRange;
         if (tr.sign < 0) sign = -sign;
-        // Note: Go merges a fold table here under (?i); our subset has no fold
-        // tables (equivalent to Go's fold == nil branch), so we append directly.
-        if (sign > 0) {
-            try appendTable(p.al, class, tr.ranges);
+
+        if (p.flags & ast.FoldCase == 0 or tr.fold == null) {
+            if (sign > 0) {
+                try appendTable(p.al, class, tr.ranges);
+            } else {
+                try appendNegatedTable(p.al, class, tr.ranges);
+            }
         } else {
-            try appendNegatedTable(p.al, class, tr.ranges);
+            // Merge and clean tab and fold in a temporary buffer. This is
+            // necessary for the negative case and just tidy for the positive
+            // case (Go's parseUnicodeClass).
+            var tmp: std.ArrayList(u21) = .empty;
+            defer tmp.deinit(p.al);
+            try appendTable(p.al, &tmp, tr.ranges);
+            try appendTable(p.al, &tmp, tr.fold.?);
+            cleanClass(&tmp);
+            if (sign > 0) {
+                try appendClass(p.al, class, tmp.items);
+            } else {
+                try appendNegatedClass(p.al, class, tmp.items);
+            }
         }
         return t;
     }

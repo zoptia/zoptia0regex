@@ -4,8 +4,9 @@
 //!
 //! The case-fold table (`fold_table.zig`) is generated from Go's
 //! `unicode.SimpleFold` and covers all of Unicode, so `(?i)` folding matches
-//! Go exactly. The `\p{}` tables (`unicode_tables.zig`) are a curated subset
-//! of the most common general categories and scripts.
+//! Go exactly. The `\p{}` tables (`unicode_tables.zig`) are the full set of
+//! general categories, scripts, fold companions and aliases from Go's
+//! `unicode` package, so every property name Go accepts is accepted here.
 
 const std = @import("std");
 const fold = @import("fold_table.zig");
@@ -85,36 +86,68 @@ fn canonicalName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
 
 pub const TableResult = struct {
     ranges: []const URange,
-    /// extra sign inversion (Go's tsign): currently only +1 for our subset.
+    /// The class's case-fold companion table (Go's `unicode.FoldCategory` /
+    /// `FoldScript`), merged into the class under `(?i)`; null when Go has none.
+    fold: ?[]const URange,
+    /// Extra sign inversion (Go's tsign): -1 only for `Assigned` (= not `Cn`).
     sign: i2,
 };
 
 /// unicodeTable returns the range table identified by `name` (after
-/// canonicalization), or null if unknown. Handles the special cases Go does
-/// for "Any" and "ASCII"; other names come from the curated subset.
+/// canonicalization), or null if unknown. Mirrors Go 1.27's `unicodeTable`:
+/// the special cases `Any`, `Assigned`, `ASCII` and `LC`, then general
+/// categories, scripts (both matched on their canonical name) and finally
+/// `unicode.CategoryAliases` such as `Letter` or `Uppercase_Letter`.
 pub fn unicodeTable(allocator: std.mem.Allocator, name: []const u8) !?TableResult {
     const canon = try canonicalName(allocator, name);
     defer allocator.free(canon);
 
-    if (std.mem.eql(u8, canon, "Any")) return TableResult{ .ranges = &any_ranges, .sign = 1 };
-    if (std.mem.eql(u8, canon, "Ascii")) return TableResult{ .ranges = &ascii_ranges, .sign = 1 };
-
-    for (utbl.unicode_classes) |cls| {
-        if (std.mem.eql(u8, cls.name, canon)) {
-            return TableResult{ .ranges = cls.ranges, .sign = 1 };
+    if (std.mem.eql(u8, canon, "Any")) return TableResult{ .ranges = &any_ranges, .fold = &any_ranges, .sign = 1 };
+    if (std.mem.eql(u8, canon, "Assigned")) {
+        const cn = categoryByName("Cn").?;
+        return TableResult{ .ranges = cn.ranges, .fold = cn.ranges, .sign = -1 }; // invert Cn (unassigned)
+    }
+    if (std.mem.eql(u8, canon, "Ascii")) return TableResult{ .ranges = &ascii_ranges, .fold = &ascii_fold_ranges, .sign = 1 };
+    if (std.mem.eql(u8, canon, "Lc")) {
+        const lc = categoryByName("LC").?;
+        return TableResult{ .ranges = lc.ranges, .fold = lc.fold, .sign = 1 };
+    }
+    for (utbl.categories) |cls| {
+        if (std.mem.eql(u8, cls.canon, canon)) return TableResult{ .ranges = cls.ranges, .fold = cls.fold, .sign = 1 };
+    }
+    for (utbl.scripts) |cls| {
+        if (std.mem.eql(u8, cls.canon, canon)) return TableResult{ .ranges = cls.ranges, .fold = cls.fold, .sign = 1 };
+    }
+    for (utbl.category_aliases) |alias| {
+        if (std.mem.eql(u8, alias.canon, canon)) {
+            const cls = categoryByName(alias.actual).?;
+            return TableResult{ .ranges = cls.ranges, .fold = cls.fold, .sign = 1 };
         }
+    }
+    return null;
+}
+
+fn categoryByName(name: []const u8) ?utbl.UnicodeClass {
+    for (utbl.categories) |cls| {
+        if (std.mem.eql(u8, cls.name, name)) return cls;
     }
     return null;
 }
 
 const any_ranges = [_]URange{.{ .lo = 0, .hi = max_rune, .stride = 1 }};
 const ascii_ranges = [_]URange{.{ .lo = 0, .hi = 0x7F, .stride = 1 }};
+// Go's asciiFoldTable: ASCII plus the two non-ASCII runes that fold into it.
+const ascii_fold_ranges = [_]URange{
+    .{ .lo = 0, .hi = 0x7F, .stride = 1 },
+    .{ .lo = 0x017F, .hi = 0x017F, .stride = 1 }, // Old English long s (ſ), folds to S/s.
+    .{ .lo = 0x212A, .hi = 0x212A, .stride = 1 }, // Kelvin K, folds to K/k.
+};
 
 fn classRanges(comptime name: []const u8) []const URange {
-    for (utbl.unicode_classes) |cls| {
+    for (utbl.categories) |cls| {
         if (std.mem.eql(u8, cls.name, name)) return cls.ranges;
     }
-    @compileError("missing unicode class: " ++ name);
+    @compileError("missing unicode category: " ++ name);
 }
 
 fn inRanges(r: u21, ranges: []const URange) bool {
@@ -159,4 +192,16 @@ test "unicodeTable lookup" {
     try std.testing.expect((try unicodeTable(a, "Nd")) != null);
     try std.testing.expect((try unicodeTable(a, "NoSuchScript")) == null);
     try std.testing.expect((try unicodeTable(a, "Any")) != null);
+    // Go 1.27: scripts and category aliases match on their canonical name.
+    try std.testing.expect((try unicodeTable(a, "Old_Italic")) != null);
+    try std.testing.expect((try unicodeTable(a, "old italic")) != null);
+    try std.testing.expect((try unicodeTable(a, "Uppercase_Letter")) != null);
+    try std.testing.expect((try unicodeTable(a, "__upper case-let ter")) != null);
+    // Special cases and fold companions.
+    const assigned = (try unicodeTable(a, "Assigned")).?;
+    try std.testing.expectEqual(@as(i2, -1), assigned.sign);
+    try std.testing.expect((try unicodeTable(a, "Lc")).?.ranges.len > 0);
+    try std.testing.expect((try unicodeTable(a, "Lu")).?.fold != null);
+    try std.testing.expect((try unicodeTable(a, "Nd")).?.fold == null);
+    try std.testing.expect((try unicodeTable(a, "ASCII")).?.fold.?.len == 3);
 }
