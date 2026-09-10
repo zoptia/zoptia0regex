@@ -662,7 +662,7 @@ fn firstBytes(gpa: std.mem.Allocator, al: std.mem.Allocator, p: *const prog.Prog
     @memset(seen, false);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);
-    var set = [_]bool{false} ** 0x80;
+    var set: [0x80]bool = @splat(false);
 
     try stack.append(gpa, p.start);
     while (stack.pop()) |pc| {

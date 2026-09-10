@@ -56,6 +56,16 @@ older Zig: `ArrayList` is unmanaged (`.empty`, `.append(allocator, x)`); there
 is no `std.time.Timer` / `std.process.argsAlloc` / `std.fs.cwd` (the Io rework);
 `main(init: std.process.Init.Minimal)` is how `demo.zig` gets args.
 
+**Must also build on Zig 0.17.0-dev (`zig-nightly`)** — downstream packages
+pin it, and a dependency's `build.zig` is compiled into every consumer's build
+runner. Run `zig-nightly build test` before releasing. Known 0.16 ↔ 0.17-dev
+splits, all handled: `b.args` vs `Run.addPassthruArgs` and `Fmt.Options.paths`
+(`[]const u8` vs `LazyPath`) are gated in `build.zig`; array repetition `**`
+is a 0.17 parse error (use `@splat` into a typed array); `std.meta.Int` is
+gone (use `@Int`). Keep `@intFromEnum` — nightly's `zig fmt` rewrites it to
+`@backingInt`, which 0.16 does not compile, so never run nightly `fmt` on the
+tree; the fmt gate is 0.16-only.
+
 ## Architecture
 
 **Pipeline:** `compile()` runs `parse → simplify → compile (→ Prog) → build

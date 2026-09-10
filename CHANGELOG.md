@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — 2026-09-10
+
+### Zig compatibility
+
+Builds on **Zig 0.16.0** (still the `minimum_zig_version`) and on the
+**0.17.0-dev** nightlies (verified on 0.17.0-dev.2085+5e36170b5: unit,
+behaviour and all ~35.7k differential tests pass, demo and benchmarks build).
+No behaviour change; `zig fetch --save` consumers on either toolchain can now
+depend on the package.
+
+- `build.zig`: forward demo args via `b.args` on 0.16 and
+  `Run.addPassthruArgs` on 0.17-dev (the `args` field is gone there). A
+  dependency's `build.zig` is compiled into every consumer's build runner, so
+  this line alone broke consumers on nightly. `addFmt` paths likewise switch
+  between `[]const u8` and `LazyPath` by inspecting `Fmt.Options`.
+- Array repetition `x ** n` (a parse error on 0.17-dev) replaced by
+  `@splat` into an explicitly typed array; `std.meta.Int` (removed on
+  0.17-dev) replaced by the `@Int` builtin. Both spellings work on 0.16.
+- CI gains a non-blocking `test-nightly` job (`zvk zig install nightly`,
+  `zig-nightly build test` + `difftest`) so the next std rename is caught
+  early. The `zig fmt --check` gate stays on 0.16: nightly's formatter rewrites
+  `@intFromEnum` to `@backingInt`, which 0.16 does not compile.
+
 ## [0.5.0] — 2026-09-10
 
 ### Upstream sync: Go 1.27.1 / Unicode 17.0

@@ -32,7 +32,15 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(demo);
     const run_demo = b.addRunArtifact(demo);
-    if (b.args) |args| run_demo.addArgs(args);
+    // Forward `zig build demo -- <args>`. Zig 0.16 exposes them as `b.args`;
+    // 0.17-dev replaced that field with `Run.addPassthruArgs`. A dependency's
+    // build.zig is compiled into every consumer's build runner, so both
+    // toolchains must compile this file.
+    if (@hasField(std.Build, "args")) {
+        if (b.args) |args| run_demo.addArgs(args);
+    } else {
+        run_demo.addPassthruArgs();
+    }
     const demo_step = b.step("demo", "Run the regex demo (pass: <pattern> <input>)");
     demo_step.dependOn(&run_demo.step);
 
@@ -73,8 +81,15 @@ pub fn build(b: *std.Build) void {
 
     // Formatting gate, same as CI: `zig build fmt` fails on unformatted files.
     const fmt_step = b.step("fmt", "Check that all Zig sources are formatted");
+    // Fmt.Options.paths is `[]const []const u8` on 0.16 and `[]const LazyPath`
+    // on 0.17-dev; pick the element type the running std expects.
+    const FmtPath = @typeInfo(@FieldType(std.Build.Step.Fmt.Options, "paths")).pointer.child;
+    const fmt_paths: []const FmtPath = if (FmtPath == std.Build.LazyPath)
+        &.{ b.path("src"), b.path("build.zig") }
+    else
+        &.{ "src", "build.zig" };
     fmt_step.dependOn(&b.addFmt(.{
-        .paths = &.{ "src", "build.zig" },
+        .paths = fmt_paths,
         .check = true,
     }).step);
 }

@@ -117,7 +117,8 @@ walkthrough, see **[docs/internals.md](docs/internals.md)**.
 
 ## Install & use
 
-Requires **Zig 0.16**.
+Requires **Zig 0.16** (also builds on the 0.17.0-dev nightlies; CI smoke-tests
+zvk's `zig-nightly`).
 
 ```sh
 zig fetch --save git+https://github.com/zoptia/zoptia0regex

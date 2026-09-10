@@ -41,3 +41,34 @@ jobs:
       # asserts the results are byte-for-byte identical (and leak-free).
       - name: Differential tests vs Go
         run: zig build difftest
+
+  # Smoke test on the Zig nightly zvk tracks (`zig-nightly`), so a std rename
+  # that would break consumers on 0.17-dev is caught early. Nightly's `zig fmt`
+  # rewrites builtins that 0.16 does not know (e.g. @intFromEnum ->
+  # @backingInt), so the formatting gate stays 0.16-only.
+  test-nightly:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig nightly via zvk
+        env:
+          ZVK_NO_DOCS: "1"
+          ZVK_NO_CLAUDE_MD: "1"
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/zoptia/zvk/main/install.sh | sh
+          echo "$HOME/.zvk/bin" >> "$GITHUB_PATH"
+          "$HOME/.zvk/bin/zvk" zig install nightly
+
+      - name: Zig nightly version
+        run: zig-nightly version
+
+      - name: Build (all steps' artifacts)
+        run: zig-nightly build && zig-nightly build demo -- 'a+b' 'xaab'
+
+      - name: Unit & behaviour tests
+        run: zig-nightly build test
+
+      - name: Differential tests vs Go
+        run: zig-nightly build difftest

@@ -64,7 +64,7 @@ fn indexOfAnyByte(haystack: []const u8, set: []const u8) ?usize {
     const width = comptime std.simd.suggestVectorLength(u8) orelse
         return std.mem.indexOfAny(u8, haystack, set);
     const V = @Vector(width, u8);
-    const Mask = std.meta.Int(.unsigned, width);
+    const Mask = @Int(.unsigned, width);
 
     var splats: [max_first_bytes]V = undefined;
     for (set, 0..) |b, k| splats[k] = @splat(b);
@@ -92,7 +92,7 @@ fn indexOfAnyByte(haystack: []const u8, set: []const u8) ?usize {
 /// scanning for `a`.
 const byte_rank: [256]u8 = blk: {
     @setEvalBranchQuota(10_000);
-    var r = [_]u8{15} ** 256;
+    var r: [256]u8 = @splat(15);
     for (0..0x20) |c| r[c] = 3; // control bytes: rare
     r['\n'] = 180;
     r['\t'] = 120;

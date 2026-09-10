@@ -32,7 +32,7 @@ test "fuzz differential vs Go regexp" {
     const gpa = std.testing.allocator;
     var total: usize = 0;
     var passed: usize = 0;
-    var fails = [_]usize{0} ** 5; // m, all, repl, split, compile
+    var fails: [5]usize = @splat(0); // m, all, repl, split, compile
     var shown: usize = 0;
 
     var it = std.mem.tokenizeScalar(u8, data, '\n');

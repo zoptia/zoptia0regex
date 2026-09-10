@@ -16,7 +16,10 @@ catastrophic backtracking, so the engine is immune to ReDoS. A pattern such as
 
 ### Requirements
 
-- **Zig 0.16** (the package declares `minimum_zig_version = "0.16.0"`).
+- **Zig 0.16** (the package declares `minimum_zig_version = "0.16.0"`). The
+  0.17.0-dev nightlies are supported too: `build.zig` and the sources avoid
+  everything 0.17 removed (`Build.args`, `std.meta.Int`, array `**`), and CI
+  smoke-tests zvk's `zig-nightly`.
 
 ### Add the dependency
 

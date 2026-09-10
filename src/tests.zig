@@ -224,12 +224,12 @@ test "linear time on ReDoS-style pattern" {
     // so this completes instantly and matches Go's result (no match).
     var re = try regex.compile(ta, "(a*)*$");
     defer re.deinit();
-    const input = "a" ** 200 ++ "b"; // no '$' reachable after the trailing b
-    try std.testing.expect(try re.match(ta, input));
+    const input: [201]u8 = @as([200]u8, @splat('a')) ++ "b".*; // no '$' reachable after the trailing b
+    try std.testing.expect(try re.match(ta, &input));
     var re2 = try regex.compile(ta, "(a+)+b");
     defer re2.deinit();
-    const input2 = "a" ** 500; // never a 'b' -> no match, but must not blow up
-    try std.testing.expect(!try re2.match(ta, input2));
+    const input2: [500]u8 = @splat('a'); // never a 'b' -> no match, but must not blow up
+    try std.testing.expect(!try re2.match(ta, &input2));
 }
 
 test "empty and nullable edge cases" {
@@ -286,8 +286,8 @@ test "invalid-UTF-8 error codes match Go" {
 }
 
 test "deep nesting returns NestingDepth (no stack overflow)" {
-    const pat = ("(" ** 3000) ++ "a" ++ (")" ** 3000);
-    try std.testing.expectError(error.NestingDepth, regex.compile(ta, pat));
+    const pat: [6001]u8 = @as([3000]u8, @splat('(')) ++ "a".* ++ @as([3000]u8, @splat(')'));
+    try std.testing.expectError(error.NestingDepth, regex.compile(ta, &pat));
 }
 
 test "unicode names in replacement templates match Go" {
