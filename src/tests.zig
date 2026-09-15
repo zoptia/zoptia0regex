@@ -447,3 +447,54 @@ test "replace func" {
     defer ta.free(out);
     try std.testing.expectEqualStrings("a[d]b[BIG]", out);
 }
+
+fn exerciseExecutionAllocationFailures(allocator: std.mem.Allocator, re: *const regex.Regexp, input: []const u8) !void {
+    const matches = try re.findAllSubmatchIndex(allocator, input, -1);
+    defer if (matches) |m| regex.Regexp.freeAllSubmatchIndex(allocator, m);
+    try std.testing.expect(matches != null);
+}
+
+test "execution and collected captures clean up on allocation failure" {
+    var re = try regex.compile(ta, "(a|b)+");
+    defer re.deinit();
+    try std.testing.checkAllAllocationFailures(ta, exerciseExecutionAllocationFailures, .{ &re, "aa bb aa bb aa bb aa bb aa bb aa bb" });
+    const input = try ta.alloc(u8, 40000);
+    defer ta.free(input);
+    @memset(input, 'a');
+    try std.testing.checkAllAllocationFailures(ta, exerciseExecutionAllocationFailures, .{ &re, input });
+}
+
+test "literal fast paths agree with engine results without allocations" {
+    const cases = [_]struct { pattern: []const u8, input: []const u8 }{
+        .{ .pattern = "needle", .input = "a needle in text" },
+        .{ .pattern = "needle", .input = "absent" },
+        .{ .pattern = "", .input = "\xff" },
+        .{ .pattern = "日", .input = "\xff日本" },
+        .{ .pattern = "a", .input = "\xffa" },
+        .{ .pattern = "�", .input = "\xff" },
+        .{ .pattern = "^a$", .input = "ba" },
+        .{ .pattern = "(a)", .input = "ba" },
+    };
+    for (cases) |c| {
+        var re = try regex.compile(ta, c.pattern);
+        defer re.deinit();
+        const expected = try re.findSubmatchIndex(ta, c.input);
+        defer if (expected) |m| ta.free(m);
+        const actual = try re.findIndex(ta, c.input);
+        try std.testing.expectEqual(expected != null, actual != null);
+        if (actual) |m| {
+            try std.testing.expectEqual(@as(usize, @intCast(expected.?[0])), m.start);
+            try std.testing.expectEqual(@as(usize, @intCast(expected.?[1])), m.end);
+        }
+        try std.testing.expectEqual(expected != null, try re.match(ta, c.input));
+        var scratch = regex.Scratch.init(ta);
+        defer scratch.deinit();
+        try std.testing.expectEqual(actual, try re.findIndexScratch(&scratch, c.input));
+        try std.testing.expectEqual(expected != null, try re.matchScratch(&scratch, c.input));
+    }
+    var re = try regex.compile(ta, "needle");
+    defer re.deinit();
+    var failing = std.testing.FailingAllocator.init(ta, .{ .fail_index = 0 });
+    try std.testing.expect(try re.match(failing.allocator(), "find needle"));
+    try std.testing.expectEqual(regex.Match{ .start = 5, .end = 11 }, (try re.findIndex(failing.allocator(), "find needle")).?);
+}

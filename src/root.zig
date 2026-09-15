@@ -40,4 +40,5 @@ test {
     _ = @import("onepass.zig");
     _ = @import("regexp.zig");
     _ = @import("tests.zig");
+    _ = @import("oomtest.zig");
 }

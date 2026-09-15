@@ -206,7 +206,7 @@ fn prefixIndex(haystack: []const u8, needle: []const u8) ?usize {
     return prefixIndexAnchored(haystack, needle, prefixAnchor(needle));
 }
 
-fn prefixIndexAnchored(haystack: []const u8, needle: []const u8, anchor: usize) ?usize {
+pub fn prefixIndexAnchored(haystack: []const u8, needle: []const u8, anchor: usize) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len == 1) return std.mem.indexOfScalar(u8, haystack, needle[0]);
     if (haystack.len < needle.len) return null;
@@ -349,14 +349,10 @@ pub const Scratch = struct {
     fn ensurePike(self: *Scratch, ninst: usize, ncap: usize) !void {
         const a = self.allocator;
         if (ninst > self.pike_ninst) {
-            if (self.s0.len > 0) a.free(self.s0);
-            if (self.s1.len > 0) a.free(self.s1);
-            if (self.dense0.len > 0) a.free(self.dense0);
-            if (self.dense1.len > 0) a.free(self.dense1);
-            self.s0 = try a.alloc(u32, ninst);
-            self.s1 = try a.alloc(u32, ninst);
-            self.dense0 = try a.alloc(Entry, ninst);
-            self.dense1 = try a.alloc(Entry, ninst);
+            try replaceBuffer(u32, a, &self.s0, ninst);
+            try replaceBuffer(u32, a, &self.s1, ninst);
+            try replaceBuffer(Entry, a, &self.dense0, ninst);
+            try replaceBuffer(Entry, a, &self.dense1, ninst);
             self.pike_ninst = ninst;
         }
         if (ncap != self.thread_ncap) {
@@ -366,8 +362,7 @@ pub const Scratch = struct {
             }
             self.all_threads.clearRetainingCapacity();
             self.pool.clearRetainingCapacity();
-            if (self.matchcap.len > 0) a.free(self.matchcap);
-            self.matchcap = if (ncap > 0) try a.alloc(i64, ncap) else &.{};
+            try replaceBuffer(i64, a, &self.matchcap, ncap);
             self.thread_ncap = ncap;
         }
     }
@@ -378,12 +373,10 @@ pub const Scratch = struct {
     fn bitBufs(self: *Scratch, ncap: usize, visited_size: usize) !struct { work: []i64, visited: []u32 } {
         const a = self.allocator;
         if (ncap > self.work.len) {
-            if (self.work.len > 0) a.free(self.work);
-            self.work = try a.alloc(i64, ncap);
+            try replaceBuffer(i64, a, &self.work, ncap);
         }
         if (visited_size > self.visited.len) {
-            if (self.visited.len > 0) a.free(self.visited);
-            self.visited = try a.alloc(u32, visited_size);
+            try replaceBuffer(u32, a, &self.visited, visited_size);
         }
         return .{ .work = self.work[0..ncap], .visited = self.visited[0..visited_size] };
     }
@@ -393,12 +386,18 @@ pub const Scratch = struct {
     /// scratch — see `regexp.findSubmatchIndexScratch`.
     pub fn resultBuf(self: *Scratch, n: usize) ![]i64 {
         if (n > self.result.len) {
-            if (self.result.len > 0) self.allocator.free(self.result);
-            self.result = try self.allocator.alloc(i64, n);
+            try replaceBuffer(i64, self.allocator, &self.result, n);
         }
         return self.result[0..n];
     }
 };
+
+// Allocate before releasing the old buffer so failure leaves valid ownership.
+fn replaceBuffer(comptime T: type, allocator: std.mem.Allocator, buffer: *[]T, n: usize) !void {
+    const next = try allocator.alloc(T, n);
+    allocator.free(buffer.*);
+    buffer.* = next;
+}
 
 const Machine = struct {
     scratch: *Scratch,
@@ -453,12 +452,14 @@ const Machine = struct {
             t.pc = pc;
             return t;
         }
+        // Reserve both lists before transferring ownership of a new thread.
+        try sc.all_threads.ensureUnusedCapacity(sc.allocator, 1);
+        try sc.pool.ensureTotalCapacity(sc.allocator, sc.all_threads.items.len + 1);
         const t = try sc.allocator.create(Thread);
+        errdefer sc.allocator.destroy(t);
         t.cap = if (m.ncap > 0) try sc.allocator.alloc(i64, m.ncap) else &.{};
         t.pc = pc;
-        try sc.all_threads.append(sc.allocator, t);
-        // Ensure the free pool can always hold every thread without erroring.
-        try sc.pool.ensureTotalCapacity(sc.allocator, sc.all_threads.items.len);
+        sc.all_threads.appendAssumeCapacity(t);
         return t;
     }
 
@@ -1078,4 +1079,35 @@ pub fn execute(
     var scratch = Scratch.init(allocator);
     defer scratch.deinit();
     return executeReuse(&scratch, p, op, longest, cond, accel, input, pos, caps);
+}
+
+fn exerciseScratchGrowth(allocator: std.mem.Allocator) !void {
+    var scratch = Scratch.init(allocator);
+    defer scratch.deinit();
+    try scratch.ensurePike(4, 2);
+    try scratch.ensurePike(16, 6);
+    try scratch.ensurePike(8, 0);
+    _ = try scratch.bitBufs(2, 8);
+    _ = try scratch.bitBufs(6, 32);
+    _ = try scratch.resultBuf(2);
+    _ = try scratch.resultBuf(8);
+}
+
+test "scratch growth cleans up after every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseScratchGrowth, .{});
+}
+
+test "scratch remains reusable after partially failed growth" {
+    for (0..5) |offset| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var scratch = Scratch.init(failing.allocator());
+        defer scratch.deinit();
+        try scratch.ensurePike(4, 2);
+        failing.fail_index = failing.alloc_index + offset;
+        try std.testing.expectError(error.OutOfMemory, scratch.ensurePike(16, 6));
+        failing.fail_index = std.math.maxInt(usize);
+        try scratch.ensurePike(4, 2);
+        try scratch.ensurePike(16, 6);
+        try std.testing.expectEqual(@as(usize, 6), scratch.matchcap.len);
+    }
 }

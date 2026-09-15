@@ -116,11 +116,21 @@ pub const Regexp = struct {
         re.longest = true;
     }
 
+    fn isLiteral(re: *const Regexp) bool {
+        return re.prefix_complete and re.onepass == null and re.num_subexp == 0 and re.cond == 0;
+    }
+
+    fn literalIndex(re: *const Regexp, input: []const u8) ?Match {
+        const start = exec.prefixIndexAnchored(input, re.prefix, re.prefix_anchor) orelse return null;
+        return .{ .start = start, .end = start + re.prefix.len };
+    }
+
     // --- boolean match ---
 
     /// Reports whether `input` contains any match.
     pub fn match(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!bool {
         if (input.len < re.min_input_len) return false;
+        if (re.isLiteral()) return re.literalIndex(input) != null;
         var caps: [0]i64 = .{};
         return try re.execAt(allocator, .{ .s = input }, 0, &caps);
     }
@@ -138,6 +148,7 @@ pub const Regexp = struct {
     /// share one `Scratch` between concurrent matches.
     pub fn matchScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!bool {
         if (input.len < re.min_input_len) return false;
+        if (re.isLiteral()) return re.literalIndex(input) != null;
         var caps: [0]i64 = .{};
         return try re.execAtScratch(scratch, .{ .s = input }, 0, &caps);
     }
@@ -146,6 +157,7 @@ pub const Regexp = struct {
     /// allocating per call. See `matchScratch` for the reuse contract.
     pub fn findIndexScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!?Match {
         if (input.len < re.min_input_len) return null;
+        if (re.isLiteral()) return re.literalIndex(input);
         var caps: [2]i64 = .{ -1, -1 };
         const matched = try re.execAtScratch(scratch, .{ .s = input }, 0, &caps);
         if (!matched) return null;
@@ -169,6 +181,7 @@ pub const Regexp = struct {
     /// Leftmost match location, or null.
     pub fn findIndex(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!?Match {
         if (input.len < re.min_input_len) return null;
+        if (re.isLiteral()) return re.literalIndex(input);
         var caps: [2]i64 = .{ -1, -1 };
         const matched = try re.execAt(allocator, .{ .s = input }, 0, &caps);
         if (!matched) return null;
@@ -337,7 +350,9 @@ pub const Regexp = struct {
             out.deinit(allocator);
         }
         while (try it.next()) |m| {
-            try out.append(allocator, try allocator.dupe(i64, m));
+            const copy = try allocator.dupe(i64, m);
+            errdefer allocator.free(copy);
+            try out.append(allocator, copy);
         }
         if (out.items.len == 0) {
             out.deinit(allocator);

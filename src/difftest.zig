@@ -71,7 +71,22 @@ fn checkCase(gpa: std.mem.Allocator, c: Case) !bool {
     const got = try re.findSubmatchIndex(gpa, c.i);
     defer if (got) |g| gpa.free(g);
 
-    return eqOptInts(c.m, got);
+    if (!eqOptInts(c.m, got)) return false;
+    if (try re.match(gpa, c.i) != (c.m != null)) return false;
+    const index = try re.findIndex(gpa, c.i);
+    if ((index != null) != (c.m != null)) return false;
+    if (index) |m| {
+        if (m.start != c.m.?[0] or m.end != c.m.?[1]) return false;
+    }
+    var scratch = regex.Scratch.init(gpa);
+    defer scratch.deinit();
+    if (try re.matchScratch(&scratch, c.i) != (c.m != null)) return false;
+    const scratch_index = try re.findIndexScratch(&scratch, c.i);
+    if ((scratch_index != null) != (index != null)) return false;
+    if (scratch_index) |m| {
+        if (m.start != index.?.start or m.end != index.?.end) return false;
+    }
+    return true;
 }
 
 fn reportMismatch(gpa: std.mem.Allocator, c: Case) void {

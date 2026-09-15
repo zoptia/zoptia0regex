@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Preserve valid Scratch buffer ownership when allocation fails during growth.
+- Clean up partially allocated Pike VM threads and collected submatch results
+  on allocation failure. Add allocation-failure injection and recovery tests.
+
+### Performance
+
+- Search complete, uncaptured literals directly in `match`, `findIndex`, and
+  their Scratch variants, avoiding execution-engine setup and allocation.
+  Assertions, captures, case folding, and replacement-rune patterns retain
+  the existing execution paths.
+
 ## [0.5.1] — 2026-09-10
 
 ### Zig compatibility
