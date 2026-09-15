@@ -20,14 +20,15 @@ byte-for-byte parity with Go**.
 
 Head-to-head against Go's standard-library `regexp` — same patterns, same
 inputs, same 256 KB corpus, same calibration, Zig built `ReleaseFast` —
-**zoptia0regex is ~44% faster on average** and compiles patterns **~1.4×
+**zoptia0regex is ~53% faster on average** and compiles patterns **~1.4×
 faster**. And it doesn't trade correctness for speed: ~48,000 differential tests
 prove its output is **byte-for-byte identical to Go's** (go1.27.1, Unicode 17).
 
 Not "inspired by." **Proven identical.**
 
 - 🚀 **Faster than Go at matching.** Geometric mean across 20 workloads:
-  **0.56×** Go's time. Anchored "validation" patterns hit the one-pass engine
+  **0.47×** Go's time (0.54× leaving out the literal-hit row, which is
+  now a bare substring search). Anchored "validation" patterns hit the one-pass engine
   and fly — up to **~2× faster** — and a SIMD first-byte prefilter Go doesn't
   have runs unanchored `(?i)` and `\d`-led scans at **4.5–6× Go's speed**.
 - 🛡️ **Linear-time. ReDoS-proof.** Thompson NFA simulation means no catastrophic
@@ -69,13 +70,13 @@ wins.
 | `\A(?i)performance\z` | one-pass | **0.56×** |
 | `\w+` / `\p{L}+` (find all) | Pike VM | **0.64×** |
 | `\A(...)@(...)\z` with captures | one-pass | **0.78×** |
-| **Geometric mean (20 workloads)** | — | **0.56×** |
+| literal hit (`performance`) | literal fast path | **0.02×** |
+| **Geometric mean (20 workloads)** | — | **0.47×** |
 | Pattern compilation | — | **0.72×** (~1.4× faster) |
 
-**The honest caveat:** there are **two** workloads where Go is on par or
-ahead — a literal hit that is a pure memchr race (**1.02×**, ~200 ns each) and
-a nested-quantifier match on a small input (`(a+)+$`, bitstate engine) at
-**1.14×**, both sides in single-digit microseconds. Everything else is faster.
+**The honest caveat:** there is **one** workload where Go is ahead — a
+nested-quantifier match on a small input (`(a+)+$`, bitstate engine) at
+**1.13×**, both sides in single-digit microseconds. Everything else is faster.
 Full methodology and the complete table: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Why this exists
@@ -148,7 +149,7 @@ corpora:
 | Curated | ~11.7k | Hand-picked edge cases across every feature |
 | Random / fuzz | ~9k | Grammar-generated patterns & inputs |
 | POSIX leftmost-longest | ~15k | POSIX match semantics |
-| Audit | ~12.1k | Raw bytes, bounded results, templates, POSIX syntax and depth limits |
+| Byte-level | ~12.1k | Raw bytes (malformed UTF-8, NULs), bounded results, templates, POSIX syntax, depth limits |
 
 Each case runs the *real* Go `regexp` and zoptia0regex on the same input and
 requires **byte-for-byte identical** `FindSubmatchIndex` / `FindAll` /

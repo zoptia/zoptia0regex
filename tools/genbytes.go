@@ -1,5 +1,7 @@
-// Generate byte-preserving differential cases for the project audit.
-// Run with the reference Go toolchain: go run tools/genaudit.go > src/audit.jsonl
+// Generates src/bytes.jsonl: differential cases whose inputs and outputs are
+// JSON byte arrays, so malformed UTF-8 and NULs survive the round trip. Covers
+// Perl / Longest() / CompilePOSIX modes, bounded FindAll/Split limits,
+// replacement templates and parser depth limits. Run via tools/regen.sh.
 package main
 
 import (
@@ -11,7 +13,7 @@ import (
 	"strings"
 )
 
-type AuditCase struct {
+type Case struct {
 	P     string  `json:"p"`
 	I     []int   `json:"i"`
 	Mode  string  `json:"mode"`
@@ -62,7 +64,7 @@ func main() {
 				}
 			}
 			for j, input := range inputs {
-				c := AuditCase{P: p, I: bytesOf(input), Mode: mode, N: limits[j%len(limits)], T: templates[j%len(templates)], Err: err != nil}
+				c := Case{P: p, I: bytesOf(input), Mode: mode, N: limits[j%len(limits)], T: templates[j%len(templates)], Err: err != nil}
 				if err == nil {
 					c.M = re.FindStringSubmatchIndex(input)
 					c.All = re.FindAllStringSubmatchIndex(input, c.N)

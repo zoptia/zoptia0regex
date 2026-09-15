@@ -451,7 +451,7 @@ generated from Go's `unicode.SimpleFold` — not just ASCII.
 
 ## 6. Scope & differences from Go
 
-This is a high-fidelity replica, and the differential test suite (~35,000 cases
+This is a high-fidelity replica, and the differential test suite (~48,000 cases
 across curated, fuzz, and POSIX-leftmost-longest corpora) requires byte-for-byte
 identical results against the real Go `regexp` for `FindSubmatchIndex`,
 `FindAll`, `ReplaceAll`, and `Split`. The intentional differences are:

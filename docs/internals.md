@@ -296,15 +296,16 @@ The port's central claim is *result-identical to Go*, and that claim is
    `std.testing.allocator`, so any byte leaked across the whole suite fails the
    test. Parity and zero-leak are checked together.
 
-Three corpora cover three regimes:
+Four corpora cover four regimes:
 
 | Corpus           | Test harness        | Generator        | What it exercises |
 |------------------|---------------------|------------------|-------------------|
 | `cases.jsonl`    | `difftest.zig`      | `gencases.go`    | ~11.7k curated `(pattern, input)` pairs — the tricky, hand-chosen edge cases |
 | `fuzz.jsonl`     | `fuzztest.zig`      | `genfuzz.go`     | ~9k grammar-driven random patterns/inputs, checking `m` + `all` + `repl` + `split` |
 | `longest.jsonl`  | `longesttest.zig`   | `genlongest.go`  | ~15k POSIX leftmost-longest cases (`Regexp.Longest()`), isolating the `longest` branches of the Pike VM |
+| `bytes.jsonl`    | `bytestest.zig`     | `genbytes.go`    | ~12.1k byte-level cases: inputs/outputs stored as byte arrays so malformed UTF-8 and NULs survive JSON; Perl / `Longest()` / `CompilePOSIX` modes, bounded `FindAll`/`Split`, `$` templates, parser depth limits |
 
-Together that is roughly **35,000 cases with zero mismatches and zero leaks**,
+Together that is roughly **48,000 cases with zero mismatches and zero leaks**,
 re-run in full by CI on every push. When a divergence is ever introduced, the
 harness prints the offending pattern, input, Go's result, and our result
 side-by-side (`reportMismatch`), so the regression is immediately diagnosable.

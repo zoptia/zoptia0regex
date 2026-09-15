@@ -1,9 +1,10 @@
-//! Regression tests discovered during the project audit.
+//! Regression tests for fixed defects: capture-name ownership, AST height
+//! limits, and allocation-failure cleanup across compilation and the result APIs.
 const std = @import("std");
 const regex = @import("regexp.zig");
 const ta = std.testing.allocator;
 
-test "audit: compiled capture names own their source" {
+test "regression: compiled capture names own their source" {
     const pattern = try ta.dupe(u8, "(?P<name>a)");
     defer ta.free(pattern);
     var re = try regex.compile(ta, pattern);
@@ -16,7 +17,7 @@ test "audit: compiled capture names own their source" {
     try std.testing.expectEqualStrings("a", replaced);
 }
 
-test "audit: POSIX stacked repetitions enforce AST depth" {
+test "regression: POSIX stacked repetitions enforce AST depth" {
     const pattern = try ta.alloc(u8, 1001);
     defer ta.free(pattern);
     @memset(pattern, '*');
@@ -53,7 +54,7 @@ fn apiWithFailures(allocator: std.mem.Allocator, re: *const regex.Regexp) !void 
     defer allocator.free(quoted);
 }
 
-test "audit: compilation and result APIs survive allocation failures" {
+test "regression: compilation and result APIs survive allocation failures" {
     // Arena growth can resize in place depending on allocator addresses.
     // Force growth through alloc so fault indices stay deterministic.
     var no_resize = std.testing.FailingAllocator.init(ta, .{ .resize_fail_index = 0 });
@@ -66,7 +67,7 @@ test "audit: compilation and result APIs survive allocation failures" {
     try std.testing.checkAllAllocationFailures(backing, apiWithFailures, .{&re});
 }
 
-test "audit: redundant noncapturing groups do not consume AST depth" {
+test "regression: redundant noncapturing groups do not consume AST depth" {
     var pattern: std.ArrayList(u8) = .empty;
     defer pattern.deinit(ta);
     for (0..1001) |_| try pattern.appendSlice(ta, "(?:");

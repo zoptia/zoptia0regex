@@ -31,7 +31,7 @@ changing any matching/parsing behaviour.** The port-to-Go file map:
 
 ```sh
 zig build test                          # unit + behaviour tests (fast)
-zig build difftest                      # ~35k differential cases vs Go (slow-ish)
+zig build difftest                      # ~48k differential cases vs Go (slow-ish)
 zig build bench                         # benchmark, ReleaseFast (stderr TSV)
 zig build demo -- '<pattern>' '<input>' # CLI demo
 zig fmt --check src/*.zig build.zig     # must be clean; CI enforces it
@@ -109,6 +109,16 @@ into the engine/tests. To change them, edit the generator in `tools/` and run
 `tools/regen.sh`. The corpora are committed, so `zig build difftest` needs no Go
 toolchain (only `regen.sh` does).
 
+**Literal fast path:** `match` / `findIndex` (and their Scratch variants) skip
+the engines entirely when `Regexp.isLiteral()` holds (`prefix_complete`, no
+one-pass program, no capture groups, no start condition): the answer is
+`prefixIndexAnchored` alone. Any new shortcut must be covered by the
+`difftest.zig` per-case checks of `match`/`findIndex`/Scratch variants.
+
+**Parser limits:** AST height is tracked per node (`ast.Regexp.parse_height`,
+parser-only) and checked in `push` and `repeat` like Go's `checkHeight`;
+redundant `(?:…)` groups do not add height, POSIX stacked quantifiers do.
+
 **Find-all loops:** `findAll*`, `split` and the `replaceAll*` family run on
 `Regexp.Matches` (`regexp.zig`), the port of Go 1.27's `matches` iterator: one
 `Scratch` for the whole loop, `ncap = 2` when only the whole-match location is
@@ -125,7 +135,10 @@ runs under `std.testing.allocator`, so any leak fails the build.
 1. Consult the corresponding Go source first; mirror its logic.
 2. Add patterns exercising the change to the relevant generator
    (`tools/gencases.go` for curated, `genfuzz.go` for random, `genlongest.go`
-   for POSIX), run `tools/regen.sh`, and commit the regenerated `.jsonl`.
+   for POSIX, `genbytes.go` for byte-level cases whose inputs must carry
+   malformed UTF-8 / NULs or exercise `compilePOSIX`, `FindAll`/`Split`
+   limits and `$` templates), run `tools/regen.sh`, and commit the
+   regenerated `.jsonl`.
 3. `zig build test && zig build difftest` must pass; `zig fmt` must be clean.
 
 ## Intentional omissions — do not "fix" these

@@ -1112,7 +1112,7 @@ test "scratch remains reusable after partially failed growth" {
     }
 }
 
-test "audit: fresh Pike sparse indices are initialized" {
+test "fresh Pike sparse indices are initialized" {
     var scratch = Scratch.init(std.testing.allocator);
     defer scratch.deinit();
     for ([_]usize{ 8, 16 }) |n| {

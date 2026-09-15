@@ -8,7 +8,7 @@ feature set.
 
 ```sh
 zig build test         # unit + behaviour tests (fast)
-zig build difftest     # ~35k differential cases vs Go's recorded output
+zig build difftest     # ~48k differential cases vs Go's recorded output
 zig fmt --check src/*.zig build.zig
 ```
 

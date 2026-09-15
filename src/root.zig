@@ -41,5 +41,5 @@ test {
     _ = @import("regexp.zig");
     _ = @import("tests.zig");
     _ = @import("oomtest.zig");
-    _ = @import("audittest.zig");
+    _ = @import("regressiontest.zig");
 }

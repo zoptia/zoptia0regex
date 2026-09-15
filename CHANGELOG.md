@@ -4,30 +4,55 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.5.2] — 2026-09-15
+
+Merges the `fix/regex-allocation-and-literal` audit branch. No change to
+match results; the differential suite grows to ~47.8k cases (four corpora)
+and still reports zero mismatches on Zig 0.16.0 and 0.17.0-dev.2131.
 
 ### Fixed
 
-- Copy the pattern before parsing so named captures never borrow caller memory.
-- Enforce parsed AST height, including POSIX stacked quantifiers, while allowing
-  redundant noncapturing parentheses that do not increase AST height.
-- Initialize newly allocated Pike and one-pass sparse indices before reading
-  them; retain sparse-set reuse without per-match clearing.
-- Correct `find` and `findIndex` ownership guidance and release captured-result
-  slices in the README examples.
-- Add 12,132 byte-preserving Go differential cases for malformed UTF-8,
-  replacement templates, bounded results, POSIX syntax, and depth limits.
-
-- Preserve valid Scratch buffer ownership when allocation fails during growth.
-- Clean up partially allocated Pike VM threads and collected submatch results
-  on allocation failure. Add allocation-failure injection and recovery tests.
+- **Capture names borrowed the caller's pattern buffer.** `parsePerlFlags`
+  stores names as slices of the pattern, and the pattern was copied into the
+  regexp's arena only after parsing, so `subexpNames()` / `${name}` dangled
+  once the caller freed or reused its buffer. The copy now happens before
+  parsing.
+- **AST height limit matched Go only approximately.** Nesting was counted as
+  open parentheses; Go measures parse-tree height. POSIX stacked quantifiers
+  (`a` + 1000 `*`) were accepted where Go returns `ErrNestingDepth`, and 1001
+  redundant `(?:…)` groups were rejected where Go accepts them. Height is now
+  cached per node and checked in `push` and `repeat`, like Go's `checkHeight`.
+- **Allocation-failure cleanup.** Growing a `Scratch` buffer freed the old
+  block before allocating the new one, leaving a dangling pointer for
+  `deinit` to free again; a Pike VM thread whose capture array failed to
+  allocate leaked; a copied submatch slice leaked when the collecting list
+  failed to grow. All three now clean up, verified with
+  `checkAllAllocationFailures` over compilation and every result-producing
+  API (`src/oomtest.zig`, `src/regressiontest.zig`).
+- Freshly allocated Pike VM and one-pass sparse-set index buffers are zeroed
+  once on (re)allocation; reading undefined memory is UB in Zig even though
+  the dense cross-check made the stale-value case sound. Reuse between
+  matches still does no clearing.
+- Docs: `find` returns a borrowed sub-slice and `findIndex` a `Match` value —
+  neither is freed; README examples free the `findSubmatch` outer slice.
 
 ### Performance
 
-- Search complete, uncaptured literals directly in `match`, `findIndex`, and
-  their Scratch variants, avoiding execution-engine setup and allocation.
-  Assertions, captures, case folding, and replacement-rune patterns retain
-  the existing execution paths.
+- **Complete-literal fast path.** When the regexp is exactly a literal (no
+  captures, assertions or case folding), `match`, `findIndex` and their
+  `Scratch` variants answer with the prefix search alone. `literal_hit` in
+  the benchmark drops from ~200 ns to 5 ns; benchmark geomean vs Go
+  **0.47×** (0.54× without that row).
+
+### Testing
+
+- New byte-level corpus `src/bytes.jsonl` (`tools/genbytes.go`, ~12.1k
+  cases): inputs and outputs stored as byte arrays so malformed UTF-8 and
+  NULs survive JSON; covers Perl / `setLongest` / `compilePOSIX`, bounded
+  `findAll` / `split`, `$` templates and parser depth limits. Part of
+  `zig build difftest`.
+- The curated corpus now also checks `match`, `findIndex` and both `Scratch`
+  variants per case, so any engine shortcut is held to the recorded result.
 
 ## [0.5.1] — 2026-09-10
 

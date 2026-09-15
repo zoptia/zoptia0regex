@@ -1,5 +1,10 @@
-//! Byte-preserving Go differential tests for malformed UTF-8, bounded results,
-//! replacement templates, POSIX parsing, longest matching, and depth limits.
+//! Byte-level differential test against Go: `bytes.jsonl` (from
+//! `tools/genbytes.go`) stores inputs and outputs as byte arrays, so malformed
+//! UTF-8 and NULs are preserved exactly. Each case checks `findSubmatchIndex`,
+//! `match`, `findIndex`, `findAllSubmatchIndex` with a limit, `replaceAllString`
+//! with a template, and `split`, in Perl, `setLongest` and `compilePOSIX` modes.
+//!
+//! Run on its own:  zig test src/bytestest.zig
 const std = @import("std");
 const regex = @import("regexp.zig");
 const common = @import("difftest_common.zig");
@@ -16,9 +21,9 @@ const Case = struct {
     split: ?[][]u8,
 };
 
-test "audit differential vs Go" {
+test "byte-level differential vs Go" {
     const allocator = std.testing.allocator;
-    var lines = std.mem.tokenizeScalar(u8, @embedFile("audit.jsonl"), '\n');
+    var lines = std.mem.tokenizeScalar(u8, @embedFile("bytes.jsonl"), '\n');
     var total: usize = 0;
     var failures: usize = 0;
     while (lines.next()) |line| {
@@ -27,10 +32,10 @@ test "audit differential vs Go" {
         total += 1;
         checkCase(allocator, parsed.value) catch |err| {
             failures += 1;
-            if (failures <= 10) std.debug.print("AUDIT {s}: mode={s} pattern={s} input={any} n={d} template={s}\n", .{ @errorName(err), parsed.value.mode, parsed.value.p, parsed.value.i, parsed.value.n, parsed.value.t });
+            if (failures <= 10) std.debug.print("BYTES-MISMATCH {s}: mode={s} pattern={s} input={any} n={d} template={s}\n", .{ @errorName(err), parsed.value.mode, parsed.value.p, parsed.value.i, parsed.value.n, parsed.value.t });
         };
     }
-    std.debug.print("[audit] total={d} failures={d}\n", .{ total, failures });
+    std.debug.print("[bytes] total={d} failures={d}\n", .{ total, failures });
     try std.testing.expectEqual(@as(usize, 0), failures);
 }
 

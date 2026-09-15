@@ -461,7 +461,7 @@ pub fn compileOnePass(gpa: std.mem.Allocator, al: std.mem.Allocator, p: *const P
     return .{ .insts = insts, .start = opp.start, .num_cap = opp.num_cap };
 }
 
-test "audit: fresh one-pass sparse indices are initialized" {
+test "fresh one-pass sparse indices are initialized" {
     const allocator = std.testing.allocator;
     var queue = try newQueue(allocator, 8);
     defer allocator.free(queue.sparse);

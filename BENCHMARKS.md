@@ -2,15 +2,16 @@
 
 A like-for-like performance comparison between this Zig port and the Go
 standard-library `regexp` it is modelled on. The two engines produce
-**identical match results** (verified by ~35k differential cases); this measures
+**identical match results** (verified by ~48k differential cases); this measures
 how fast they get there.
 
 **Headline:** across 20 representative workloads the Zig port is, on average,
-**~44% faster** (geomean Zig/Go = **0.56×**) and **~1.4× faster at compiling**.
-It ships all three of Go's engines (Pike VM, bitstate backtracker, one-pass)
-plus a SIMD first-byte prefilter Go lacks; Go is on par or ahead on just two
-workloads — the literal hit (1.02×, a memchr race at ~200 ns) and a
-small-input bitstate case at 1.14× — both in single-digit microseconds.
+**~53% faster** (geomean Zig/Go = **0.47×**; **0.54×** if the
+literal-hit row, now a bare substring search, is left out) and **~1.4× faster
+at compiling**. It ships all three of Go's engines (Pike VM, bitstate
+backtracker, one-pass) plus a SIMD first-byte prefilter and a complete-literal
+fast path Go lacks; Go is ahead on just one workload — a small-input bitstate
+case at 1.13×, both sides in single-digit microseconds.
 
 ## Methodology
 
@@ -63,27 +64,27 @@ and exercise the one-pass engine.
 
 | case | op | engine | Go ns/op | Zig ns/op | Zig/Go |
 |------|----|--------|---------:|----------:|-------:|
-| literal_hit | find | prefix+VM | 197 | 201 | 1.02× |
-| literal_miss | find | prefix+VM | 6,008 | 5,898 | 0.98× |
-| alternation | findall | first-bytes+VM | 9,079,296 | 2,999,894 | **0.33×** |
-| charclass_word | findall | Pike VM | 6,176,186 | 4,060,733 | **0.66×** |
-| perl_word `\w+` | findall | Pike VM | 6,845,316 | 4,402,283 | **0.64×** |
-| digits `\d+` | findall | first-bytes+VM | 3,392,055 | 567,003 | **0.17×** |
-| date | findall | first-bytes+VM | 3,455,110 | 610,356 | **0.18×** |
-| email | findall | Pike VM | 4,956,833 | 4,077,528 | **0.82×** |
-| email_submatch | submatch | Pike VM | 2,009 | 1,846 | **0.92×** |
-| anchored_multiline `(?m)^\w+` | findall | Pike VM | 2,027,184 | 1,519,318 | **0.75×** |
-| unicode_letters `\p{L}+` | findall | Pike VM | 7,905,753 | 5,034,615 | **0.64×** |
-| dotstar_greedy `p.*e` | find | first-bytes+VM | 3,622 | 2,630 | **0.73×** |
-| redos_linear `(a+)+$` | match | bitstate | 7,814 | 8,899 | 1.14× |
-| nested_groups | findall | Pike VM | 8,470,043 | 6,245,440 | **0.74×** |
-| caseins_literal `(?i)…` | findall | first-bytes+VM | 3,614,422 | 807,756 | **0.22×** |
-| anchored_caseins `\A(?i)…\z` | match | one-pass | 65 | 37 | **0.56×** |
-| anchored_word `\A[a-z]+\z` | match | one-pass | 94 | 45 | **0.47×** |
-| anchored_date `\A\d{4}-…\z` | match | one-pass | 62 | 30 | **0.47×** |
-| anchored_digits `\A\d+\z` | match | one-pass | 88 | 42 | **0.48×** |
-| anchored_email `\A(…)@(…)\z` | submatch | one-pass | 221 | 173 | **0.78×** |
-| **geomean** | | | | | **0.56×** |
+| literal_hit | find | literal fast path | 203 | 5 | **0.02×** |
+| literal_miss | find | literal fast path | 6,094 | 5,801 | 0.95× |
+| alternation | findall | first-bytes+VM | 9,132,552 | 3,059,994 | **0.34×** |
+| charclass_word | findall | Pike VM | 6,232,430 | 4,191,366 | **0.67×** |
+| perl_word `\w+` | findall | Pike VM | 6,898,607 | 4,409,001 | **0.64×** |
+| digits `\d+` | findall | first-bytes+VM | 3,447,038 | 564,928 | **0.16×** |
+| date | findall | first-bytes+VM | 3,488,526 | 621,218 | **0.18×** |
+| email | findall | Pike VM | 5,074,188 | 4,065,250 | **0.80×** |
+| email_submatch | submatch | Pike VM | 2,058 | 1,880 | **0.91×** |
+| anchored_multiline `(?m)^\w+` | findall | Pike VM | 2,041,154 | 1,454,768 | **0.71×** |
+| unicode_letters `\p{L}+` | findall | Pike VM | 7,862,441 | 4,949,832 | **0.63×** |
+| dotstar_greedy `p.*e` | find | first-bytes+VM | 4,419 | 2,674 | **0.61×** |
+| redos_linear `(a+)+$` | match | bitstate | 7,835 | 8,890 | 1.13× |
+| nested_groups | findall | Pike VM | 8,616,458 | 6,046,292 | **0.70×** |
+| caseins_literal `(?i)…` | findall | first-bytes+VM | 3,536,499 | 802,031 | **0.23×** |
+| anchored_caseins `\A(?i)…\z` | match | one-pass | 67 | 40 | **0.59×** |
+| anchored_word `\A[a-z]+\z` | match | one-pass | 94 | 47 | **0.50×** |
+| anchored_date `\A\d{4}-…\z` | match | one-pass | 57 | 32 | **0.56×** |
+| anchored_digits `\A\d+\z` | match | one-pass | 88 | 45 | **0.51×** |
+| anchored_email `\A(…)@(…)\z` | submatch | one-pass | 222 | 171 | **0.77×** |
+| **geomean** | | | | | **0.47×** |
 
 ## Analysis
 
@@ -130,11 +131,17 @@ adding our own):**
 | anchored case-insensitive | 1.27× | **0.62×** | one-pass engine + prefix skip |
 | unanchored case-insensitive | 1.29× | **0.25×** | SIMD first-byte prefilter (no Go counterpart) |
 
-**The remaining non-wins are `redos_linear` (1.14×) and `literal_hit`
-(1.02×).** The first is the bitstate engine on a 2 KB input, where Go's
-small-input constant is slightly lower; the second is a pure memchr race that
-both sides finish in ~200 ns. Both implementations are linear-time (no
-exponential blowup) and finish in single-digit microseconds.
+**Complete literals skip the engines.** When the regexp is exactly a literal
+(`prefix_complete`, no captures, no assertions, no case folding), `match` /
+`findIndex` answer with the prefix search alone — no machine setup, no
+allocation. `literal_hit` drops from ~200 ns (a Pike VM start-up plus one
+memchr) to **5 ns**; `literal_miss` is unchanged, since it was already one
+substring search over 256 KB.
+
+**The one remaining non-win is `redos_linear` (1.13×)** — the bitstate engine
+on a 2 KB input, where Go's small-input constant is slightly lower. Both
+implementations are linear-time (no exponential blowup) and finish in
+single-digit microseconds.
 
 ## Allocation-free matching: the `Scratch` API
 
