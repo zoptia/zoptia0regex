@@ -65,11 +65,11 @@ pub fn build(b: *std.Build) void {
     bench_scratch_step.dependOn(&b.addRunArtifact(bench_scratch_exe).step);
 
     // Differential tests against Go's regexp output (golden reference). All
-    // three corpora (src/cases.jsonl, src/fuzz.jsonl, src/longest.jsonl) are
+    // four corpora (cases, fuzz, longest, audit) are
     // committed — regenerate them with tools/regen.sh only when the generators
     // change; running the tests needs no Go toolchain.
-    const difftest_step = b.step("difftest", "Differential test vs Go's regexp (curated + fuzz + POSIX corpora)");
-    inline for (.{ "src/difftest.zig", "src/fuzztest.zig", "src/longesttest.zig" }) |src| {
+    const difftest_step = b.step("difftest", "Differential test vs Go's regexp (curated + fuzz + POSIX + audit corpora)");
+    inline for (.{ "src/difftest.zig", "src/fuzztest.zig", "src/longesttest.zig", "src/auditdifftest.zig" }) |src| {
         const mod = b.createModule(.{
             .root_source_file = b.path(src),
             .target = target,

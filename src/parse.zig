@@ -156,10 +156,6 @@ const Parser = struct {
     flags: Flags,
     stack: std.ArrayList(*Regexp) = .empty,
     num_cap: i32 = 0,
-    // Current open '(' nesting. A proxy for Go's calcHeight (which measures
-    // full AST height including concat/alternate nesting); parens are the only
-    // way a *pattern* nests the recursive passes deeply enough to matter.
-    paren_depth: u32 = 0,
     num_runes: usize = 0, // total runes across all char classes
 
     fn newRegexp(p: *Parser, o: Op) !*Regexp {
@@ -168,7 +164,15 @@ const Parser = struct {
         return re;
     }
 
+    fn checkHeight(re: *Regexp) ParseError!void {
+        var height: u32 = 1;
+        for (re.sub) |sub| height = @max(height, sub.parse_height + 1);
+        if (height > max_height) return error.NestingDepth;
+        re.parse_height = height;
+    }
+
     fn push(p: *Parser, re: *Regexp) !void {
+        try checkHeight(re);
         p.num_runes += re.runes.len;
         if (p.num_runes > max_runes) return error.TooLarge;
         try p.stack.append(p.al, re);
@@ -179,12 +183,6 @@ const Parser = struct {
         const re = try p.newRegexp(o);
         re.flags = p.flags;
         try p.push(re);
-        if (o == .left_paren) {
-            // Bound nesting depth so the recursive AST passes can't overflow
-            // the stack (Go rejects over-deep patterns with ErrNestingDepth).
-            p.paren_depth += 1;
-            if (p.paren_depth > max_height) return error.NestingDepth;
-        }
         return re;
     }
 
@@ -234,6 +232,7 @@ const Parser = struct {
         re.max = max;
         re.flags = flags;
         re.sub = try p.al.dupe(*Regexp, &[_]*Regexp{sub});
+        try checkHeight(re);
         p.stack.items[n - 1] = re;
 
         if (o == .repeat and (min >= 2 or max >= 2) and !repeatIsValid(re, 1000)) {
@@ -382,7 +381,6 @@ const Parser = struct {
         const re2 = p.stack.items[n - 2];
         p.stack.shrinkRetainingCapacity(n - 2);
         if (re2.op != .left_paren) return error.UnexpectedParen;
-        if (p.paren_depth > 0) p.paren_depth -= 1;
 
         p.flags = re2.flags; // restore flags at time of paren
         if (re2.cap == 0) {

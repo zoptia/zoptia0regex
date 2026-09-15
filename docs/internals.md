@@ -47,10 +47,9 @@ the input, with no backtracking and no exponential blow-up.** The same
 `(a+)+$` that hangs a backtracker runs in linear time here. The engine is
 *immune to ReDoS by construction.*
 
-The price of this guarantee is the one feature it forgets: **backreferences**
-(`\1`) and `\C` are not regular and cannot be simulated this way, so — exactly
-like Go and RE2 — zoptia0regex does not support them. Everything else in Go's
-syntax is supported (see the README for the full grammar).
+Backreferences (`\1`) fall outside regular-language matching and are
+unsupported. The byte escape `\C` is also intentionally unsupported to
+match Go's syntax; a single-byte match is not itself a non-regular feature.
 
 The remaining subtlety is *which* match the NFA reports, since a regex can
 match a given position in several ways. RE2 reproduces Perl's

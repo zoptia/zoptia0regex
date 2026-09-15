@@ -5,7 +5,7 @@
 ### Go's `regexp`, faithfully replicated in Zig — and faster.
 
 A **regular-expression (regex) library for Zig** — a high-fidelity port of the
-RE2 engine, with a linear-time guarantee and **~35,000 tests proving
+RE2 engine, with a linear-time guarantee and **~48,000 tests proving
 byte-for-byte parity with Go**.
 
 [![CI](https://github.com/zoptia/zoptia0regex/actions/workflows/ci.yml/badge.svg)](https://github.com/zoptia/zoptia0regex/actions)
@@ -21,7 +21,7 @@ byte-for-byte parity with Go**.
 Head-to-head against Go's standard-library `regexp` — same patterns, same
 inputs, same 256 KB corpus, same calibration, Zig built `ReleaseFast` —
 **zoptia0regex is ~44% faster on average** and compiles patterns **~1.4×
-faster**. And it doesn't trade correctness for speed: ~35,000 differential tests
+faster**. And it doesn't trade correctness for speed: ~48,000 differential tests
 prove its output is **byte-for-byte identical to Go's** (go1.27.1, Unicode 17).
 
 Not "inspired by." **Proven identical.**
@@ -33,7 +33,7 @@ Not "inspired by." **Proven identical.**
 - 🛡️ **Linear-time. ReDoS-proof.** Thompson NFA simulation means no catastrophic
   backtracking, ever. A pattern like `(a+)+` that hangs PCRE, JS, and Python
   runs in linear time here.
-- ✅ **Proven identical to Go.** ~35,000 differential cases run the *real* Go
+- ✅ **Proven identical to Go.** ~48,000 differential cases run the *real* Go
   `regexp` and this engine on the same inputs and require identical results.
   **Zero mismatches. Zero leaks.** The fidelity isn't a claim — it's enforced by
   the suite on every push.
@@ -47,7 +47,8 @@ var re = try regex.compile(gpa, "(\\w+)@(\\w+)\\.(\\w+)");
 defer re.deinit();
 
 const subs = (try re.findSubmatch(gpa, "ping me@example.com")).?;
-// subs => "me" / "example" / "com"
+defer gpa.free(subs);
+// subs => "me@example.com" / "me" / "example" / "com"
 ```
 
 → Full install & API in the **[usage guide](docs/usage.md)**.
@@ -130,6 +131,7 @@ const regex = @import("regex");
 var re = try regex.compile(gpa, "(\\w+)@(\\w+)\\.(\\w+)");
 defer re.deinit();
 const subs = (try re.findSubmatch(gpa, "ping me@example.com")).?;
+defer gpa.free(subs);
 ```
 
 That's the taste — the **[full install + API guide lives in docs/usage.md](docs/usage.md)**:
@@ -138,7 +140,7 @@ wiring the dependency into `build.zig`, every `Find` / `FindAll` / `Replace` /
 
 ## Trust & validation
 
-Every push runs the **full ~35,000-case differential suite** in CI, across three
+Every push runs the **full ~48,000-case differential suite** in CI, across four
 corpora:
 
 | Corpus | Cases | What it checks |
@@ -146,6 +148,7 @@ corpora:
 | Curated | ~11.7k | Hand-picked edge cases across every feature |
 | Random / fuzz | ~9k | Grammar-generated patterns & inputs |
 | POSIX leftmost-longest | ~15k | POSIX match semantics |
+| Audit | ~12.1k | Raw bytes, bounded results, templates, POSIX syntax and depth limits |
 
 Each case runs the *real* Go `regexp` and zoptia0regex on the same input and
 requires **byte-for-byte identical** `FindSubmatchIndex` / `FindAll` /
@@ -154,7 +157,7 @@ under `std.testing.allocator`). CI stays green.
 
 ```sh
 zig build test        # unit + behaviour tests
-zig build difftest    # the full ~35k differential suite (no Go toolchain needed)
+zig build difftest    # the full ~48k differential suite (no Go toolchain needed)
 zig build bench       # benchmark vs Go (ReleaseFast)
 ```
 

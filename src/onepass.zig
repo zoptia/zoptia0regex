@@ -7,11 +7,6 @@
 //! `compileOnePass` builds that table when possible, else returns null and the
 //! caller falls back to the bitstate/Pike VM engines (with identical results).
 //!
-//! Port notes vs Go: `onePassCopy`'s optional Prog-idiom rewrites (which let a
-//! few extra Alt shapes qualify) and `doOnePass`'s literal-prefix skip are
-//! omitted — both only affect which programs qualify / how fast, never the
-//! match results of those that do.
-
 const std = @import("std");
 const prog = @import("prog.zig");
 const ast = @import("ast.zig");
@@ -123,7 +118,10 @@ const Queue = struct {
 };
 
 fn newQueue(al: std.mem.Allocator, size: usize) !Queue {
-    return .{ .sparse = try al.alloc(u32, size), .dense = try al.alloc(u32, size) };
+    const sparse = try al.alloc(u32, size);
+    errdefer al.free(sparse);
+    @memset(sparse, 0);
+    return .{ .sparse = sparse, .dense = try al.alloc(u32, size) };
 }
 
 const MergeResult = struct { merged: []const u21, next: []u32 };
@@ -461,4 +459,17 @@ pub fn compileOnePass(gpa: std.mem.Allocator, al: std.mem.Allocator, p: *const P
         };
     }
     return .{ .insts = insts, .start = opp.start, .num_cap = opp.num_cap };
+}
+
+test "audit: fresh one-pass sparse indices are initialized" {
+    const allocator = std.testing.allocator;
+    var queue = try newQueue(allocator, 8);
+    defer allocator.free(queue.sparse);
+    defer allocator.free(queue.dense);
+    for (queue.sparse) |value| try std.testing.expectEqual(@as(u32, 0), value);
+    queue.insert(3);
+    queue.insert(3);
+    try std.testing.expectEqual(@as(u32, 1), queue.size);
+    queue.clear();
+    try std.testing.expect(!queue.contains(3));
 }

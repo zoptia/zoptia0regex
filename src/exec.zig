@@ -350,7 +350,9 @@ pub const Scratch = struct {
         const a = self.allocator;
         if (ninst > self.pike_ninst) {
             try replaceBuffer(u32, a, &self.s0, ninst);
+            @memset(self.s0, 0);
             try replaceBuffer(u32, a, &self.s1, ninst);
+            @memset(self.s1, 0);
             try replaceBuffer(Entry, a, &self.dense0, ninst);
             try replaceBuffer(Entry, a, &self.dense1, ninst);
             self.pike_ninst = ninst;
@@ -414,11 +416,9 @@ const Machine = struct {
 
     /// Build a Machine view over `scratch`. Buffers are borrowed from `scratch`
     /// (grown as needed); nothing here is freed at the end of a run — the
-    /// scratch outlives the Machine. Sparse sets are deliberately NOT zeroed:
-    /// the membership test in `add` is `sp < q.n and dense[sp].pc == pc`, which
-    /// the dense cross-check makes sound against any stale/indeterminate
-    /// `sparse[pc]` (the defining property of a sparse set — Go zeroes the
-    /// buffer only because `make` does, never for correctness).
+    /// scratch outlives the Machine. Fresh sparse storage is initialized because
+    /// Zig does not permit reading undefined integers. Reused sparse entries
+    /// need no clearing: the dense cross-check rejects stale indices.
     fn init(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, accel: Accel, ncap: usize) !Machine {
         const ninst = p.insts.len;
         try scratch.ensurePike(ninst, ncap);
@@ -1109,5 +1109,15 @@ test "scratch remains reusable after partially failed growth" {
         try scratch.ensurePike(4, 2);
         try scratch.ensurePike(16, 6);
         try std.testing.expectEqual(@as(usize, 6), scratch.matchcap.len);
+    }
+}
+
+test "audit: fresh Pike sparse indices are initialized" {
+    var scratch = Scratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    for ([_]usize{ 8, 16 }) |n| {
+        try scratch.ensurePike(n, 2);
+        for (scratch.s0) |value| try std.testing.expectEqual(@as(u32, 0), value);
+        for (scratch.s1) |value| try std.testing.expectEqual(@as(u32, 0), value);
     }
 }

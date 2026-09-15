@@ -81,6 +81,8 @@ pub const Regexp = struct {
     runes: []u21 = &.{},
     min: i32 = 0,
     max: i32 = 0,
+    /// Parser-only cached AST height, checked before recursive passes run.
+    parse_height: u32 = 1,
     cap: i32 = 0, // capturing index, for `capture`
     name: []const u8 = "", // capturing name, for `capture`
 

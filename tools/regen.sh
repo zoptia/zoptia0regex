@@ -10,6 +10,7 @@
 #   src/cases.jsonl         curated differential corpus
 #   src/fuzz.jsonl          large random differential corpus
 #   src/longest.jsonl       POSIX leftmost-longest corpus
+#   src/audit.jsonl         byte-preserving audit differential corpus
 #   src/bench.jsonl + src/bench_*.txt  benchmark workloads and corpus
 set -e
 cd "$(dirname "$0")/.."
@@ -29,8 +30,11 @@ echo "generating random fuzz corpus (src/fuzz.jsonl) ..."
 echo "generating leftmost-longest corpus (src/longest.jsonl) ..."
 ( cd tools && go run genlongest.go ) > src/longest.jsonl
 
+echo "generating audit corpus (src/audit.jsonl) ..."
+go run tools/genaudit.go > src/audit.jsonl
+
 echo "generating benchmark corpus (src/bench*.{jsonl,txt}) ..."
 ( cd tools && go run genbench.go ) > src/bench.jsonl
 
 echo "done. counts:"
-wc -l src/cases.jsonl src/fuzz.jsonl src/longest.jsonl src/bench.jsonl
+wc -l src/cases.jsonl src/fuzz.jsonl src/longest.jsonl src/audit.jsonl src/bench.jsonl

@@ -397,11 +397,13 @@ The split is deliberate and consistent:
 
 - **The caller frees returned slices.** Anything a method hands back is
   caller-owned unless the table above says otherwise:
-  - `find` / `findAll` / `findSubmatch` / `split` return slices whose *elements*
+  - `find` returns a borrowed sub-slice of the input; do not free it.
+  - `findIndex` returns a `Match` value; there is no result allocation to free.
+  - `findAll` / `findSubmatch` / `split` return slices whose *elements*
     are sub-slices of the input (not separately allocated) — free only the
     outer slice with `allocator.free`, and keep the input alive while you use
     them.
-  - `findIndex` / `findAllIndex` / `findSubmatchIndex` return owned slices of
+  - `findAllIndex` / `findSubmatchIndex` return owned slices of
     offsets — free with `allocator.free`.
   - `findAllSubmatchIndex` returns a slice-of-slices where both levels are
     owned — free with `freeAllSubmatchIndex`.
@@ -414,8 +416,8 @@ The split is deliberate and consistent:
   `Scratch` you pass; `scratch.deinit()` frees it all. Nothing they return is
   yours to free.
 
-- **No-match is `null`, not an error.** The find/match family return
-  `?...`; only allocation failure produces an error (`ExecError`).
+- **No-match is not an error.** Boolean methods return `false`; find methods
+  return `null`. Only allocation failure produces an error (`ExecError`).
 
 The whole library is verified leak-free under `std.testing.allocator` across the
 full differential suite.

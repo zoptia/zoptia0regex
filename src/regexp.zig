@@ -593,7 +593,8 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
     }
     const al = arena.allocator();
 
-    const re_ast = try parse.parse(al, expr, mode);
+    const expr_owned = try al.dupe(u8, expr);
+    const re_ast = try parse.parse(al, expr_owned, mode);
     const max_cap = re_ast.maxCap();
 
     const names = try al.alloc([]const u8, @intCast(max_cap + 1));
@@ -603,7 +604,6 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
     const simplified = try simplify.simplify(al, re_ast);
     const p = try compile_.compile(al, simplified);
 
-    const expr_owned = try al.dupe(u8, expr);
     const cond = p.startCond();
 
     // Build the one-pass program if the regexp qualifies (anchored, unambiguous).

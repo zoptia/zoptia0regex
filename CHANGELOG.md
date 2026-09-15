@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- Copy the pattern before parsing so named captures never borrow caller memory.
+- Enforce parsed AST height, including POSIX stacked quantifiers, while allowing
+  redundant noncapturing parentheses that do not increase AST height.
+- Initialize newly allocated Pike and one-pass sparse indices before reading
+  them; retain sparse-set reuse without per-match clearing.
+- Correct `find` and `findIndex` ownership guidance and release captured-result
+  slices in the README examples.
+- Add 12,132 byte-preserving Go differential cases for malformed UTF-8,
+  replacement templates, bounded results, POSIX syntax, and depth limits.
+
 - Preserve valid Scratch buffer ownership when allocation fails during growth.
 - Clean up partially allocated Pike VM threads and collected submatch results
   on allocation failure. Add allocation-failure injection and recovery tests.
