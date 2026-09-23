@@ -568,7 +568,7 @@ const Machine = struct {
                     }
                     m.matched = true;
                 },
-                .rune => add_it = (c >= 0 and i.matchRune(@intCast(c))),
+                .rune => add_it = (c >= 0 and m.p.matchRuneAt(t.pc, @intCast(c))),
                 .rune1 => add_it = (c == @as(i32, @intCast(i.runes[0]))),
                 .rune_any => add_it = true,
                 .rune_any_not_nl => add_it = (c != '\n'),
@@ -749,7 +749,7 @@ const BitState = struct {
                     },
                     .rune => {
                         const s = b.input.step(@intCast(pos));
-                        if (s.r < 0 or !inst.matchRune(@intCast(s.r))) break :process;
+                        if (s.r < 0 or !b.p.matchRuneAt(pc, @intCast(s.r))) break :process;
                         pos += @intCast(s.w);
                         pc = inst.out;
                         continue :process;

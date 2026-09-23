@@ -20,14 +20,14 @@ byte-for-byte parity with Go**.
 
 Head-to-head against Go's standard-library `regexp` — same patterns, same
 inputs, same 256 KB corpus, same calibration, Zig built `ReleaseFast` —
-**zoptia0regex is ~53% faster on average** and compiles patterns **~1.4×
+**zoptia0regex is ~48% faster on average** and compiles patterns **~1.25×
 faster**. And it doesn't trade correctness for speed: ~48,000 differential tests
 prove its output is **byte-for-byte identical to Go's** (go1.27.1, Unicode 17).
 
 Not "inspired by." **Proven identical.**
 
 - 🚀 **Faster than Go at matching.** Geometric mean across 20 workloads:
-  **0.47×** Go's time (0.54× leaving out the literal-hit row, which is
+  **0.45×** Go's time (0.52× leaving out the literal-hit row, which is
   now a bare substring search). Anchored "validation" patterns hit the one-pass engine
   and fly — up to **~2× faster** — and a SIMD first-byte prefilter Go doesn't
   have runs unanchored `(?i)` and `\d`-led scans at **4.5–6× Go's speed**.
@@ -62,21 +62,21 @@ wins.
 | Workload | Engine | Zig / Go |
 |---|---|---|
 | `\d+` | first-bytes + Pike VM | **0.17×** |
-| date scan (`\d{4}-…`) | first-bytes + Pike VM | **0.18×** |
-| `(?i)performance` (unanchored scan) | first-bytes + Pike VM | **0.22×** |
-| alternation | first-bytes + Pike VM | **0.33×** |
+| date scan (`\d{4}-…`) | first-bytes + Pike VM | **0.17×** |
+| `(?i)performance` (unanchored scan) | first-bytes + Pike VM | **0.13×** |
+| alternation | first-bytes + Pike VM | **0.29×** |
 | `\A[a-z]+\z` (anchored validation) | one-pass | **0.47×** |
 | `\A\d+\z` (anchored validation) | one-pass | **0.48×** |
 | `\A(?i)performance\z` | one-pass | **0.56×** |
-| `\w+` / `\p{L}+` (find all) | Pike VM | **0.64×** |
+| `\w+` / `\p{L}+` (find all) | Pike VM | **0.60×** |
 | `\A(...)@(...)\z` with captures | one-pass | **0.78×** |
 | literal hit (`performance`) | literal fast path | **0.02×** |
-| **Geometric mean (20 workloads)** | — | **0.47×** |
-| Pattern compilation | — | **0.72×** (~1.4× faster) |
+| **Geometric mean (20 workloads)** | — | **0.45×** |
+| Pattern compilation | — | **0.80×** (~1.25× faster) |
 
 **The honest caveat:** there is **one** workload where Go is ahead — a
 nested-quantifier match on a small input (`(a+)+$`, bitstate engine) at
-**1.13×**, both sides in single-digit microseconds. Everything else is faster.
+**1.14×**, both sides in single-digit microseconds. Everything else is faster.
 Full methodology and the complete table: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Why this exists

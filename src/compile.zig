@@ -73,12 +73,14 @@ const any_rune_not_nl = [_]u21{ 0, '\n' - 1, '\n' + 1, unicode.max_rune };
 const Compiler = struct {
     al: std.mem.Allocator,
     insts: std.ArrayList(Inst) = .empty,
+    ascii: std.ArrayList(u128) = .empty,
     num_cap: usize = 2, // implicit whole-match pair
     depth: u32 = 0,
 
     fn inst(c: *Compiler, op: prog.InstOp) Error!Frag {
         const i: u32 = @intCast(c.insts.items.len);
         try c.insts.append(c.al, .{ .op = op });
+        try c.ascii.append(c.al, 0);
         if (c.insts.items.len > max_insts) return error.TooLarge;
         return .{ .i = i, .nullable = true };
     }
@@ -176,6 +178,7 @@ const Compiler = struct {
         }
         c.insts.items[f.i].runes = runes;
         c.insts.items[f.i].arg = flags;
+        c.ascii.items[f.i] = asciiBitmap(runes, flags);
         f.out = PatchList.make(f.i << 1);
 
         // Specialize for the exec machine.
@@ -246,6 +249,35 @@ const Compiler = struct {
     }
 };
 
+/// The ASCII membership bitmap of a rune instruction (bit b set iff rune
+/// b < 0x80 matches), derived straight from the range list — or, for a
+/// single case-folded rune, from one walk of its fold orbit — so building it
+/// costs O(ranges), not 128 probes. Mirrors `prog.matchRunePos` exactly.
+fn asciiBitmap(runes: []const u21, flags: ast.Flags) u128 {
+    var bits: u128 = 0;
+    if (runes.len == 1) {
+        const r0 = runes[0];
+        if (r0 < 0x80) bits |= @as(u128, 1) << @intCast(r0);
+        if (flags & ast.FoldCase != 0) {
+            var r1 = unicode.simpleFold(r0);
+            while (r1 != r0) : (r1 = unicode.simpleFold(r1)) {
+                if (r1 < 0x80) bits |= @as(u128, 1) << @intCast(r1);
+            }
+        }
+        return bits;
+    }
+    var j: usize = 0;
+    while (j < runes.len) : (j += 2) {
+        const lo = runes[j];
+        if (lo >= 0x80) break; // sorted pairs: nothing ASCII beyond this
+        const hi = @min(runes[j + 1], 0x7F);
+        const width: u8 = @intCast(hi - lo + 1);
+        const run: u128 = if (width == 128) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(width)) - 1;
+        bits |= run << @intCast(lo);
+    }
+    return bits;
+}
+
 /// Compile a simplified AST into a program. The returned `Prog.insts` is
 /// allocated from `al` (caller/owning Regexp's arena).
 pub fn compile(al: std.mem.Allocator, re: *Regexp) Error!Prog {
@@ -257,7 +289,31 @@ pub fn compile(al: std.mem.Allocator, re: *Regexp) Error!Prog {
     const start = f.i;
     return Prog{
         .insts = try c.insts.toOwnedSlice(al),
+        .ascii = try c.ascii.toOwnedSlice(al),
         .start = start,
         .num_cap = c.num_cap,
     };
+}
+
+test "ASCII bitmap agrees with matchRunePos for every rune instruction" {
+    const parse = @import("parse.zig");
+    const simplify = @import("simplify.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const patterns = [_][]const u8{ "[a-z]", "(?i)k", "(?i)[k-s]", "\\pL", "[^\\x00-\\x7f]", "\\w\\d\\s", "[[:punct:]]", "(?i)straße", "." };
+    for (patterns) |pat| {
+        const re_ast = try parse.parse(al, pat, ast.Perl);
+        const p = try compile(al, try simplify.simplify(al, re_ast));
+        try std.testing.expectEqual(p.insts.len, p.ascii.len);
+        for (p.insts, 0..) |inst, pc| {
+            if (inst.op != .rune) continue;
+            for (0..0x80) |b| {
+                const want = prog.matchRunePos(inst.runes, inst.arg, @intCast(b)) >= 0;
+                try std.testing.expectEqual(want, p.matchRuneAt(@intCast(pc), @intCast(b)));
+            }
+            // Non-ASCII still goes through the range list.
+            try std.testing.expectEqual(inst.matchRune(0x212A), p.matchRuneAt(@intCast(pc), 0x212A));
+        }
+    }
 }

@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.3] — 2026-09-22
+
+### Performance
+
+- **ASCII bitmap for rune instructions.** Every general `rune` instruction
+  gets a compile-time 128-bit ASCII membership bitmap, stored as a side table
+  in `Prog` so `Inst` stays 32 bytes (inline, it slowed the bitstate engine
+  by ~25%). The Pike VM and bitstate engines answer ASCII input with one bit
+  test instead of a range scan, binary search or case-fold orbit walk.
+  `(?i)performance` findall 0.13× Go (was 0.23×), `\p{L}+` 0.51× (was
+  0.63×); benchmark geomean vs Go **0.45×** (0.52× without literal_hit;
+  0.5.2: 0.47× / 0.54×). The bitmap is built from the range list in
+  O(ranges), costing ~5–15% of compile time; compile geomean 0.80× Go.
+
+### Testing
+
+- `zig build difftest` always builds in ReleaseSafe: the ~48k cases run in
+  about half the Debug time with safety checks still on.
+- New unit test: the bitmap agrees with `matchRunePos` on all 128 ASCII
+  runes for classes, fold literals, `\pL`, negated and POSIX classes.
+
 ## [0.5.2] — 2026-09-15
 
 Merges the `fix/regex-allocation-and-literal` audit branch. No change to

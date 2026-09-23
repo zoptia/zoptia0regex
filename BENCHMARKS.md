@@ -6,12 +6,12 @@ standard-library `regexp` it is modelled on. The two engines produce
 how fast they get there.
 
 **Headline:** across 20 representative workloads the Zig port is, on average,
-**~53% faster** (geomean Zig/Go = **0.47×**; **0.54×** if the
-literal-hit row, now a bare substring search, is left out) and **~1.4× faster
+**~55% faster** (geomean Zig/Go = **0.45×**; **0.52×** if the
+literal-hit row, now a bare substring search, is left out) and **~1.2× faster
 at compiling**. It ships all three of Go's engines (Pike VM, bitstate
 backtracker, one-pass) plus a SIMD first-byte prefilter and a complete-literal
 fast path Go lacks; Go is ahead on just one workload — a small-input bitstate
-case at 1.13×, both sides in single-digit microseconds.
+case at 1.14×, both sides in single-digit microseconds.
 
 ## Methodology
 
@@ -64,27 +64,27 @@ and exercise the one-pass engine.
 
 | case | op | engine | Go ns/op | Zig ns/op | Zig/Go |
 |------|----|--------|---------:|----------:|-------:|
-| literal_hit | find | literal fast path | 203 | 5 | **0.02×** |
-| literal_miss | find | literal fast path | 6,094 | 5,801 | 0.95× |
-| alternation | findall | first-bytes+VM | 9,132,552 | 3,059,994 | **0.34×** |
-| charclass_word | findall | Pike VM | 6,232,430 | 4,191,366 | **0.67×** |
-| perl_word `\w+` | findall | Pike VM | 6,898,607 | 4,409,001 | **0.64×** |
-| digits `\d+` | findall | first-bytes+VM | 3,447,038 | 564,928 | **0.16×** |
-| date | findall | first-bytes+VM | 3,488,526 | 621,218 | **0.18×** |
-| email | findall | Pike VM | 5,074,188 | 4,065,250 | **0.80×** |
-| email_submatch | submatch | Pike VM | 2,058 | 1,880 | **0.91×** |
-| anchored_multiline `(?m)^\w+` | findall | Pike VM | 2,041,154 | 1,454,768 | **0.71×** |
-| unicode_letters `\p{L}+` | findall | Pike VM | 7,862,441 | 4,949,832 | **0.63×** |
-| dotstar_greedy `p.*e` | find | first-bytes+VM | 4,419 | 2,674 | **0.61×** |
-| redos_linear `(a+)+$` | match | bitstate | 7,835 | 8,890 | 1.13× |
-| nested_groups | findall | Pike VM | 8,616,458 | 6,046,292 | **0.70×** |
-| caseins_literal `(?i)…` | findall | first-bytes+VM | 3,536,499 | 802,031 | **0.23×** |
-| anchored_caseins `\A(?i)…\z` | match | one-pass | 67 | 40 | **0.59×** |
-| anchored_word `\A[a-z]+\z` | match | one-pass | 94 | 47 | **0.50×** |
-| anchored_date `\A\d{4}-…\z` | match | one-pass | 57 | 32 | **0.56×** |
-| anchored_digits `\A\d+\z` | match | one-pass | 88 | 45 | **0.51×** |
-| anchored_email `\A(…)@(…)\z` | submatch | one-pass | 222 | 171 | **0.77×** |
-| **geomean** | | | | | **0.47×** |
+| literal_hit | find | literal fast path | 209 | 5 | **0.02×** |
+| literal_miss | find | literal fast path | 6,207 | 5,819 | **0.94×** |
+| alternation | findall | first-bytes+VM | 10,715,251 | 3,091,220 | **0.29×** |
+| charclass_word | findall | Pike VM | 6,468,539 | 4,065,844 | **0.63×** |
+| perl_word `\w+` | findall | Pike VM | 7,024,104 | 4,180,844 | **0.60×** |
+| digits `\d+` | findall | first-bytes+VM | 3,533,382 | 598,987 | **0.17×** |
+| date | findall | first-bytes+VM | 3,473,170 | 605,496 | **0.17×** |
+| email | findall | Pike VM | 5,065,922 | 3,679,915 | **0.73×** |
+| email_submatch | submatch | Pike VM | 2,088 | 1,833 | **0.88×** |
+| anchored_multiline `(?m)^\w+` | findall | Pike VM | 2,100,812 | 1,651,643 | **0.79×** |
+| unicode_letters `\p{L}+` | findall | Pike VM | 8,022,673 | 4,083,480 | **0.51×** |
+| dotstar_greedy `p.*e` | find | first-bytes+VM | 3,908 | 2,815 | **0.72×** |
+| redos_linear `(a+)+$` | match | bitstate | 7,965 | 9,097 | 1.14× |
+| nested_groups | findall | Pike VM | 8,763,336 | 5,522,340 | **0.63×** |
+| caseins_literal `(?i)…` | findall | first-bytes+VM | 3,554,886 | 467,166 | **0.13×** |
+| anchored_caseins `\A(?i)…\z` | match | one-pass | 70 | 42 | **0.60×** |
+| anchored_word `\A[a-z]+\z` | match | one-pass | 96 | 54 | **0.56×** |
+| anchored_date `\A\d{4}-…\z` | match | one-pass | 58 | 34 | **0.58×** |
+| anchored_digits `\A\d+\z` | match | one-pass | 95 | 47 | **0.49×** |
+| anchored_email `\A(…)@(…)\z` | submatch | one-pass | 230 | 180 | **0.78×** |
+| **geomean** | | | | | **0.45×** |
 
 ## Analysis
 
@@ -116,10 +116,11 @@ one-pass engine: a single deterministic pass with no thread set. With the
 literal-prefix skip (`onePassPrefix`) and the ASCII decode fast path, the port
 now wins every such case at **0.47–0.78×**.
 
-**Compilation is ~1.4× faster** (geomean 0.72×) — Go does more up-front work
+**Compilation is ~1.25× faster** (geomean 0.80×) — Go does more up-front work
 and pays GC overhead; the port spends a little extra on its one-pass deep
-copy, first-byte analysis and the linear `\p{…}` name lookup over Go's full
-category/script set, and still compiles comfortably faster.
+copy, first-byte analysis, the per-instruction ASCII bitmaps (built from the
+range list in O(ranges), ~5–15% of compile time) and the linear `\p{…}` name
+lookup over Go's full category/script set, and still compiles faster.
 
 **Benchmark-driven gaps, all closed by porting the matching Go machinery (or
 adding our own):**
@@ -131,6 +132,14 @@ adding our own):**
 | anchored case-insensitive | 1.27× | **0.62×** | one-pass engine + prefix skip |
 | unanchored case-insensitive | 1.29× | **0.25×** | SIMD first-byte prefilter (no Go counterpart) |
 
+**ASCII bitmap for rune instructions.** Each general `rune` instruction
+carries a compile-time 128-bit ASCII membership bitmap (a side table in
+`Prog`, so `Inst` stays 32 bytes — putting it inline slowed the
+cache-sensitive bitstate engine by ~25%). ASCII input answers with one bit
+test instead of a range scan, binary search or case-fold orbit walk:
+`caseins_literal` drops to **0.13×**, `unicode_letters` to
+**0.51×**, `email` to **0.73×** and `nested_groups` to **0.63×**.
+
 **Complete literals skip the engines.** When the regexp is exactly a literal
 (`prefix_complete`, no captures, no assertions, no case folding), `match` /
 `findIndex` answer with the prefix search alone — no machine setup, no
@@ -138,7 +147,7 @@ allocation. `literal_hit` drops from ~200 ns (a Pike VM start-up plus one
 memchr) to **5 ns**; `literal_miss` is unchanged, since it was already one
 substring search over 256 KB.
 
-**The one remaining non-win is `redos_linear` (1.13×)** — the bitstate engine
+**The one remaining non-win is `redos_linear` (1.14×)** — the bitstate engine
 on a 2 KB input, where Go's small-input constant is slightly lower. Both
 implementations are linear-time (no exponential blowup) and finish in
 single-digit microseconds.

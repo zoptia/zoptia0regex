@@ -69,12 +69,15 @@ pub fn build(b: *std.Build) void {
     // src/bytes.jsonl) are
     // committed — regenerate them with tools/regen.sh only when the generators
     // change; running the tests needs no Go toolchain.
-    const difftest_step = b.step("difftest", "Differential test vs Go's regexp (curated + fuzz + POSIX + byte-level corpora)");
+    // Always ReleaseSafe: ~48k cases take twice as long in Debug (34 s vs
+    // 17 s on an M4) and safety checks stay on. Debug a single corpus with
+    // `zig test src/<corpus>test.zig` when you need it.
+    const difftest_step = b.step("difftest", "Differential test vs Go's regexp (curated + fuzz + POSIX + byte-level corpora; ReleaseSafe)");
     inline for (.{ "src/difftest.zig", "src/fuzztest.zig", "src/longesttest.zig", "src/bytestest.zig" }) |src| {
         const mod = b.createModule(.{
             .root_source_file = b.path(src),
             .target = target,
-            .optimize = optimize,
+            .optimize = .ReleaseSafe,
         });
         const t = b.addTest(.{ .root_module = mod });
         difftest_step.dependOn(&b.addRunArtifact(t).step);

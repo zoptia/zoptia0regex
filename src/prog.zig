@@ -92,8 +92,19 @@ pub fn matchRunePos(rs: []const u21, arg: u32, r: u21) i32 {
 /// A compiled program.
 pub const Prog = struct {
     insts: []Inst,
+    /// Per-instruction ASCII membership bitmap for `.rune` (bit b set iff
+    /// rune b < 0x80 matches); kept out of `Inst` so the instruction stays
+    /// 32 bytes. Lets the engines answer the common ASCII case without
+    /// walking the range list or the fold orbit.
+    ascii: []const u128 = &.{},
     start: u32 = 0,
     num_cap: usize = 2, // implicit whole-match capture pair
+
+    /// `Inst.matchRune` for `insts[pc]` with the ASCII fast path.
+    pub inline fn matchRuneAt(p: *const Prog, pc: u32, r: u21) bool {
+        if (r < 0x80) return (p.ascii[pc] >> @intCast(r)) & 1 != 0;
+        return p.insts[pc].matchRune(r);
+    }
 
     /// The leading zero-width conditions that must hold at the start of any
     /// match. Returns `impossible` if no match is possible. Mirrors

@@ -31,7 +31,7 @@ changing any matching/parsing behaviour.** The port-to-Go file map:
 
 ```sh
 zig build test                          # unit + behaviour tests (fast)
-zig build difftest                      # ~48k differential cases vs Go (slow-ish)
+zig build difftest                      # ~48k differential cases vs Go (ReleaseSafe, ~20 s)
 zig build bench                         # benchmark, ReleaseFast (stderr TSV)
 zig build demo -- '<pattern>' '<input>' # CLI demo
 zig fmt --check src/*.zig build.zig     # must be clean; CI enforces it
@@ -108,6 +108,13 @@ semantics: leftmost-first (`compile`) vs POSIX leftmost-longest
 into the engine/tests. To change them, edit the generator in `tools/` and run
 `tools/regen.sh`. The corpora are committed, so `zig build difftest` needs no Go
 toolchain (only `regen.sh` does).
+
+**ASCII rune bitmap:** `Prog.ascii` is a side table (one `u128` per pc,
+built by `compile.zig:asciiBitmap`) giving each `.rune` instruction's ASCII
+membership; the Pike VM and bitstate engines call `Prog.matchRuneAt`, which
+answers `r < 0x80` with one bit test. Keep it out of `Inst`: growing `Inst`
+past 32 bytes measurably slows the bitstate engine. The bitmap must agree
+with `prog.matchRunePos` for every ASCII rune (unit test in `compile.zig`).
 
 **Literal fast path:** `match` / `findIndex` (and their Scratch variants) skip
 the engines entirely when `Regexp.isLiteral()` holds (`prefix_complete`, no
