@@ -5,7 +5,7 @@
 ### Go's `regexp`, faithfully replicated in Zig — and faster.
 
 A **regular-expression (regex) library for Zig** — a high-fidelity port of the
-RE2 engine, with a linear-time guarantee and **~48,000 tests proving
+RE2 engine, with a linear-time guarantee and **~54,000 tests proving
 byte-for-byte parity with Go**.
 
 [![CI](https://github.com/zoptia/zoptia0regex/actions/workflows/ci.yml/badge.svg)](https://github.com/zoptia/zoptia0regex/actions)
@@ -20,13 +20,13 @@ byte-for-byte parity with Go**.
 
 Head-to-head against Go's standard-library `regexp` — same patterns, same
 inputs, same 256 KB corpus, same calibration, Zig built `ReleaseFast` —
-**zoptia0regex is ~48% faster on average** and compiles patterns **~1.25×
-faster**. And it doesn't trade correctness for speed: ~48,000 differential tests
+**zoptia0regex is ~48% faster on average** and compiles patterns **~1.26×
+faster**. And it doesn't trade correctness for speed: ~54,000 differential tests
 prove its output is **byte-for-byte identical to Go's** (go1.27.1, Unicode 17).
 
 Not "inspired by." **Proven identical.**
 
-- 🚀 **Faster than Go at matching.** Geometric mean across 20 workloads:
+- 🚀 **Faster than Go at matching.** Geometric mean across 22 workloads:
   **0.45×** Go's time (0.52× leaving out the literal-hit row, which is
   now a bare substring search). Anchored "validation" patterns hit the one-pass engine
   and fly — up to **~2× faster** — and a SIMD first-byte prefilter Go doesn't
@@ -34,7 +34,7 @@ Not "inspired by." **Proven identical.**
 - 🛡️ **Linear-time. ReDoS-proof.** Thompson NFA simulation means no catastrophic
   backtracking, ever. A pattern like `(a+)+` that hangs PCRE, JS, and Python
   runs in linear time here.
-- ✅ **Proven identical to Go.** ~48,000 differential cases run the *real* Go
+- ✅ **Proven identical to Go.** ~54,000 differential cases run the *real* Go
   `regexp` and this engine on the same inputs and require identical results.
   **Zero mismatches. Zero leaks.** The fidelity isn't a claim — it's enforced by
   the suite on every push.
@@ -71,8 +71,9 @@ wins.
 | `\w+` / `\p{L}+` (find all) | Pike VM | **0.60×** |
 | `\A(...)@(...)\z` with captures | one-pass | **0.78×** |
 | literal hit (`performance`) | literal fast path | **0.02×** |
-| **Geometric mean (20 workloads)** | — | **0.45×** |
-| Pattern compilation | — | **0.80×** (~1.25× faster) |
+| 40-word keyword list (find all) | first-bytes + Pike VM | **0.38×** |
+| **Geometric mean (22 workloads)** | — | **0.45×** |
+| Pattern compilation | — | **0.79×** (~1.26× faster) |
 
 **The honest caveat:** there is **one** workload where Go is ahead — a
 nested-quantifier match on a small input (`(a+)+$`, bitstate engine) at
@@ -141,13 +142,13 @@ wiring the dependency into `build.zig`, every `Find` / `FindAll` / `Replace` /
 
 ## Trust & validation
 
-Every push runs the **full ~48,000-case differential suite** in CI, across four
+Every push runs the **full ~54,000-case differential suite** in CI, across four
 corpora:
 
 | Corpus | Cases | What it checks |
 |---|---|---|
-| Curated | ~11.7k | Hand-picked edge cases across every feature |
-| Random / fuzz | ~9k | Grammar-generated patterns & inputs |
+| Curated | ~16k | Hand-picked edge cases across every feature |
+| Random / fuzz | ~10.8k | Grammar-generated patterns & inputs |
 | POSIX leftmost-longest | ~15k | POSIX match semantics |
 | Byte-level | ~12.1k | Raw bytes (malformed UTF-8, NULs), bounded results, templates, POSIX syntax, depth limits |
 
@@ -158,7 +159,7 @@ under `std.testing.allocator`). CI stays green.
 
 ```sh
 zig build test        # unit + behaviour tests
-zig build difftest    # the full ~48k differential suite (no Go toolchain needed)
+zig build difftest    # the full ~54k differential suite (no Go toolchain needed)
 zig build bench       # benchmark vs Go (ReleaseFast)
 ```
 

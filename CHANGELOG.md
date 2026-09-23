@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-09-22
+
+### Performance
+
+- **Alternation factoring, ported from Go.** The parser now runs Go's
+  AST-shaping passes that the port had skipped as "result-neutral":
+  `maybeConcat` literal coalescing, `push`'s single-rune class rewrite
+  (`[a]` → `a`, `[Aa]` → `(?i)a`), the `swapVerticalBar` class merge,
+  `cleanAlt`, and `factor` (common literal prefixes, common leading classes
+  or fixed repeats, runs of single runes merged into a class, collapsed
+  empty alternatives). They are result-neutral but not speed-neutral: a
+  40-word keyword list compiled to 342 instructions instead of Go's 194 and
+  ran at 3.05× Go; it now runs at **0.38×**. Benchmark geomean over
+  22 workloads: **0.45×** Go (0.52× without literal_hit).
+
+### Added
+
+- `Regexp.matchesScratch`: the `matches` iterator borrowing engine buffers
+  and the yielded offsets from a caller-owned `Scratch`, so repeated
+  find-all scans allocate nothing once warm.
+
+### Testing
+
+- `cases.jsonl` and `fuzz.jsonl` now record `ni`, Go's compiled program
+  length per pattern, and the tests require the port to match it exactly —
+  AST-shape fidelity, not just result fidelity. Verified to fail on the
+  0.5.3 parser.
+- Curated corpus gains ~70 factoring patterns (prefix runs, class merges,
+  empty alternatives, flag and quantifier boundaries factor must respect);
+  the fuzz corpus gains an independent 300-pattern alternation stream.
+  Differential suite: ~53.9k cases.
+- Benchmarks gain `keyword_list` and `domain_allowlist`.
+
 ## [0.5.3] — 2026-09-22
 
 ### Performance

@@ -24,6 +24,7 @@ const Case = struct {
     all: ?[][]i64,
     repl: []const u8,
     split: ?[][]const u8,
+    ni: usize = 0, // Go's program length; 0 = not recorded
 };
 
 const data = @embedFile("fuzz.jsonl");
@@ -32,7 +33,7 @@ test "fuzz differential vs Go regexp" {
     const gpa = std.testing.allocator;
     var total: usize = 0;
     var passed: usize = 0;
-    var fails: [5]usize = @splat(0); // m, all, repl, split, compile
+    var fails: [6]usize = @splat(0); // m, all, repl, split, compile, prog
     var shown: usize = 0;
 
     var it = std.mem.tokenizeScalar(u8, data, '\n');
@@ -59,7 +60,7 @@ test "fuzz differential vs Go regexp" {
             continue;
         }
 
-        const which = try checkAll(gpa, &re, c);
+        const which: usize = if (c.ni != 0 and re.prog.insts.len != c.ni) 6 else try checkAll(gpa, &re, c);
         if (which == 0) {
             passed += 1;
         } else {
@@ -71,7 +72,7 @@ test "fuzz differential vs Go regexp" {
         }
     }
 
-    std.debug.print("\n[fuzz] total={d} passed={d} m_fail={d} all_fail={d} repl_fail={d} split_fail={d} compile_fail={d}\n", .{ total, passed, fails[0], fails[1], fails[2], fails[3], fails[4] });
+    std.debug.print("\n[fuzz] total={d} passed={d} m_fail={d} all_fail={d} repl_fail={d} split_fail={d} compile_fail={d} prog_fail={d}\n", .{ total, passed, fails[0], fails[1], fails[2], fails[3], fails[4], fails[5] });
     for (fails) |f| try std.testing.expectEqual(@as(usize, 0), f);
 }
 
@@ -81,7 +82,8 @@ fn kindName(w: usize) []const u8 {
         2 => "all",
         3 => "repl",
         4 => "split",
-        else => "compile",
+        5 => "compile",
+        else => "prog-length",
     };
 }
 

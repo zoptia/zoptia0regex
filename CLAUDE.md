@@ -31,7 +31,7 @@ changing any matching/parsing behaviour.** The port-to-Go file map:
 
 ```sh
 zig build test                          # unit + behaviour tests (fast)
-zig build difftest                      # ~48k differential cases vs Go (ReleaseSafe, ~20 s)
+zig build difftest                      # ~54k differential cases vs Go (ReleaseSafe, ~20 s)
 zig build bench                         # benchmark, ReleaseFast (stderr TSV)
 zig build demo -- '<pattern>' '<input>' # CLI demo
 zig fmt --check src/*.zig build.zig     # must be clean; CI enforces it
@@ -122,6 +122,11 @@ one-pass program, no capture groups, no start condition): the answer is
 `prefixIndexAnchored` alone. Any new shortcut must be covered by the
 `difftest.zig` per-case checks of `match`/`findIndex`/Scratch variants.
 
+**AST shape must equal Go's.** `cases.jsonl` and `fuzz.jsonl` carry `ni`,
+the instruction count of Go's `syntax.Compile(Parse(p).Simplify())`, and the
+tests require `re.prog.insts.len == ni`. A parser/simplifier/compiler change
+that alters program shape fails there even when match results still agree.
+
 **Parser limits:** AST height is tracked per node (`ast.Regexp.parse_height`,
 parser-only) and checked in `push` and `repeat` like Go's `checkHeight`;
 redundant `(?:…)` groups do not add height, POSIX stacked quantifiers do.
@@ -150,14 +155,15 @@ runs under `std.testing.allocator`, so any leak fails the build.
 
 ## Intentional omissions — do not "fix" these
 
-These diverge from Go's *source* but never from its *results*: the alternation
-`factor()` pass is omitted (it only changes the compiled program's shape / raw
-speed). Backreferences and `\C` are unsupported — **same as Go** (RE2). Inputs
+Backreferences and `\C` are unsupported — **same as Go** (RE2). Inputs
 are `[]const u8` only (no `io.RuneReader`), and Go 1.27's `All*` iterator
 methods collapse into the single `Regexp.matches` iterator. See the README
 "Scope" table.
 
-(Once also omitted, now ported: `onePassCopy`'s Prog-idiom rewrites and
-`doOnePass`'s literal-prefix skip. The port also *adds* one accelerator Go
+(Once omitted, now ported: `onePassCopy`'s Prog-idiom rewrites,
+`doOnePass`'s literal-prefix skip, and the parser's AST-shaping passes —
+`maybeConcat`, `push`'s single-rune class rewrite, the `swapVerticalBar`
+class merge and alternation `factor`. Skipping `factor` left keyword-list
+alternations 3× slower than Go. The port also *adds* one accelerator Go
 lacks: the `first_bytes` prefilter described above — behaviour-neutral by
 construction and covered by the differential suite.)

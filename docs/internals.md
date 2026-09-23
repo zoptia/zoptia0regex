@@ -85,7 +85,14 @@ This mirrors Go's structure one-to-one.
 1. **parse** — turn source text into an AST of `ast.Regexp` nodes (literals,
    alternations, concatenations, char classes, quantifiers, captures,
    assertions), honouring inline flags `(?imsU)`, escapes, `\Q…\E`, Perl and
-   POSIX classes, and Go's full `\p{…}` category/script set.
+   POSIX classes, and Go's full `\p{…}` category/script set. The AST shape
+   matches Go's node for node: adjacent literals are coalesced into strings
+   (`maybeConcat`), single-rune classes become literals, and alternations
+   are factored (`factor`: common literal prefixes and leading classes are
+   pulled out, runs of single runes become one class), so
+   `perform|performer|period` compiles like `per(form(|er)|iod)`. The
+   differential corpora record Go's instruction count per pattern and check
+   the port compiles to exactly as many.
 2. **simplify** — rewrite the AST into a smaller canonical form: counted
    repetitions are expanded (`x{2,4}` → `xx(x(x)?)?`), and idempotent nested
    quantifiers are collapsed (`(?:a+)+` → `a+`). This keeps the compiler simple
@@ -300,12 +307,12 @@ Four corpora cover four regimes:
 
 | Corpus           | Test harness        | Generator        | What it exercises |
 |------------------|---------------------|------------------|-------------------|
-| `cases.jsonl`    | `difftest.zig`      | `gencases.go`    | ~11.7k curated `(pattern, input)` pairs — the tricky, hand-chosen edge cases |
-| `fuzz.jsonl`     | `fuzztest.zig`      | `genfuzz.go`     | ~9k grammar-driven random patterns/inputs, checking `m` + `all` + `repl` + `split` |
+| `cases.jsonl`    | `difftest.zig`      | `gencases.go`    | ~16k curated `(pattern, input)` pairs — the tricky, hand-chosen edge cases |
+| `fuzz.jsonl`     | `fuzztest.zig`      | `genfuzz.go`     | ~10.8k grammar-driven random patterns/inputs (including an alternation-heavy stream), checking `m` + `all` + `repl` + `split` + program length |
 | `longest.jsonl`  | `longesttest.zig`   | `genlongest.go`  | ~15k POSIX leftmost-longest cases (`Regexp.Longest()`), isolating the `longest` branches of the Pike VM |
 | `bytes.jsonl`    | `bytestest.zig`     | `genbytes.go`    | ~12.1k byte-level cases: inputs/outputs stored as byte arrays so malformed UTF-8 and NULs survive JSON; Perl / `Longest()` / `CompilePOSIX` modes, bounded `FindAll`/`Split`, `$` templates, parser depth limits |
 
-Together that is roughly **48,000 cases with zero mismatches and zero leaks**,
+Together that is roughly **54,000 cases with zero mismatches and zero leaks**,
 re-run in full by CI on every push. When a divergence is ever introduced, the
 harness prints the offending pattern, input, Go's result, and our result
 side-by-side (`reportMismatch`), so the regression is immediately diagnosable.

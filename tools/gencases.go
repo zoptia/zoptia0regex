@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"regexp"
+	"regexp/syntax"
 )
 
 type Case struct {
@@ -12,6 +13,23 @@ type Case struct {
 	I   string `json:"i"`
 	Err bool   `json:"err"`
 	M   []int  `json:"m"`
+	NI  int    `json:"ni,omitempty"` // Go's program length (see progLen)
+}
+
+// progLen is the instruction count of the program Go's regexp.Compile builds
+// for p (syntax.Parse with Perl flags, Simplify, Compile). The port must
+// produce the same AST shape, so its program has exactly this many
+// instructions; the differential tests check it.
+func progLen(p string) int {
+	re, err := syntax.Parse(p, syntax.Perl)
+	if err != nil {
+		return 0
+	}
+	prog, err := syntax.Compile(re.Simplify())
+	if err != nil {
+		return 0
+	}
+	return len(prog.Inst)
 }
 
 func main() {
@@ -68,6 +86,21 @@ func main() {
 		"((a|b)c)+d", "(a(b(c)))", "(?:(?:ab)+)+",
 		// compiled-away capture groups (padding edge cases)
 		"(a){0}", "(a){0}b", "(x){0}|y", "(a)(b){0}(c)", "(\\w){0}x", "(ab){0,0}c",
+		// alternation factoring (Go's factor): common literal prefixes,
+		// common leading classes / fixed repeats, runs of single runes
+		// merged into classes, empty alternatives, and the shapes factor
+		// must NOT merge (quantified prefixes, differing flags)
+		"abc|abd", "ABC|ABD|AEF|BCX|BCY", "foo|foobar|fo", "fo|foo|foobar",
+		"a|b|c|d", "[ab]|c|[d-f]", ".|\\n", "a||b", "|a", "a|", "a|b|", "(?:)|a|(?:)",
+		"(a)|(ab)", "(ab)|(ac)", "(?i)ab|AC", "(?i:ab)|ac", "ab|(?i:ac)", "x*|x*y",
+		"[ab]{2}c|[ab]{2}d", "[ab]{1,2}c|[ab]{1,2}d", "\\d\\d|\\d\\w", "a*?b|a*?c",
+		"(?U)a+b|a+c", "[a]b|[a]c", "[Aa]x|[Aa]y", "colou?r|colour", "(?s).a|.b",
+		"the|then|there|these|they|this|that|than|thaw",
+		"quick|quiet|quit|quite|quiz|brown|brow|bro|fox|foxy|fo",
+		"(?i)hello|help|helm|HELIX|world|word|work", "ab(c|d)|ab(c|e)",
+		"a(b|c)d|a(b|c)e", "(?:ab|ac)+", "(?:ab|ac)*d", "(ab|ac){2}", "\\bthe|\\bthen",
+		"^ab|^ac", "ab$|ac$", "a\\b|a\\B", "日本|日本語|日", "αβ|αγ|Αδ", "(?i)σ|ς|Σx",
+		"\\pL|\\pN|x", "[^a]|b|c", "[a-c]|[b-d]", "a|[^a]", "\\x{10FFFF}|\\x{10FFFE}",
 		// dot variants
 		".", "..", "...",
 		// repetition of classes
@@ -84,6 +117,8 @@ func main() {
 		"123abc456def", "AaBbCc", "ABCDEF", "abcdef", "x", "xx", "xxx",
 		"a-b-c", "[a]", "]", "-", "\U0001F600 emoji", "abcXYZ123",
 		"aaAAaa", "STRASSE", "ﬀ ﬁ",
+		"then there these they thaw", "quiet quiz foxy bro", "HELLO helm Helix work",
+		"abcabdabe", "ac ab ad abab", "日本語 日 αγ Αδ ς",
 		// Unicode 16/17 additions and fold-table edge cases
 		"\U00010D50\U00010D70 garay", "\U0001CC00 legacy symbol", "\U00010300 old italic",
 		"\u1401\u1403 canadian", "\u01C5\u01C8 titlecase", "\u0345 ypogegrammeni \u03B9",
@@ -101,9 +136,10 @@ func main() {
 			enc.Encode(Case{P: p, I: "", Err: true, M: nil})
 			continue
 		}
+		ni := progLen(p)
 		for _, in := range inputs {
 			m := re.FindStringSubmatchIndex(in)
-			enc.Encode(Case{P: p, I: in, Err: false, M: m})
+			enc.Encode(Case{P: p, I: in, Err: false, M: m, NI: ni})
 		}
 	}
 }

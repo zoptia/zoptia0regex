@@ -18,6 +18,7 @@ const Case = struct {
     i: []const u8,
     err: bool,
     m: ?[]i64,
+    ni: usize = 0, // Go's program length; 0 = not recorded
 };
 
 const data = @embedFile("cases.jsonl");
@@ -68,6 +69,9 @@ fn checkCase(gpa: std.mem.Allocator, c: Case) !bool {
     defer re.deinit();
     if (c.err) return false; // Go errored, we did not
 
+    // Same AST shape as Go => same number of compiled instructions.
+    if (c.ni != 0 and re.prog.insts.len != c.ni) return false;
+
     const got = try re.findSubmatchIndex(gpa, c.i);
     defer if (got) |g| gpa.free(g);
 
@@ -90,7 +94,7 @@ fn checkCase(gpa: std.mem.Allocator, c: Case) !bool {
 }
 
 fn reportMismatch(gpa: std.mem.Allocator, c: Case) void {
-    std.debug.print("MISMATCH /{s}/ \"{s}\"\n   go : err={} m={?any}\n", .{ c.p, c.i, c.err, c.m });
+    std.debug.print("MISMATCH /{s}/ \"{s}\"\n   go : err={} m={?any} ni={d}\n", .{ c.p, c.i, c.err, c.m, c.ni });
     var re = regex.compile(gpa, c.p) catch {
         std.debug.print("   zig: <compile error>\n", .{});
         return;
@@ -101,5 +105,5 @@ fn reportMismatch(gpa: std.mem.Allocator, c: Case) void {
         return;
     };
     defer if (got) |g| gpa.free(g);
-    std.debug.print("   zig: m={?any}\n", .{got});
+    std.debug.print("   zig: m={?any} ni={d}\n", .{ got, re.prog.insts.len });
 }

@@ -2,12 +2,9 @@
 //! `regexp/syntax.Regexp` node, its `Op` enum, and the `Flags` bitset.
 //!
 //! Port note: Go uses an inline-storage + free-list micro-optimization
-//! (`Sub0`, `Rune0`, `p.free`/`reuse`) and incrementally coalesces adjacent
-//! literal runes in `maybeConcat`. We drop all of those: nodes are allocated
-//! from an arena, and each parsed character becomes its own single-rune
-//! `literal` node. This is semantically identical because the compiler emits
-//! one instruction per rune of a literal regardless of coalescing, so the
-//! compiled program is the same.
+//! (`Sub0`, `Rune0`, `p.free`/`reuse`); we drop it and allocate nodes from an
+//! arena. The AST shape otherwise matches Go's, including `maybeConcat`'s
+//! multi-rune literals and `factor`'s rewritten alternations.
 
 const std = @import("std");
 
@@ -85,6 +82,26 @@ pub const Regexp = struct {
     parse_height: u32 = 1,
     cap: i32 = 0, // capturing index, for `capture`
     name: []const u8 = "", // capturing name, for `capture`
+
+    /// Structural equality. Mirrors Go's `Regexp.Equal` (used by `factor`).
+    pub fn equal(x: *const Regexp, y: *const Regexp) bool {
+        if (x.op != y.op) return false;
+        switch (x.op) {
+            .end_text => return x.flags & WasDollar == y.flags & WasDollar,
+            .literal, .char_class => return x.flags & FoldCase == y.flags & FoldCase and
+                std.mem.eql(u21, x.runes, y.runes),
+            .alternate, .concat => {
+                if (x.sub.len != y.sub.len) return false;
+                for (x.sub, y.sub) |a, b| if (!a.equal(b)) return false;
+                return true;
+            },
+            .star, .plus, .quest => return x.flags & NonGreedy == y.flags & NonGreedy and x.sub[0].equal(y.sub[0]),
+            .repeat => return x.flags & NonGreedy == y.flags & NonGreedy and x.min == y.min and x.max == y.max and
+                x.sub[0].equal(y.sub[0]),
+            .capture => return x.cap == y.cap and std.mem.eql(u8, x.name, y.name) and x.sub[0].equal(y.sub[0]),
+            else => return true,
+        }
+    }
 
     /// Walk the tree to find the maximum capture index.
     pub fn maxCap(re: *const Regexp) i32 {

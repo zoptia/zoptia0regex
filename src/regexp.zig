@@ -239,17 +239,28 @@ pub const Regexp = struct {
     pub const Matches = struct {
         re: *const Regexp,
         input: []const u8,
-        scratch: Scratch,
+        /// Engine storage owned by the iterator (`matches`); unused when
+        /// `borrowed` is set (`matchesScratch`).
+        own: Scratch,
+        borrowed: ?*Scratch = null,
         caps: []i64,
         pos: usize = 0,
         prev_match_end: i64 = -1,
         remaining: i64, // matches still to yield; < 0 means unlimited
         done: bool = false,
 
+        /// Frees what the iterator owns. For `matchesScratch` iterators this
+        /// is a no-op: every buffer belongs to the caller's `Scratch`.
         pub fn deinit(it: *Matches) void {
-            it.scratch.allocator.free(it.caps);
-            it.scratch.deinit();
+            if (it.borrowed == null) {
+                it.own.allocator.free(it.caps);
+                it.own.deinit();
+            }
             it.* = undefined;
+        }
+
+        fn scratch(it: *Matches) *Scratch {
+            return it.borrowed orelse &it.own;
         }
 
         /// The next match's submatch byte offsets, or null when exhausted.
@@ -258,7 +269,7 @@ pub const Regexp = struct {
         pub fn next(it: *Matches) ExecError!?[]const i64 {
             const in = exec.Input{ .s = it.input };
             while (!it.done and it.pos <= it.input.len) {
-                const matched = try it.re.execAtScratch(&it.scratch, in, it.pos, it.caps);
+                const matched = try it.re.execAtScratch(it.scratch(), in, it.pos, it.caps);
                 if (!matched) break;
                 var accept = true;
                 if (it.caps[1] == @as(i64, @intCast(it.pos))) {
@@ -297,7 +308,25 @@ pub const Regexp = struct {
         return .{
             .re = re,
             .input = input,
-            .scratch = Scratch.init(allocator),
+            .own = Scratch.init(allocator),
+            .caps = caps,
+            .remaining = n,
+            .done = n == 0 or input.len < re.min_input_len,
+        };
+    }
+
+    /// Like `matches`, but borrows all storage — engine buffers and the
+    /// yielded offsets — from a caller-owned `Scratch`, so a warmed-up loop
+    /// of scans allocates nothing. The iterator and the slices it yields are
+    /// valid until the next call that reuses `scratch` (including another
+    /// `findSubmatchIndexScratch`); `deinit` is optional and frees nothing.
+    pub fn matchesScratch(re: *const Regexp, scratch: *Scratch, input: []const u8, n: i64) ExecError!Matches {
+        const caps = try scratch.resultBuf(re.padLen());
+        return .{
+            .re = re,
+            .input = input,
+            .own = undefined,
+            .borrowed = scratch,
             .caps = caps,
             .remaining = n,
             .done = n == 0 or input.len < re.min_input_len,

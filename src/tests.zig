@@ -498,3 +498,45 @@ test "literal fast paths agree with engine results without allocations" {
     try std.testing.expect(try re.match(failing.allocator(), "find needle"));
     try std.testing.expectEqual(regex.Match{ .start = 5, .end = 11 }, (try re.findIndex(failing.allocator(), "find needle")).?);
 }
+
+fn scratchScans(allocator: std.mem.Allocator, re: *const regex.Regexp, scratch: *regex.Scratch) !usize {
+    _ = allocator;
+    var total: usize = 0;
+    for ([_][]const u8{ "ab ac ab", "xx", "abab ac" }) |input| {
+        var it = try re.matchesScratch(scratch, input, -1);
+        defer it.deinit();
+        while (try it.next()) |m| total += @intCast(m[1] - m[0]);
+    }
+    return total;
+}
+
+test "matchesScratch agrees with matches and allocates nothing once warm" {
+    var re = try regex.compile(ta, "a(b|c)");
+    defer re.deinit();
+    const inputs = [_][]const u8{ "ab ac ab", "", "zzz", "acab" };
+    var scratch = regex.Scratch.init(ta);
+    defer scratch.deinit();
+    for (inputs) |input| {
+        var a = try re.matches(ta, input, -1);
+        defer a.deinit();
+        var b = try re.matchesScratch(&scratch, input, -1);
+        defer b.deinit();
+        while (true) {
+            const x = try a.next();
+            const y = try b.next();
+            try std.testing.expectEqual(x == null, y == null);
+            if (x == null) break;
+            try std.testing.expectEqualSlices(i64, x.?, y.?);
+        }
+    }
+    // Warm the scratch, then every further scan must succeed with an
+    // allocator that fails on first use.
+    var warm = regex.Scratch.init(ta);
+    defer warm.deinit();
+    _ = try scratchScans(ta, &re, &warm);
+    var failing = std.testing.FailingAllocator.init(ta, .{ .fail_index = 0 });
+    warm.allocator = failing.allocator();
+    const n = try scratchScans(failing.allocator(), &re, &warm);
+    warm.allocator = ta;
+    try std.testing.expectEqual(@as(usize, 12), n);
+}

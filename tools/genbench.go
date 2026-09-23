@@ -76,6 +76,9 @@ func main() {
 		{"anchored_date", "\\A\\d{4}-\\d{2}-\\d{2}\\z", "match", "", "2024-01-15"},
 		{"anchored_digits", "\\A\\d+\\z", "match", "", "1234567890"},
 		{"anchored_email", "\\A([\\w.]+)@(\\w+)\\.(\\w+)\\z", "submatch", "", "john.doe@example.com"},
+		// Alternations with shared prefixes: what Go's factor pass targets.
+		{"keyword_list", "performance|performer|perform|period|periodic|permit|permission|persist|person|personal|benchmark|bench|benefit|between|beyond|expression|express|expressive|extend|extension|external|extra|throughput|through|throw|thread|threshold|threat|compile|compiler|complete|complex|component|compose|computer|compute|concept|concern|condition|connect", "findall", "corpus", ""},
+		{"domain_allowlist", "(?i)\\A(?:mail\\.example\\.com|www\\.example\\.com|api\\.example\\.com|cdn\\.example\\.com|static\\.example\\.com|login\\.example\\.com|auth\\.example\\.com|vpn\\.example\\.com|git\\.example\\.com|ci\\.example\\.com|mail\\.corp\\.net|www\\.corp\\.net|api\\.corp\\.net|wiki\\.corp\\.net|jira\\.corp\\.net|git\\.corp\\.net|vpn\\.corp\\.net|sso\\.corp\\.net|docs\\.corp\\.net|chat\\.corp\\.net)\\z", "match", "", "SSO.corp.net"},
 	}
 	w := bufio.NewWriter(os.Stdout)
 	defer w.Flush()

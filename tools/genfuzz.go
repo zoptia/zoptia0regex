@@ -6,6 +6,8 @@ import (
 	"math/rand"
 	"os"
 	"regexp"
+	"regexp/syntax"
+	"strings"
 )
 
 type Case struct {
@@ -16,6 +18,50 @@ type Case struct {
 	All   [][]int  `json:"all"`
 	Repl  string   `json:"repl"`
 	Split []string `json:"split"`
+	NI    int      `json:"ni,omitempty"` // Go's program length (see progLen)
+}
+
+// progLen is the instruction count of the program Go's regexp.Compile builds
+// for p (syntax.Parse with Perl flags, Simplify, Compile). The port must
+// produce the same AST shape, so its program has exactly this many
+// instructions; the differential tests check it.
+func progLen(p string) int {
+	re, err := syntax.Parse(p, syntax.Perl)
+	if err != nil {
+		return 0
+	}
+	prog, err := syntax.Compile(re.Simplify())
+	if err != nil {
+		return 0
+	}
+	return len(prog.Inst)
+}
+
+// genAlternation builds an alternation whose branches share prefixes, the
+// input shape Go's parser factors (literal prefixes, leading classes, fixed
+// repeats, single runes merged into classes).
+var altStems = []string{"ab", "abc", "a", "b", "ba", "x", "xa", "[ab]", "[ab]{2}", "\\d", "\\d\\d", ".", "(a)", "(?:ab)", "(?i:ab)", "a*", "a+?", ""}
+var altTails = []string{"", "a", "b", "c", "x", "ab", "bc", "\\d", "[xy]", "a?", "(b)", "$", "\\b"}
+
+func genAlternation(r *rand.Rand) string {
+	n := 2 + r.Intn(7)
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = altStems[r.Intn(len(altStems))] + altTails[r.Intn(len(altTails))]
+		if r.Intn(4) == 0 {
+			parts[i] += altTails[r.Intn(len(altTails))]
+		}
+	}
+	s := strings.Join(parts, "|")
+	switch r.Intn(5) {
+	case 0:
+		s = "(" + s + ")"
+	case 1:
+		s = "(?:" + s + ")+"
+	case 2:
+		s = `\A(?:` + s + `)\z`
+	}
+	return flags[r.Intn(len(flags))] + s
 }
 
 const replT = "[$0/$1]"
@@ -80,6 +126,17 @@ func genInput(r *rand.Rand) string {
 	return string(rs)
 }
 
+var altInputAlpha = []rune("abcxy12 AB\nΑ")
+
+func genAltInput(r *rand.Rand) string {
+	n := r.Intn(10)
+	rs := make([]rune, n)
+	for i := range rs {
+		rs[i] = altInputAlpha[r.Intn(len(altInputAlpha))]
+	}
+	return string(rs)
+}
+
 func main() {
 	r := rand.New(rand.NewSource(20260625))
 	w := bufio.NewWriter(os.Stdout)
@@ -87,15 +144,30 @@ func main() {
 	enc := json.NewEncoder(w)
 
 	npat := 1500
-	for k := 0; k < npat; k++ {
-		p := genRegex(r)
+	// A second, independent stream of alternation-heavy patterns keeps the
+	// original 1500 patterns (and their seed) unchanged.
+	ra := rand.New(rand.NewSource(20260922))
+	nalt := 300
+	for k := 0; k < npat+nalt; k++ {
+		var p string
+		if k < npat {
+			p = genRegex(r)
+		} else {
+			p = genAlternation(ra)
+		}
 		re, err := regexp.Compile(p)
 		if err != nil {
 			enc.Encode(Case{P: p, Err: true})
 			continue
 		}
+		ni := progLen(p)
 		for j := 0; j < 6; j++ {
-			in := genInput(r)
+			var in string
+			if k < npat {
+				in = genInput(r)
+			} else {
+				in = genAltInput(ra)
+			}
 			c := Case{
 				P:     p,
 				I:     in,
@@ -104,6 +176,7 @@ func main() {
 				All:   re.FindAllStringSubmatchIndex(in, -1),
 				Repl:  re.ReplaceAllString(in, replT),
 				Split: re.Split(in, -1),
+				NI:    ni,
 			}
 			enc.Encode(c)
 		}

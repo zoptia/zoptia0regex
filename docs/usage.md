@@ -357,6 +357,7 @@ pooled `*machine`:
 | `matchScratch` | `match` reusing a caller-owned `Scratch`. | `false` |
 | `findIndexScratch` | `findIndex` reusing a caller-owned `Scratch`. | `null` |
 | `findSubmatchIndexScratch` | `findSubmatchIndex` reusing a caller-owned `Scratch`. **The returned slice is borrowed from the scratch** — valid only until the next call that reuses it; copy it to keep it, and do *not* free it. | `null` |
+| `matchesScratch` | `matches` iterator borrowing engine buffers *and* the yielded offsets from the `Scratch`: repeated scans allocate nothing once warm. Valid until the next call that reuses the scratch; `deinit` frees nothing. | `next()` → `null` |
 
 ```zig
 var scratch = regex.Scratch.init(gpa);
@@ -451,7 +452,7 @@ generated from Go's `unicode.SimpleFold` — not just ASCII.
 
 ## 6. Scope & differences from Go
 
-This is a high-fidelity replica, and the differential test suite (~48,000 cases
+This is a high-fidelity replica, and the differential test suite (~54,000 cases
 across curated, fuzz, and POSIX-leftmost-longest corpora) requires byte-for-byte
 identical results against the real Go `regexp` for `FindSubmatchIndex`,
 `FindAll`, `ReplaceAll`, and `Split`. The intentional differences are:

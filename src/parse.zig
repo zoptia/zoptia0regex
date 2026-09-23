@@ -2,12 +2,12 @@
 //! faithfully porting Go's `regexp/syntax.parse`.
 //!
 //! The stack machine, operator precedence, repetition handling, group/flag
-//! parsing and character-class construction all mirror Go. We deliberately
-//! drop Go's allocation micro-optimizations (the `p.free` free-list, the
-//! incremental literal coalescing in `maybeConcat`, and the alternation
-//! `factor`/`mergeCharClass` prefix optimizations): none affect the matched
-//! language or match priority, and the compiler emits identical instructions.
-//! All nodes are allocated from a caller-provided arena.
+//! parsing and character-class construction all mirror Go, including the
+//! AST-shaping passes: `maybeConcat` literal coalescing, single-rune class
+//! rewriting in `push`, the `swapVerticalBar` class merge, and the
+//! alternation `factor` (common-prefix extraction and class introduction).
+//! Only Go's `p.free` node free-list is dropped: all nodes are allocated from
+//! a caller-provided arena.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -157,6 +157,11 @@ const Parser = struct {
     stack: std.ArrayList(*Regexp) = .empty,
     num_cap: i32 = 0,
     num_runes: usize = 0, // total runes across all char classes
+    // Growth buffer for the literal `maybeConcat` is extending, so a long
+    // literal is built in amortized O(n) (Go gets this from `append`).
+    lit_owner: ?*Regexp = null,
+    lit_ptr: [*]u21 = undefined,
+    lit_cap: usize = 0,
 
     fn newRegexp(p: *Parser, o: Op) !*Regexp {
         const re = try p.al.create(Regexp);
@@ -171,12 +176,80 @@ const Parser = struct {
         re.parse_height = height;
     }
 
+    /// Push `re` onto the stack, first coalescing literals (Go's `push`).
+    /// A single-rune class becomes a literal and a case-fold pair like
+    /// `[Aa]` a case-insensitive literal; either may be absorbed into the
+    /// literal on top of the stack instead of being pushed.
     fn push(p: *Parser, re: *Regexp) !void {
-        try checkHeight(re);
         p.num_runes += re.runes.len;
         if (p.num_runes > max_runes) return error.TooLarge;
+        const rs = re.runes;
+        if (re.op == .char_class and rs.len == 2 and rs[0] == rs[1]) {
+            // Single rune.
+            if (try p.maybeConcat(rs[0], p.flags & ~ast.FoldCase)) return;
+            re.op = .literal;
+            re.runes = rs[0..1];
+            re.flags = p.flags & ~ast.FoldCase;
+        } else if (re.op == .char_class and
+            ((rs.len == 4 and rs[0] == rs[1] and rs[2] == rs[3] and
+                unicode.simpleFold(rs[0]) == rs[2] and unicode.simpleFold(rs[2]) == rs[0]) or
+                (rs.len == 2 and @as(u32, rs[0]) + 1 == rs[1] and
+                    unicode.simpleFold(rs[0]) == rs[1] and unicode.simpleFold(rs[1]) == rs[0])))
+        {
+            // Case-insensitive rune like [Aa] or [Δδ].
+            if (try p.maybeConcat(rs[0], p.flags | ast.FoldCase)) return;
+            re.op = .literal;
+            re.runes = rs[0..1];
+            re.flags = p.flags | ast.FoldCase;
+        } else {
+            _ = try p.maybeConcat(null, 0);
+        }
+        try checkHeight(re);
         try p.stack.append(p.al, re);
         if (p.stack.items.len > max_stack_nodes) return error.TooLarge;
+    }
+
+    /// Incremental concatenation of literal runes into string nodes (Go's
+    /// `maybeConcat`). Called before each push, so only the top two stack
+    /// entries can need merging; the topmost literal stays separate until the
+    /// next push, so a following operator still applies to one rune (`ab*`).
+    /// When `r` is non-null and the top literal was absorbed, its node is
+    /// reused to hold `r` and true is returned (`r` was pushed).
+    fn maybeConcat(p: *Parser, r: ?u21, flags: Flags) !bool {
+        const n = p.stack.items.len;
+        if (n < 2) return false;
+        const re1 = p.stack.items[n - 1];
+        const re2 = p.stack.items[n - 2];
+        if (re1.op != .literal or re2.op != .literal or
+            re1.flags & ast.FoldCase != re2.flags & ast.FoldCase) return false;
+
+        try p.appendLiteralRunes(re2, re1.runes);
+        if (r) |rr| {
+            re1.runes = re1.runes[0..1];
+            re1.runes[0] = rr;
+            re1.flags = flags;
+            return true;
+        }
+        p.stack.shrinkRetainingCapacity(n - 1);
+        return false;
+    }
+
+    fn appendLiteralRunes(p: *Parser, re: *Regexp, extra: []const u21) !void {
+        const old = re.runes;
+        const need = old.len + extra.len;
+        if (p.lit_owner == re and old.ptr == p.lit_ptr and need <= p.lit_cap) {
+            re.runes = p.lit_ptr[0..need];
+            @memcpy(re.runes[old.len..], extra);
+            return;
+        }
+        const cap = @max(need * 2, 8);
+        const buf = try p.al.alloc(u21, cap);
+        @memcpy(buf[0..old.len], old);
+        @memcpy(buf[old.len..need], extra);
+        re.runes = buf[0..need];
+        p.lit_owner = re;
+        p.lit_ptr = buf.ptr;
+        p.lit_cap = cap;
     }
 
     fn op(p: *Parser, o: Op) !*Regexp {
@@ -304,6 +377,7 @@ const Parser = struct {
     // --- stack collapsing ---
 
     fn concat(p: *Parser) !*Regexp {
+        _ = try p.maybeConcat(null, 0);
         var i = p.stack.items.len;
         while (i > 0 and !p.stack.items[i - 1].op.isPseudo()) i -= 1;
         const subs = p.stack.items[i..];
@@ -320,6 +394,9 @@ const Parser = struct {
         var i = p.stack.items.len;
         while (i > 0 and !p.stack.items[i - 1].op.isPseudo()) i -= 1;
         const subs = p.stack.items[i..];
+        // Make sure top class is clean; the others already are (see
+        // swapVerticalBar).
+        if (subs.len > 0) try p.cleanAlt(subs[subs.len - 1]);
         const re = if (subs.len == 0)
             try p.newRegexp(.no_match)
         else
@@ -330,9 +407,9 @@ const Parser = struct {
     }
 
     /// Apply `o` to `subs`, hoisting nested same-op nodes so there is never a
-    /// concat-of-concat or alternate-of-alternate. (Go's `factor` prefix
-    /// optimization is intentionally omitted — it does not change semantics.)
-    fn collapse(p: *Parser, subs: []*Regexp, o: Op) !*Regexp {
+    /// concat-of-concat or alternate-of-alternate, and factoring alternations
+    /// (Go's `collapse`).
+    fn collapse(p: *Parser, subs: []*Regexp, o: Op) ParseError!*Regexp {
         if (subs.len == 1) return subs[0];
         var list: std.ArrayList(*Regexp) = .empty;
         for (subs) |sub| {
@@ -342,9 +419,258 @@ const Parser = struct {
                 try list.append(p.al, sub);
             }
         }
-        const re = try p.newRegexp(o);
+        var re = try p.newRegexp(o);
         re.sub = try list.toOwnedSlice(p.al);
+        if (o == .alternate) {
+            re.sub = try p.factor(re.sub);
+            if (re.sub.len == 1) re = re.sub[0];
+        }
+        try checkHeight(re);
         return re;
+    }
+
+    /// Factor common prefixes out of the alternation list `sub` (Go's
+    /// `factor`). For example `ABC|ABD|AEF|BCX|BCY` becomes, by literal
+    /// prefix extraction, `A(B(C|D)|EF)|BC(X|Y)` and then, by character
+    /// class introduction, `A(B[CD]|EF)|BC[XY]`. Leftmost-first priority is
+    /// preserved: only adjacent alternatives are merged, in order.
+    fn factor(p: *Parser, sub: []*Regexp) ParseError![]*Regexp {
+        if (sub.len < 2) return sub;
+        var cur = sub;
+
+        // Round 1: factor out common literal prefixes.
+        {
+            var out: std.ArrayList(*Regexp) = .empty;
+            var str: []const u21 = &.{};
+            var strflags: Flags = 0;
+            var start: usize = 0;
+            var i: usize = 0;
+            while (i <= cur.len) : (i += 1) {
+                var istr: []const u21 = &.{};
+                var iflags: Flags = 0;
+                if (i < cur.len) {
+                    const ls = leadingString(cur[i]);
+                    istr = ls.runes;
+                    iflags = ls.flags;
+                    if (iflags == strflags) {
+                        var same: usize = 0;
+                        while (same < str.len and same < istr.len and str[same] == istr[same]) same += 1;
+                        if (same > 0) {
+                            // Matches at least one rune in current range.
+                            str = str[0..same];
+                            continue;
+                        }
+                    }
+                }
+                // cur[start..i] all begin with str, but cur[i] does not even
+                // begin with str[0]: factor out the common string.
+                if (i == start) {
+                    // Nothing to do: run of length 0.
+                } else if (i == start + 1) {
+                    try out.append(p.al, cur[start]);
+                } else {
+                    const prefix = try p.newRegexp(.literal);
+                    prefix.flags = strflags;
+                    prefix.runes = try p.al.dupe(u21, str);
+                    for (start..i) |j| {
+                        cur[j] = try p.removeLeadingString(cur[j], str.len);
+                        try checkHeight(cur[j]);
+                    }
+                    const suffix = try p.collapse(cur[start..i], .alternate); // recurse
+                    try out.append(p.al, try p.concat2(prefix, suffix));
+                }
+                start = i;
+                str = istr;
+                strflags = iflags;
+            }
+            cur = try out.toOwnedSlice(p.al);
+        }
+
+        // Round 2: factor out common simple prefixes — just the first piece
+        // of each concatenation, and only a character class or a fixed repeat
+        // of one: factoring anything with a quantifier would merge distinct
+        // paths through the automaton and change results.
+        {
+            var out: std.ArrayList(*Regexp) = .empty;
+            var start: usize = 0;
+            var first: ?*Regexp = null;
+            var i: usize = 0;
+            while (i <= cur.len) : (i += 1) {
+                var ifirst: ?*Regexp = null;
+                if (i < cur.len) {
+                    ifirst = leadingRegexp(cur[i]);
+                    if (first) |f| {
+                        if (ifirst != null and f.equal(ifirst.?) and
+                            (isCharClass(f) or (f.op == .repeat and f.min == f.max and isCharClass(f.sub[0]))))
+                        {
+                            continue;
+                        }
+                    }
+                }
+                if (i == start) {
+                    // Nothing to do: run of length 0.
+                } else if (i == start + 1) {
+                    try out.append(p.al, cur[start]);
+                } else {
+                    const prefix = first.?;
+                    for (start..i) |j| {
+                        cur[j] = try p.removeLeadingRegexp(cur[j]);
+                        try checkHeight(cur[j]);
+                    }
+                    const suffix = try p.collapse(cur[start..i], .alternate); // recurse
+                    try out.append(p.al, try p.concat2(prefix, suffix));
+                }
+                start = i;
+                first = ifirst;
+            }
+            cur = try out.toOwnedSlice(p.al);
+        }
+
+        // Round 3: collapse runs of single literals into character classes.
+        {
+            var out: std.ArrayList(*Regexp) = .empty;
+            var start: usize = 0;
+            var i: usize = 0;
+            while (i <= cur.len) : (i += 1) {
+                if (i < cur.len and isCharClass(cur[i])) continue;
+                // cur[i] is not a char or char class; emit a class for
+                // cur[start..i] ...
+                if (i == start) {
+                    // Nothing to do: run of length 0.
+                } else if (i == start + 1) {
+                    try out.append(p.al, cur[start]);
+                } else {
+                    // Start with the most complex regexp in cur[start..i].
+                    var max = start;
+                    for (start + 1..i) |j| {
+                        const a = @intFromEnum(cur[max].op);
+                        const b = @intFromEnum(cur[j].op);
+                        if (a < b or (a == b and cur[max].runes.len < cur[j].runes.len)) max = j;
+                    }
+                    std.mem.swap(*Regexp, &cur[start], &cur[max]);
+                    for (start + 1..i) |j| try p.mergeCharClass(cur[start], cur[j]);
+                    try p.cleanAlt(cur[start]);
+                    try out.append(p.al, cur[start]);
+                }
+                // ... and then emit cur[i].
+                if (i < cur.len) try out.append(p.al, cur[i]);
+                start = i + 1;
+            }
+            cur = try out.toOwnedSlice(p.al);
+        }
+
+        // Round 4: collapse runs of empty matches into a single empty match.
+        {
+            var out: std.ArrayList(*Regexp) = .empty;
+            for (cur, 0..) |re, i| {
+                if (i + 1 < cur.len and re.op == .empty_match and cur[i + 1].op == .empty_match) continue;
+                try out.append(p.al, re);
+            }
+            cur = try out.toOwnedSlice(p.al);
+        }
+        return cur;
+    }
+
+    fn concat2(p: *Parser, a: *Regexp, b: *Regexp) !*Regexp {
+        const re = try p.newRegexp(.concat);
+        re.sub = try p.al.dupe(*Regexp, &.{ a, b });
+        try checkHeight(re);
+        return re;
+    }
+
+    /// Remove the first `n` runes from the leading literal of `re` (Go's
+    /// `removeLeadingString`); returns the replacement for `re`.
+    fn removeLeadingString(p: *Parser, re: *Regexp, n: usize) !*Regexp {
+        if (re.op == .concat and re.sub.len > 0) {
+            // Removing a leading string in a concatenation might simplify it.
+            const s0 = try p.removeLeadingString(re.sub[0], n);
+            re.sub[0] = s0;
+            if (s0.op == .empty_match) {
+                switch (re.sub.len) {
+                    0, 1 => {
+                        // Impossible but handle.
+                        re.op = .empty_match;
+                        re.sub = &.{};
+                    },
+                    2 => return re.sub[1],
+                    else => re.sub = re.sub[1..],
+                }
+            }
+            try checkHeight(re);
+            return re;
+        }
+        if (re.op == .literal) {
+            std.mem.copyForwards(u21, re.runes, re.runes[n..]);
+            re.runes = re.runes[0 .. re.runes.len - n];
+            if (re.runes.len == 0) re.op = .empty_match;
+        }
+        return re;
+    }
+
+    /// Remove the leading regexp of `re` (Go's `removeLeadingRegexp`);
+    /// returns the replacement for `re`.
+    fn removeLeadingRegexp(p: *Parser, re: *Regexp) !*Regexp {
+        if (re.op == .concat and re.sub.len > 0) {
+            re.sub = re.sub[1..];
+            switch (re.sub.len) {
+                0 => {
+                    re.op = .empty_match;
+                    re.sub = &.{};
+                },
+                1 => return re.sub[0],
+                else => {},
+            }
+            try checkHeight(re);
+            return re;
+        }
+        return p.newRegexp(.empty_match);
+    }
+
+    /// Clean `re` for eventual inclusion in an alternation (Go's `cleanAlt`).
+    fn cleanAlt(p: *Parser, re: *Regexp) !void {
+        _ = p;
+        if (re.op != .char_class) return;
+        re.runes = cleanRunes(re.runes);
+        const r = re.runes;
+        if (r.len == 2 and r[0] == 0 and r[1] == max_rune) {
+            re.runes = &.{};
+            re.op = .any_char;
+        } else if (r.len == 4 and r[0] == 0 and r[1] == '\n' - 1 and r[2] == '\n' + 1 and r[3] == max_rune) {
+            re.runes = &.{};
+            re.op = .any_char_not_nl;
+        }
+    }
+
+    /// dst = dst|src (Go's `mergeCharClass`). The caller ensures
+    /// dst.op >= src.op, so src is a literal or a simpler class.
+    fn mergeCharClass(p: *Parser, dst: *Regexp, src: *const Regexp) !void {
+        switch (dst.op) {
+            .any_char => {}, // src doesn't add anything
+            .any_char_not_nl => {
+                // src might add \n
+                if (matchRuneNode(src, '\n')) dst.op = .any_char;
+            },
+            .char_class => {
+                var list: std.ArrayList(u21) = .empty;
+                try list.appendSlice(p.al, dst.runes);
+                if (src.op == .literal) {
+                    try appendLiteral(p.al, &list, src.runes[0], src.flags);
+                } else {
+                    try appendClass(p.al, &list, src.runes);
+                }
+                dst.runes = try list.toOwnedSlice(p.al);
+            },
+            .literal => {
+                // Both literal.
+                if (src.runes[0] == dst.runes[0] and src.flags == dst.flags) return;
+                var list: std.ArrayList(u21) = .empty;
+                try appendLiteral(p.al, &list, dst.runes[0], dst.flags);
+                try appendLiteral(p.al, &list, src.runes[0], src.flags);
+                dst.op = .char_class;
+                dst.runes = try list.toOwnedSlice(p.al);
+            },
+            else => unreachable,
+        }
     }
 
     fn parseVerticalBar(p: *Parser) !void {
@@ -355,13 +681,29 @@ const Parser = struct {
     }
 
     /// If the top of the stack is an element above an opVerticalBar, swap them
-    /// and return true. (The char-class merge fast path Go has is omitted.)
+    /// and return true (Go's `swapVerticalBar`). Literals and classes on both
+    /// sides of the bar are merged into a single class instead.
     fn swapVerticalBar(p: *Parser) !bool {
         const n = p.stack.items.len;
+        const items = p.stack.items;
+        if (n >= 3 and items[n - 2].op == .vertical_bar and isCharClass(items[n - 1]) and isCharClass(items[n - 3])) {
+            var re1 = items[n - 1];
+            var re3 = items[n - 3];
+            // Make re3 the more complex of the two.
+            if (@intFromEnum(re1.op) > @intFromEnum(re3.op)) {
+                std.mem.swap(*Regexp, &re1, &re3);
+                items[n - 3] = re3;
+            }
+            try p.mergeCharClass(re3, re1);
+            p.stack.shrinkRetainingCapacity(n - 1);
+            return true;
+        }
         if (n >= 2) {
             const re1 = p.stack.items[n - 1];
             const re2 = p.stack.items[n - 2];
             if (re2.op == .vertical_bar) {
+                // Now out of reach: clean opportunistically.
+                if (n >= 3) try p.cleanAlt(p.stack.items[n - 3]);
                 p.stack.items[n - 2] = re1;
                 p.stack.items[n - 1] = re2;
                 return true;
@@ -882,11 +1224,16 @@ fn appendNegatedTable(al: std.mem.Allocator, list: *std.ArrayList(u21), ranges: 
 /// Sort range pairs (lo ascending, hi descending to break ties), then merge
 /// abutting/overlapping ranges. Mirrors Go's `cleanClass`.
 fn cleanClass(list: *std.ArrayList(u21)) void {
-    const r = list.items;
+    list.shrinkRetainingCapacity(cleanRunes(list.items).len);
+}
+
+/// `cleanClass` over a bare range-pair slice, in place; returns the cleaned
+/// prefix.
+fn cleanRunes(r: []u21) []u21 {
     // A class list is always (lo, hi) pairs; the pair-cast and the i+1 reads
     // below depend on it.
     std.debug.assert(r.len % 2 == 0);
-    if (r.len < 2) return;
+    if (r.len < 2) return r;
     const n2 = r.len / 2;
     // Reinterpret as pairs for sorting; u21 is stored as a 4-byte int, so
     // [2]u21 is exactly two adjacent elements with no padding.
@@ -910,7 +1257,56 @@ fn cleanClass(list: *std.ArrayList(u21)) void {
         r[w + 1] = hi;
         w += 2;
     }
-    list.shrinkRetainingCapacity(w);
+    return r[0..w];
+}
+
+const LeadingString = struct { runes: []const u21, flags: Flags };
+
+/// The leading literal string `re` begins with (Go's `leadingString`).
+fn leadingString(re0: *const Regexp) LeadingString {
+    var re = re0;
+    if (re.op == .concat and re.sub.len > 0) re = re.sub[0];
+    if (re.op != .literal) return .{ .runes = &.{}, .flags = 0 };
+    return .{ .runes = re.runes, .flags = re.flags & ast.FoldCase };
+}
+
+/// The leading regexp `re` begins with (Go's `leadingRegexp`).
+fn leadingRegexp(re: *Regexp) ?*Regexp {
+    if (re.op == .empty_match) return null;
+    if (re.op == .concat and re.sub.len > 0) {
+        const s0 = re.sub[0];
+        if (s0.op == .empty_match) return null;
+        return s0;
+    }
+    return re;
+}
+
+/// A single rune or a class (Go's `isCharClass`).
+fn isCharClass(re: *const Regexp) bool {
+    return (re.op == .literal and re.runes.len == 1) or re.op == .char_class or
+        re.op == .any_char_not_nl or re.op == .any_char;
+}
+
+/// Does `re` (a single rune or class) match `r`? Go's parser-level `matchRune`.
+fn matchRuneNode(re: *const Regexp, r: u21) bool {
+    switch (re.op) {
+        .literal => return re.runes.len == 1 and re.runes[0] == r,
+        .char_class => {
+            var i: usize = 0;
+            while (i < re.runes.len) : (i += 2) {
+                if (re.runes[i] <= r and r <= re.runes[i + 1]) return true;
+            }
+            return false;
+        },
+        .any_char_not_nl => return r != '\n',
+        .any_char => return true,
+        else => return false,
+    }
+}
+
+fn appendLiteral(al: std.mem.Allocator, list: *std.ArrayList(u21), x: u21, flags: Flags) !void {
+    if (flags & ast.FoldCase != 0) return appendFoldedRange(al, list, x, x);
+    return appendRange(al, list, x, x);
 }
 
 /// Replace the class with its negation. Mirrors Go's `negateClass`.
