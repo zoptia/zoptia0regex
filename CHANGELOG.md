@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Testing / CI
+
+- Fix the `test-nightly` CI failure (`NondeterministicMemoryUsage` in the
+  Pike-VM OOM regression on Linux x86_64 with Zig 0.17.0-dev.2264). The
+  allocation-failure tests counted allocations while `ArrayList` growth could
+  resize in place or not depending on heap layout; every
+  `checkAllAllocationFailures` call now uses a backing allocator that fails
+  all resizes (as `regressiontest.zig` already did), so growth always goes
+  through `alloc`. No library change. Verified on Debian 13 x86_64 with
+  nightly 2264: 67/67 unit tests (five seeds) and all differential cases.
+- CI: `actions/checkout@v4` → `@v7` (Node 24 LTS; Node 20 is deprecated on
+  GitHub runners).
+
 ## [0.6.0] — 2026-09-22
 
 ### Performance

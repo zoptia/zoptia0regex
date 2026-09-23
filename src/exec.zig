@@ -1094,7 +1094,12 @@ fn exerciseScratchGrowth(allocator: std.mem.Allocator) !void {
 }
 
 test "scratch growth cleans up after every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseScratchGrowth, .{});
+    // Growth must go through alloc: an in-place resize/remap succeeds or not
+    // depending on heap layout, which would change the allocation count
+    // between runs (NondeterministicMemoryUsage). resize_index only advances
+    // on success, so fail index 0 fails every resize.
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), exerciseScratchGrowth, .{});
 }
 
 test "scratch remains reusable after partially failed growth" {

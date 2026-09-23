@@ -25,7 +25,12 @@ test "OOM regression: Pike thread creation does not leak" {
     @memset(input, 'a');
     // The long input bypasses bitstate and forces the Pike VM.
     try std.testing.expect(re.onepass == null);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, pikeMatch, .{ &re, input });
+    // Growth must go through alloc: an in-place resize/remap succeeds or not
+    // depending on heap layout, which would change the allocation count
+    // between runs (NondeterministicMemoryUsage). resize_index only advances
+    // on success, so fail index 0 fails every resize.
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), pikeMatch, .{ &re, input });
 }
 
 fn collectMatches(allocator: std.mem.Allocator, re: *const regex.Regexp) !void {
@@ -37,5 +42,10 @@ fn collectMatches(allocator: std.mem.Allocator, re: *const regex.Regexp) !void {
 test "OOM regression: collected capture append does not leak" {
     var re = try regex.compile(std.testing.allocator, "(a|b)+");
     defer re.deinit();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, collectMatches, .{&re});
+    // Growth must go through alloc: an in-place resize/remap succeeds or not
+    // depending on heap layout, which would change the allocation count
+    // between runs (NondeterministicMemoryUsage). resize_index only advances
+    // on success, so fail index 0 fails every resize.
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), collectMatches, .{&re});
 }

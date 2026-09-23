@@ -9,7 +9,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Zig 0.16.0 is a zvk-managed build, not a plain ziglang.org release, so
       # install the toolchain through zvk (https://github.com/zoptia/zvk).
@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Zig nightly via zvk
         env:

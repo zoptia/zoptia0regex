@@ -457,11 +457,17 @@ fn exerciseExecutionAllocationFailures(allocator: std.mem.Allocator, re: *const 
 test "execution and collected captures clean up on allocation failure" {
     var re = try regex.compile(ta, "(a|b)+");
     defer re.deinit();
-    try std.testing.checkAllAllocationFailures(ta, exerciseExecutionAllocationFailures, .{ &re, "aa bb aa bb aa bb aa bb aa bb aa bb" });
+    // Growth must go through alloc: an in-place resize/remap succeeds or not
+    // depending on heap layout, which would change the allocation count
+    // between runs (NondeterministicMemoryUsage). resize_index only advances
+    // on success, so fail index 0 fails every resize.
+    var no_resize = std.testing.FailingAllocator.init(ta, .{ .resize_fail_index = 0 });
+    const backing = no_resize.allocator();
+    try std.testing.checkAllAllocationFailures(backing, exerciseExecutionAllocationFailures, .{ &re, "aa bb aa bb aa bb aa bb aa bb aa bb" });
     const input = try ta.alloc(u8, 40000);
     defer ta.free(input);
     @memset(input, 'a');
-    try std.testing.checkAllAllocationFailures(ta, exerciseExecutionAllocationFailures, .{ &re, input });
+    try std.testing.checkAllAllocationFailures(backing, exerciseExecutionAllocationFailures, .{ &re, input });
 }
 
 test "literal fast paths agree with engine results without allocations" {
