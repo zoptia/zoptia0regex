@@ -16,10 +16,11 @@ const Prog = prog.Prog;
 
 pub const Error = error{ OutOfMemory, NestingDepth, TooLarge };
 
-// Backstop against runaway programs, matching Go's maxSize (128 MB / 40-byte
-// inst ≈ 3.3M instructions): a flat expression larger than this is rejected
-// with TooLarge, just as Go rejects it with ErrLarge.
-const max_insts = (128 << 20) / 40;
+// Go's compiler has no size limit: the parser's size estimate (checkSize)
+// is the only bound, and it is ported in parse.zig. The one limit here is
+// representational: a patch list stores `pc << 1` in a u32, so every pc must
+// fit in 31 bits.
+const max_insts: usize = 1 << 31;
 
 /// A list of instruction exits awaiting patching. `head`/`tail` encode a
 /// program counter and which field (`pc<<1` for `.out`, `pc<<1 | 1` for
@@ -78,10 +79,10 @@ const Compiler = struct {
     depth: u32 = 0,
 
     fn inst(c: *Compiler, op: prog.InstOp) Error!Frag {
+        if (c.insts.items.len >= max_insts) return error.TooLarge;
         const i: u32 = @intCast(c.insts.items.len);
         try c.insts.append(c.al, .{ .op = op });
         try c.ascii.append(c.al, 0);
-        if (c.insts.items.len > max_insts) return error.TooLarge;
         return .{ .i = i, .nullable = true };
     }
 
