@@ -184,7 +184,9 @@ const Node = struct {
     has_height: bool = false,
 
     fn of(re: *Regexp) *Node {
-        return @fieldParentPtr("re", re);
+        // `Node` can be more aligned than `Regexp` (the i64 size cache on
+        // 32-bit targets); every `*Regexp` here was allocated as a `Node`.
+        return @alignCast(@fieldParentPtr("re", re));
     }
 };
 
