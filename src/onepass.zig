@@ -66,9 +66,9 @@ fn onePassPrefix(al: std.mem.Allocator, p: *const Prog) !Prefix {
     while (prog.mergedOp(i.op) == .rune and i.runes.len == 1 and
         (@as(ast.Flags, @intCast(i.arg)) & ast.FoldCase) == 0 and i.runes[0] != 0xFFFD)
     {
-        var tmp: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(i.runes[0], &tmp) catch break;
-        try buf.appendSlice(al, tmp[0..n]);
+        // A surrogate is written as U+FFFD and the walk goes on, like Go's
+        // `buf.WriteRune`: `doOnePass` then skips those bytes unchecked.
+        _ = try prog.appendRune(al, &buf, i.runes[0]);
         pc = i.out;
         i = &p.insts[pc];
     }

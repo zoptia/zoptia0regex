@@ -42,6 +42,11 @@ pub const Regexp = struct {
     /// otherwise. The engines read their own copies from `engine`.
     prefix: []const u8,
     prefix_complete: bool,
+    /// The regexp is a plain literal (`engine.accel.prefix`, complete): no
+    /// one-pass program, captures or start condition, and a prefix that
+    /// holds no U+FFFD stand-in for an unencodable rune. Matching is then
+    /// a substring search (see `literalIndex`).
+    literal: bool,
     /// Same as `engine.accel.first_bytes`; kept for introspection in tests.
     first_bytes: []const u8,
     /// Same as `engine.onepass`; kept for introspection in tests.
@@ -114,7 +119,7 @@ pub const Regexp = struct {
     }
 
     fn isLiteral(re: *const Regexp) bool {
-        return re.prefix_complete and re.onepass == null and re.num_subexp == 0 and re.engine.cond == 0;
+        return re.literal and re.engine.mode == .auto;
     }
 
     fn literalIndex(re: *const Regexp, input: []const u8) ?Match {
@@ -669,6 +674,7 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
         .min_input_len = minInputLen(simplified),
         .prefix = if (op_prog) |op| op.prefix else pfx.str,
         .prefix_complete = if (op_prog) |op| op.prefix_complete else pfx.complete,
+        .literal = pfx.complete and !pfx.lossy and op_prog == null and max_cap == 0 and cond == 0,
         .first_bytes = first_bytes,
         .onepass = op_prog,
         .engine = .{

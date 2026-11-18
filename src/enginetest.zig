@@ -69,3 +69,69 @@ test "deep program: wide alternation of distinct runes" {
     // The last alternative, U+1EA5F, preceded by two ASCII bytes.
     try expectSubmatch(a, &re, "ab\u{1EA5F}z", &.{ 2, 7 });
 }
+
+// --- Runes UTF-8 cannot encode in a literal prefix ---
+//
+// Go writes a surrogate in a literal prefix as U+FFFD and keeps collecting.
+// The one-pass engine skips its prefix without decoding it, so `^a\x{D800}`
+// matches "a\u{FFFD}"; every other engine compares runes and, since no input
+// decodes to a surrogate, never matches one. Both behaviours are Go's.
+
+const PrefixCase = struct { p: []const u8, prefix: []const u8, complete: bool };
+
+test "literal prefix with an unencodable rune" {
+    const cases = [_]PrefixCase{
+        .{ .p = "\\x{D800}", .prefix = "\u{FFFD}", .complete = true },
+        .{ .p = "a\\x{D800}b", .prefix = "a\u{FFFD}b", .complete = true },
+        .{ .p = "^a\\x{D800}", .prefix = "a\u{FFFD}", .complete = false },
+        .{ .p = "^a\\x{D800}$", .prefix = "a\u{FFFD}", .complete = true },
+        .{ .p = "[\\x{D800}]", .prefix = "\u{FFFD}", .complete = true },
+        .{ .p = "^\\x{D800}\\x{DBFF}", .prefix = "\u{FFFD}\u{FFFD}", .complete = false },
+        .{ .p = "^(a)\\x{D800}", .prefix = "", .complete = false },
+    };
+    for (cases) |c| {
+        var re = try regex.compile(ta, c.p);
+        defer re.deinit();
+        const lp = re.literalPrefix();
+        try std.testing.expectEqualStrings(c.prefix, lp.prefix);
+        try std.testing.expectEqual(c.complete, lp.complete);
+    }
+}
+
+const SubmatchCase = struct { p: []const u8, in: []const u8, want: ?[]const i64 };
+
+test "matching with an unencodable rune in the literal prefix" {
+    const cases = [_]SubmatchCase{
+        .{ .p = "^a\\x{D800}", .in = "a\u{FFFD}", .want = &.{ 0, 4 } },
+        .{ .p = "^a\\x{D800}", .in = "a\u{FFFD}b", .want = &.{ 0, 4 } },
+        .{ .p = "^a\\x{D800}", .in = "a\xed\xa0\x80", .want = null },
+        .{ .p = "^a\\x{D800}$", .in = "a\u{FFFD}", .want = &.{ 0, 4 } },
+        .{ .p = "^a\\x{D800}$", .in = "a\u{FFFD}b", .want = null },
+        .{ .p = "\\A\\x{DFFF}x\\z", .in = "\u{FFFD}x", .want = &.{ 0, 4 } },
+        .{ .p = "^a\\x{D800}(b)", .in = "a\u{FFFD}b", .want = &.{ 0, 5, 4, 5 } },
+        .{ .p = "^(a)\\x{D800}", .in = "a\u{FFFD}", .want = null },
+        .{ .p = "\\x{D800}", .in = "\u{FFFD}", .want = null },
+        .{ .p = "\\x{D800}", .in = "\xed\xa0\x80", .want = null },
+        .{ .p = "(?:\\x{D800})", .in = "\u{FFFD}", .want = null },
+        .{ .p = "[\\x{D800}]", .in = "\u{FFFD}", .want = null },
+        .{ .p = "a\\x{D800}b", .in = "a\u{FFFD}b", .want = null },
+        .{ .p = "a\\x{D800}", .in = "xa\u{FFFD}", .want = null },
+        .{ .p = "\\x{D800}|\\x{FFFD}", .in = "a\u{FFFD}", .want = &.{ 1, 4 } },
+        .{ .p = "^a\\x{D800}|b", .in = "a\u{FFFD}b", .want = &.{ 4, 5 } },
+    };
+    var scratch = regex.Scratch.init(ta);
+    defer scratch.deinit();
+    for (cases) |c| {
+        var re = try regex.compile(ta, c.p);
+        defer re.deinit();
+        try expectSubmatch(ta, &re, c.in, c.want);
+        try std.testing.expectEqual(c.want != null, try re.match(ta, c.in));
+        try std.testing.expectEqual(c.want != null, try re.matchScratch(&scratch, c.in));
+        const fi = try re.findIndex(ta, c.in);
+        try std.testing.expectEqual(c.want != null, fi != null);
+        if (fi) |m| {
+            try std.testing.expectEqual(c.want.?[0], @as(i64, @intCast(m.start)));
+            try std.testing.expectEqual(c.want.?[1], @as(i64, @intCast(m.end)));
+        }
+    }
+}

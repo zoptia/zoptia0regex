@@ -128,24 +128,28 @@ pub const Prog = struct {
     }
 
     /// A literal string that every match must start with, plus whether that
-    /// prefix is the entire match. Mirrors Go's `Prog.Prefix`.
-    pub fn prefix(p: *const Prog, allocator: std.mem.Allocator) !struct { str: []u8, complete: bool } {
+    /// prefix is the entire match. Mirrors Go's `Prog.Prefix`, including its
+    /// treatment of runes UTF-8 cannot encode (surrogates): they are written
+    /// as U+FFFD and the walk goes on. `lossy` reports that this happened;
+    /// the prefix is then not the literal the program matches (the engines
+    /// compare runes, and no input decodes to a surrogate), only the bytes
+    /// Go's one-pass prefix skip and `LiteralPrefix` use.
+    pub fn prefix(p: *const Prog, allocator: std.mem.Allocator) !struct { str: []u8, complete: bool, lossy: bool } {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
+        var lossy = false;
         var i = p.skipNop(p.start);
         // Avoid building when there is no single-rune prefix.
         if (mergedOp(i.op) != .rune or i.runes.len != 1) {
-            return .{ .str = try buf.toOwnedSlice(allocator), .complete = i.op == .match };
+            return .{ .str = try buf.toOwnedSlice(allocator), .complete = i.op == .match, .lossy = false };
         }
         while (mergedOp(i.op) == .rune and i.runes.len == 1 and
             (@as(ast.Flags, @intCast(i.arg)) & ast.FoldCase) == 0 and i.runes[0] != 0xFFFD)
         {
-            var tmp: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(i.runes[0], &tmp) catch break;
-            try buf.appendSlice(allocator, tmp[0..n]);
+            if (try appendRune(allocator, &buf, i.runes[0])) lossy = true;
             i = p.skipNop(i.out);
         }
-        return .{ .str = try buf.toOwnedSlice(allocator), .complete = i.op == .match };
+        return .{ .str = try buf.toOwnedSlice(allocator), .complete = i.op == .match, .lossy = lossy };
     }
 
     fn skipNop(p: *const Prog, pc0: u32) *Inst {
@@ -157,6 +161,20 @@ pub const Prog = struct {
     }
 };
 
+/// Append the UTF-8 encoding of `r` to `buf` like Go's `utf8.AppendRune`:
+/// a rune that cannot be encoded (a surrogate, or past U+10FFFF) is written
+/// as U+FFFD. Returns whether that substitution happened.
+pub fn appendRune(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), r: u21) !bool {
+    var tmp: [4]u8 = undefined;
+    if (std.unicode.utf8Encode(r, &tmp)) |n| {
+        try buf.appendSlice(allocator, tmp[0..n]);
+        return false;
+    } else |_| {
+        try buf.appendSlice(allocator, "\u{FFFD}");
+        return true;
+    }
+}
+
 /// `impossible` start condition: all bits set (Go's `^EmptyOp(0)`).
 pub const impossible: EmptyOp = 0xFF;
 
@@ -166,6 +184,17 @@ pub fn mergedOp(op: InstOp) InstOp {
         .rune1, .rune_any, .rune_any_not_nl => .rune,
         else => op,
     };
+}
+
+test "appendRune writes U+FFFD for unencodable runes" {
+    const a = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try std.testing.expect(!try appendRune(a, &buf, 'a'));
+    try std.testing.expect(try appendRune(a, &buf, 0xD800));
+    try std.testing.expect(!try appendRune(a, &buf, 0x10FFFF));
+    try std.testing.expect(try appendRune(a, &buf, 0x110000));
+    try std.testing.expectEqualStrings("a\u{FFFD}\u{10FFFF}\u{FFFD}", buf.items);
 }
 
 test "matchRune single, range, fold" {
