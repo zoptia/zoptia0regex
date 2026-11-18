@@ -1,5 +1,6 @@
 //! The compiled program: a list of NFA instructions, mirroring Go's
-//! `regexp/syntax.Prog` / `Inst`. The Pike VM in `exec.zig` interprets this.
+//! `regexp/syntax.Prog` / `Inst`. The engines in `exec.zig` and
+//! `backtrack.zig` interpret this.
 
 const std = @import("std");
 const unicode = @import("unicode.zig");
@@ -98,6 +99,8 @@ pub const Prog = struct {
     /// walking the range list or the fold orbit.
     ascii: []const u128 = &.{},
     start: u32 = 0,
+    /// Go's `Prog.NumCap`. Kept for parity with Go; nothing reads it (results
+    /// are padded to the Regexp's `padLen` instead).
     num_cap: usize = 2, // implicit whole-match capture pair
 
     /// `Inst.matchRune` for `insts[pc]` with the ASCII fast path.
@@ -125,24 +128,28 @@ pub const Prog = struct {
     }
 
     /// A literal string that every match must start with, plus whether that
-    /// prefix is the entire match. Mirrors Go's `Prog.Prefix`.
-    pub fn prefix(p: *const Prog, allocator: std.mem.Allocator) !struct { str: []u8, complete: bool } {
+    /// prefix is the entire match. Mirrors Go's `Prog.Prefix`, including its
+    /// treatment of runes UTF-8 cannot encode (surrogates): they are written
+    /// as U+FFFD and the walk goes on. `lossy` reports that this happened;
+    /// the prefix is then not the literal the program matches (the engines
+    /// compare runes, and no input decodes to a surrogate), only the bytes
+    /// Go's one-pass prefix skip and `LiteralPrefix` use.
+    pub fn prefix(p: *const Prog, allocator: std.mem.Allocator) !struct { str: []u8, complete: bool, lossy: bool } {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
+        var lossy = false;
         var i = p.skipNop(p.start);
         // Avoid building when there is no single-rune prefix.
         if (mergedOp(i.op) != .rune or i.runes.len != 1) {
-            return .{ .str = try buf.toOwnedSlice(allocator), .complete = i.op == .match };
+            return .{ .str = try buf.toOwnedSlice(allocator), .complete = i.op == .match, .lossy = false };
         }
         while (mergedOp(i.op) == .rune and i.runes.len == 1 and
             (@as(ast.Flags, @intCast(i.arg)) & ast.FoldCase) == 0 and i.runes[0] != 0xFFFD)
         {
-            var tmp: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(i.runes[0], &tmp) catch break;
-            try buf.appendSlice(allocator, tmp[0..n]);
+            if (try appendRune(allocator, &buf, i.runes[0])) lossy = true;
             i = p.skipNop(i.out);
         }
-        return .{ .str = try buf.toOwnedSlice(allocator), .complete = i.op == .match };
+        return .{ .str = try buf.toOwnedSlice(allocator), .complete = i.op == .match, .lossy = lossy };
     }
 
     fn skipNop(p: *const Prog, pc0: u32) *Inst {
@@ -153,6 +160,20 @@ pub const Prog = struct {
         return i;
     }
 };
+
+/// Append the UTF-8 encoding of `r` to `buf` like Go's `utf8.AppendRune`:
+/// a rune that cannot be encoded (a surrogate, or past U+10FFFF) is written
+/// as U+FFFD. Returns whether that substitution happened.
+pub fn appendRune(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), r: u21) !bool {
+    var tmp: [4]u8 = undefined;
+    if (std.unicode.utf8Encode(r, &tmp)) |n| {
+        try buf.appendSlice(allocator, tmp[0..n]);
+        return false;
+    } else |_| {
+        try buf.appendSlice(allocator, "\u{FFFD}");
+        return true;
+    }
+}
 
 /// `impossible` start condition: all bits set (Go's `^EmptyOp(0)`).
 pub const impossible: EmptyOp = 0xFF;
@@ -165,28 +186,15 @@ pub fn mergedOp(op: InstOp) InstOp {
     };
 }
 
-/// The zero-width assertions satisfied between runes r1 and r2 (each -1 at the
-/// text boundary). Mirrors Go's `EmptyOpContext`. Provided for completeness;
-/// the Pike VM uses the lazy variant in `exec.zig`.
-pub fn emptyOpContext(r1: i32, r2: i32) EmptyOp {
-    var op: EmptyOp = empty_no_word_boundary;
-    var boundary: u8 = 0;
-    if (unicode.isWordChar(r1)) {
-        boundary = 1;
-    } else if (r1 == '\n') {
-        op |= empty_begin_line;
-    } else if (r1 < 0) {
-        op |= empty_begin_text | empty_begin_line;
-    }
-    if (unicode.isWordChar(r2)) {
-        boundary ^= 1;
-    } else if (r2 == '\n') {
-        op |= empty_end_line;
-    } else if (r2 < 0) {
-        op |= empty_end_text | empty_end_line;
-    }
-    if (boundary != 0) op ^= (empty_word_boundary | empty_no_word_boundary);
-    return op;
+test "appendRune writes U+FFFD for unencodable runes" {
+    const a = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try std.testing.expect(!try appendRune(a, &buf, 'a'));
+    try std.testing.expect(try appendRune(a, &buf, 0xD800));
+    try std.testing.expect(!try appendRune(a, &buf, 0x10FFFF));
+    try std.testing.expect(try appendRune(a, &buf, 0x110000));
+    try std.testing.expectEqualStrings("a\u{FFFD}\u{10FFFF}\u{FFFD}", buf.items);
 }
 
 test "matchRune single, range, fold" {
@@ -198,10 +206,4 @@ test "matchRune single, range, fold" {
     try std.testing.expect(lit.matchRune('a'));
     try std.testing.expect(lit.matchRune('A'));
     try std.testing.expect(!lit.matchRune('b'));
-}
-
-test "emptyOpContext begin/end text" {
-    const ctx = emptyOpContext(-1, 'a');
-    try std.testing.expect(ctx & empty_begin_text != 0);
-    try std.testing.expect(ctx & empty_begin_line != 0);
 }

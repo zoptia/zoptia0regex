@@ -14,6 +14,7 @@ const simplify = @import("simplify.zig");
 const compile_ = @import("compile.zig");
 const prog = @import("prog.zig");
 const exec = @import("exec.zig");
+const search = @import("search.zig");
 const unicode = @import("unicode.zig");
 const onepass = @import("onepass.zig");
 
@@ -32,18 +33,27 @@ pub const Regexp = struct {
     base_allocator: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
     expr: []const u8,
-    prog: prog.Prog,
+    prog: *const prog.Prog,
     num_subexp: usize,
     subexp_names: []const []const u8,
-    cond: prog.EmptyOp,
     min_input_len: usize,
-    longest: bool,
+    /// Go's `Regexp.prefix` / `prefixComplete` (what `literalPrefix`
+    /// reports): `onePassPrefix` for one-pass regexps, `Prog.prefix`
+    /// otherwise. The engines read their own copies from `engine`.
     prefix: []const u8,
     prefix_complete: bool,
-    prefix_end: u32,
-    prefix_anchor: u32,
+    /// The regexp is a plain literal (`engine.accel.prefix`, complete): no
+    /// one-pass program, captures or start condition, and a prefix that
+    /// holds no U+FFFD stand-in for an unencodable rune. Matching is then
+    /// a substring search (see `findAt`).
+    literal: bool,
+    /// Same as `engine.accel.first_bytes.bytes`; kept for introspection in
+    /// tests.
     first_bytes: []const u8,
-    onepass: ?*onepass.OnePassProg,
+    /// Same as `engine.onepass`; kept for introspection in tests.
+    onepass: ?*const onepass.OnePassProg,
+    /// Everything the matching engines read (see `exec.Engine`).
+    engine: exec.Engine,
 
     pub fn deinit(re: *Regexp) void {
         const gpa = re.base_allocator;
@@ -58,25 +68,50 @@ pub const Regexp = struct {
         return (re.num_subexp + 1) * 2;
     }
 
-    /// Run the engines over `input` starting at `pos` with a per-call scratch.
-    /// `caps` receives the submatch offsets (its length bounds how many are
-    /// recorded); returns whether a match was found.
-    fn accel(re: *const Regexp) exec.Accel {
-        return .{
-            .prefix = re.prefix,
-            .prefix_end = re.prefix_end,
-            .prefix_anchor = re.prefix_anchor,
-            .first_bytes = re.first_bytes,
-        };
+    /// The single entry point every search goes through, Go's
+    /// `(*Regexp).find`: find the leftmost match in `input` starting at
+    /// byte offset `pos`, writing its submatch offsets into `caps` (whose
+    /// length, 0 up to `padLen`, bounds how many are recorded; -1 when
+    /// unset). Returns whether there was a match; `caps` is meaningful only
+    /// then. Engine storage comes from `storage`.
+    ///
+    /// Like Go it first rejects inputs shorter than any match. Then, a
+    /// port-specific shortcut: a plain literal regexp (see `literal`) needs
+    /// no engine when at most the whole-match slots are wanted — the match
+    /// is the literal's next occurrence.
+    fn findAt(re: *const Regexp, storage: Storage, input: []const u8, pos: usize, caps: []i64) ExecError!bool {
+        if (input.len < re.min_input_len) return false;
+        if (caps.len <= 2 and re.literal and re.engine.mode == .auto) {
+            const a = &re.engine.accel;
+            const start = pos + (search.prefixIndexAnchored(input[pos..], a.prefix, a.prefix_anchor) orelse return false);
+            if (caps.len == 2) {
+                caps[0] = @intCast(start);
+                caps[1] = @intCast(start + a.prefix.len);
+            }
+            return true;
+        }
+        switch (storage) {
+            .scratch => |scratch| return exec.executeReuse(scratch, &re.engine, .{ .s = input }, pos, caps),
+            .temporary => |allocator| {
+                var scratch = Scratch.init(allocator);
+                defer scratch.deinit();
+                return exec.executeReuse(&scratch, &re.engine, .{ .s = input }, pos, caps);
+            },
+        }
     }
 
-    fn execAt(re: *const Regexp, allocator: std.mem.Allocator, input: exec.Input, pos: usize, caps: []i64) ExecError!bool {
-        return exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.accel(), input, pos, caps);
-    }
+    /// Where `findAt` gets engine storage: a caller's `Scratch` (the
+    /// `*Scratch` API and the find-all loops), or a temporary one from an
+    /// allocator (the allocating API), set up only if an engine runs.
+    const Storage = union(enum) {
+        scratch: *Scratch,
+        temporary: std.mem.Allocator,
+    };
 
-    /// `execAt` borrowing all engine storage from a caller-owned `Scratch`.
-    fn execAtScratch(re: *const Regexp, scratch: *Scratch, input: exec.Input, pos: usize, caps: []i64) ExecError!bool {
-        return exec.executeReuse(scratch, &re.prog, re.onepass, re.longest, re.cond, re.accel(), input, pos, caps);
+    fn findIndexIn(re: *const Regexp, storage: Storage, input: []const u8) ExecError!?Match {
+        var caps: [2]i64 = .{ -1, -1 };
+        if (!try re.findAt(storage, input, 0, &caps)) return null;
+        return Match{ .start = @intCast(caps[0]), .end = @intCast(caps[1]) };
     }
 
     // --- introspection ---
@@ -113,26 +148,14 @@ pub const Regexp = struct {
 
     /// Switch to leftmost-longest (POSIX) matching for future searches.
     pub fn setLongest(re: *Regexp) void {
-        re.longest = true;
-    }
-
-    fn isLiteral(re: *const Regexp) bool {
-        return re.prefix_complete and re.onepass == null and re.num_subexp == 0 and re.cond == 0;
-    }
-
-    fn literalIndex(re: *const Regexp, input: []const u8) ?Match {
-        const start = exec.prefixIndexAnchored(input, re.prefix, re.prefix_anchor) orelse return null;
-        return .{ .start = start, .end = start + re.prefix.len };
+        re.engine.longest = true;
     }
 
     // --- boolean match ---
 
     /// Reports whether `input` contains any match.
     pub fn match(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!bool {
-        if (input.len < re.min_input_len) return false;
-        if (re.isLiteral()) return re.literalIndex(input) != null;
-        var caps: [0]i64 = .{};
-        return try re.execAt(allocator, .{ .s = input }, 0, &caps);
+        return re.findAt(.{ .temporary = allocator }, input, 0, &.{});
     }
 
     /// Alias of `match` (Go distinguishes `[]byte` and `string`; here both are
@@ -147,21 +170,13 @@ pub const Regexp = struct {
     /// warmed up, each call does zero heap allocation. Single-threaded: do not
     /// share one `Scratch` between concurrent matches.
     pub fn matchScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!bool {
-        if (input.len < re.min_input_len) return false;
-        if (re.isLiteral()) return re.literalIndex(input) != null;
-        var caps: [0]i64 = .{};
-        return try re.execAtScratch(scratch, .{ .s = input }, 0, &caps);
+        return re.findAt(.{ .scratch = scratch }, input, 0, &.{});
     }
 
     /// Like `findIndex`, but reuses a caller-owned `Scratch` instead of
     /// allocating per call. See `matchScratch` for the reuse contract.
     pub fn findIndexScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!?Match {
-        if (input.len < re.min_input_len) return null;
-        if (re.isLiteral()) return re.literalIndex(input);
-        var caps: [2]i64 = .{ -1, -1 };
-        const matched = try re.execAtScratch(scratch, .{ .s = input }, 0, &caps);
-        if (!matched) return null;
-        return Match{ .start = @intCast(caps[0]), .end = @intCast(caps[1]) };
+        return re.findIndexIn(.{ .scratch = scratch }, input);
     }
 
     /// Like `findSubmatchIndex`, but reuses a caller-owned `Scratch`. The
@@ -169,10 +184,8 @@ pub const Regexp = struct {
     /// that reuses it — copy it if you need to keep it. Do NOT free it. Null if
     /// there is no match.
     pub fn findSubmatchIndexScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!?[]i64 {
-        if (input.len < re.min_input_len) return null;
         const caps = try scratch.resultBuf(re.padLen());
-        const matched = try re.execAtScratch(scratch, .{ .s = input }, 0, caps);
-        if (!matched) return null;
+        if (!try re.findAt(.{ .scratch = scratch }, input, 0, caps)) return null;
         return caps;
     }
 
@@ -180,12 +193,7 @@ pub const Regexp = struct {
 
     /// Leftmost match location, or null.
     pub fn findIndex(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!?Match {
-        if (input.len < re.min_input_len) return null;
-        if (re.isLiteral()) return re.literalIndex(input);
-        var caps: [2]i64 = .{ -1, -1 };
-        const matched = try re.execAt(allocator, .{ .s = input }, 0, &caps);
-        if (!matched) return null;
-        return Match{ .start = @intCast(caps[0]), .end = @intCast(caps[1]) };
+        return re.findIndexIn(.{ .temporary = allocator }, input);
     }
 
     /// Text of the leftmost match (a sub-slice of `input`), or null.
@@ -200,10 +208,10 @@ pub const Regexp = struct {
     /// `2*(numSubexp+1)`; -1 for groups that did not participate). Caller owns
     /// the returned slice. Null if there is no match.
     pub fn findSubmatchIndex(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!?[]i64 {
-        if (input.len < re.min_input_len) return null;
+        if (input.len < re.min_input_len) return null; // skip the allocation
         const caps = try allocator.alloc(i64, re.padLen());
         errdefer allocator.free(caps);
-        const matched = try re.execAt(allocator, .{ .s = input }, 0, caps);
+        const matched = try re.findAt(.{ .temporary = allocator }, input, 0, caps);
         if (!matched) {
             allocator.free(caps);
             return null;
@@ -269,7 +277,7 @@ pub const Regexp = struct {
         pub fn next(it: *Matches) ExecError!?[]const i64 {
             const in = exec.Input{ .s = it.input };
             while (!it.done and it.pos <= it.input.len) {
-                const matched = try it.re.execAtScratch(it.scratch(), in, it.pos, it.caps);
+                const matched = try it.re.findAt(.{ .scratch = it.scratch() }, it.input, it.pos, it.caps);
                 if (!matched) break;
                 var accept = true;
                 if (it.caps[1] == @as(i64, @intCast(it.pos))) {
@@ -311,7 +319,7 @@ pub const Regexp = struct {
             .own = Scratch.init(allocator),
             .caps = caps,
             .remaining = n,
-            .done = n == 0 or input.len < re.min_input_len,
+            .done = n == 0,
         };
     }
 
@@ -329,7 +337,7 @@ pub const Regexp = struct {
             .borrowed = scratch,
             .caps = caps,
             .remaining = n,
-            .done = n == 0 or input.len < re.min_input_len,
+            .done = n == 0,
         };
     }
 
@@ -461,7 +469,7 @@ pub const Regexp = struct {
         const in = exec.Input{ .s = src };
 
         while (search_pos <= end_pos) {
-            const matched = try re.execAtScratch(&scratch, in, search_pos, caps);
+            const matched = try re.findAt(.{ .scratch = &scratch }, src, search_pos, caps);
             if (!matched) break;
             const a0: usize = @intCast(caps[0]);
             const a1: usize = @intCast(caps[1]);
@@ -631,13 +639,15 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
     re_ast.capNamesInto(names);
 
     const simplified = try simplify.simplify(al, re_ast);
-    const p = try compile_.compile(al, simplified);
+    const p = try al.create(prog.Prog);
+    p.* = try compile_.compile(al, simplified);
 
     const cond = p.startCond();
 
-    // Build the one-pass program if the regexp qualifies (anchored, unambiguous).
-    const op_prog: ?*onepass.OnePassProg = blk: {
-        if (try onepass.compileOnePass(gpa, al, &p)) |opp| {
+    // Build the one-pass program if the regexp qualifies (anchored,
+    // unambiguous). It carries its own prefix (Go's onePassPrefix).
+    const op_prog: ?*const onepass.OnePassProg = blk: {
+        if (try onepass.compileOnePass(gpa, al, p)) |opp| {
             const ptr = try al.create(onepass.OnePassProg);
             ptr.* = opp;
             break :blk ptr;
@@ -645,30 +655,18 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
         break :blk null;
     };
 
-    // Like Go: one-pass regexps use onePassPrefix (which also yields the pc to
-    // resume at after the prefix); everything else uses Prog.prefix.
-    var prefix_str: []const u8 = "";
-    var prefix_complete = false;
-    var prefix_end: u32 = 0;
-    if (op_prog != null) {
-        const opfx = try onepass.onePassPrefix(al, &p);
-        prefix_str = opfx.str;
-        prefix_complete = opfx.complete;
-        prefix_end = opfx.pc;
-    } else {
-        const pfx = try p.prefix(al);
-        prefix_str = pfx.str;
-        prefix_complete = pfx.complete;
-    }
+    // The scan prefix for the Pike VM and bitstate engines. Go computes
+    // Prog.prefix only for non-one-pass regexps; for one-pass ones it is
+    // always empty anyway (their programs start with \A), so computing it
+    // unconditionally keeps every engine runnable on every regexp.
+    const pfx = try p.prefix(al);
 
     // With no literal prefix, a small set of possible first bytes still lets
     // the Pike VM / bitstate engines skip ahead (see exec.Accel.first_bytes).
-    // Anchored programs never scan, and one-pass never uses it.
+    // Anchored programs never scan.
     var first_bytes: []const u8 = "";
-    if (op_prog == null and prefix_str.len == 0 and
-        cond != prog.impossible and (cond & prog.empty_begin_text) == 0)
-    {
-        if (try firstBytes(gpa, al, &p)) |fb| first_bytes = fb;
+    if (pfx.str.len == 0 and cond != prog.impossible and (cond & prog.empty_begin_text) == 0) {
+        if (try firstBytes(gpa, al, p)) |fb| first_bytes = fb;
     }
 
     return Regexp{
@@ -678,21 +676,30 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
         .prog = p,
         .num_subexp = @intCast(max_cap),
         .subexp_names = names,
-        .cond = cond,
         .min_input_len = minInputLen(simplified),
-        .longest = longest,
-        .prefix = prefix_str,
-        .prefix_complete = prefix_complete,
-        .prefix_end = prefix_end,
-        .prefix_anchor = exec.prefixAnchor(prefix_str),
+        .prefix = if (op_prog) |op| op.prefix else pfx.str,
+        .prefix_complete = if (op_prog) |op| op.prefix_complete else pfx.complete,
+        .literal = pfx.complete and !pfx.lossy and op_prog == null and max_cap == 0 and cond == 0,
         .first_bytes = first_bytes,
         .onepass = op_prog,
+        .engine = .{
+            .prog = p,
+            .onepass = op_prog,
+            .cond = cond,
+            .longest = longest,
+            .accel = .{
+                .prefix = pfx.str,
+                .prefix_anchor = search.prefixAnchor(pfx.str),
+                .prefix_rune = if (pfx.str.len > 0) (exec.Input{ .s = pfx.str }).step(0).r else -1,
+                .first_bytes = if (first_bytes.len > 0) search.ByteSet.init(first_bytes) else .{},
+            },
+        },
     };
 }
 
-/// Max size of the accelerated first-byte set (the SIMD scan in exec.zig
+/// Max size of the accelerated first-byte set (the SIMD scan in search.zig
 /// handles up to this many bytes at flat cost; wider sets stop filtering).
-const max_first_bytes = exec.max_first_bytes;
+const max_first_bytes = search.max_first_bytes;
 
 /// The set of bytes that can begin a match, computed from the epsilon-closure
 /// of the program start. Returns null (no acceleration) when the pattern can

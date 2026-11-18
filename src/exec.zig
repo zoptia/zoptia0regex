@@ -1,9 +1,12 @@
-//! The execution engines, faithfully porting Go's `regexp/exec.go` and
-//! `backtrack.go`. `execute` dispatches exactly like Go: the one-pass engine
-//! (see `onepass.zig`) for qualifying anchored regexps, the bitstate
-//! backtracker for small programs/inputs, and the Pike VM (an NFA simulation
-//! with submatch tracking) for everything else. All three produce identical
-//! results; the fast engines exist purely for speed.
+//! The execution engines, faithfully porting Go's `regexp/exec.go`: the
+//! input decoding, the Pike VM (an NFA simulation with submatch tracking), the
+//! one-pass runner, and the dispatch in `executeReuse`. The bitstate
+//! backtracker lives in `backtrack.zig` (Go's `backtrack.go`) and the
+//! substring / byte-set scans in `search.zig`. `executeReuse` dispatches
+//! exactly like Go: the one-pass engine (see `onepass.zig`) for qualifying
+//! anchored regexps, the bitstate backtracker for small programs/inputs, and
+//! the Pike VM for everything else. All three produce identical results; the
+//! fast engines exist purely for speed.
 //!
 //! Match priority is leftmost-first (RE2 / Perl semantics): `add` performs the
 //! epsilon-closure in greedy-priority order, and in first-match mode `step`
@@ -14,116 +17,66 @@ const std = @import("std");
 const prog = @import("prog.zig");
 const unicode = @import("unicode.zig");
 const onepass = @import("onepass.zig");
+const search = @import("search.zig");
+const backtrack_ = @import("backtrack.zig");
 
 const Prog = prog.Prog;
 const Inst = prog.Inst;
 const EmptyOp = prog.EmptyOp;
 const OnePassProg = onepass.OnePassProg;
+const Job = backtrack_.Job;
 
-const end_of_text: i32 = -1;
+pub const end_of_text: i32 = -1;
 
-/// Max size of the accelerated first-byte set. The SIMD scan's cost grows
-/// only slowly with the set size; past ~16 bytes the set stops *filtering*
-/// (too many positions qualify) rather than costing too much to scan.
-pub const max_first_bytes = 16;
-
-/// Match-acceleration data computed at compile time (see `regexp.compileInternal`).
+/// Scan acceleration for the Pike VM and the bitstate engine, computed at
+/// compile time (see `regexp.compileInternal`). The one-pass engine never
+/// scans; its own prefix lives in `OnePassProg` (Go's `onePassPrefix`, which
+/// reaches past `\A` and so is valid only for `doOnePass`).
 pub const Accel = struct {
-    /// Literal string every match must start with ("" = none). For one-pass
-    /// regexps this is Go's `onePassPrefix`; otherwise `Prog.prefix`.
+    /// Go's `Prog.Prefix`: a literal every match must start with ("" =
+    /// none). Always empty for one-pass regexps, whose programs begin with
+    /// `\A`.
     prefix: []const u8 = "",
-    /// One-pass only: the pc to resume at after `prefix` has been consumed.
-    prefix_end: u32 = 0,
-    /// Offset of `prefix`'s rarest byte (see `prefixAnchor`), precomputed at
-    /// compile time so the per-call search does not rescan the needle.
+    /// Offset of `prefix`'s rarest byte (see `search.prefixAnchor`),
+    /// precomputed so the per-call search does not rescan the needle.
     prefix_anchor: u32 = 0,
+    /// The first rune of `prefix` (Go's `prefixRune`); unused when empty.
+    prefix_rune: i32 = -1,
     /// When `prefix` is empty: the (ASCII) bytes a match can start with
-    /// (at most `max_first_bytes`), or empty when no such small set exists.
-    /// A superset of the true first bytes, so skipping to the next
+    /// (at most `search.max_first_bytes`), or empty when no such small set
+    /// exists. A superset of the true first bytes, so skipping to the next
     /// occurrence can never skip a match.
-    first_bytes: []const u8 = "",
+    first_bytes: search.ByteSet = .{},
 };
 
-fn inFirstBytes(set: []const u8, r: i32) bool {
-    if (r < 0 or r > 0x7F) return false;
-    const b: u8 = @intCast(r);
-    for (set) |x| {
-        if (x == b) return true;
-    }
-    return false;
-}
-
-/// Vectorized first-index-of-any-byte — the memchr2/…/memchr16 analogue used
-/// by the first-byte prefilter. One portable implementation: `@Vector`
-/// compiles to NEON on aarch64, SSE2 on baseline x86_64 (wider with
-/// `-Dcpu=native` on AVX2 machines), and degrades to the scalar std search on
-/// targets without SIMD registers.
-fn indexOfAnyByte(haystack: []const u8, set: []const u8) ?usize {
-    std.debug.assert(set.len >= 1 and set.len <= max_first_bytes);
-    if (set.len == 1) return std.mem.indexOfScalar(u8, haystack, set[0]);
-    const width = comptime (std.simd.suggestVectorLength(u8) orelse 0);
-    if (width == 0) return std.mem.indexOfAny(u8, haystack, set);
-    const V = @Vector(width, u8);
-    const Mask = @Int(.unsigned, width);
-
-    var splats: [max_first_bytes]V = undefined;
-    for (set, 0..) |b, k| splats[k] = @splat(b);
-
-    var i: usize = 0;
-    while (i + width <= haystack.len) : (i += width) {
-        const chunk: V = haystack[i..][0..width].*;
-        var mask: Mask = 0;
-        for (splats[0..set.len]) |s| mask |= @as(Mask, @bitCast(chunk == s));
-        if (mask != 0) return i + @ctz(mask);
-    }
-    while (i < haystack.len) : (i += 1) {
-        const c = haystack[i];
-        for (set) |b| {
-            if (c == b) return i;
-        }
-    }
-    return null;
-}
-
-/// Heuristic byte-frequency ranks (higher = more common in typical text and
-/// code). Only the relative order matters: `prefixIndex` anchors its scan on
-/// the needle's lowest-ranked byte, the idea behind rust-memmem's rare-byte
-/// heuristic — scanning for `-` or `@` false-starts far less often than
-/// scanning for `a`.
-const byte_rank: [256]u8 = blk: {
-    @setEvalBranchQuota(10_000);
-    var r: [256]u8 = @splat(15);
-    for (0..0x20) |c| r[c] = 3; // control bytes: rare
-    r['\n'] = 180;
-    r['\t'] = 120;
-    r[' '] = 255;
-    const order = "etaoinsrhldcumfpgwybvkxjqz"; // approximate English order
-    for (order, 0..) |c, idx| {
-        const common: u8 = 240 - @as(u8, @intCast(idx)) * 6;
-        r[c] = common;
-        r[std.ascii.toUpper(c)] = common / 3;
-    }
-    for ('0'..'9' + 1) |c| r[c] = 100;
-    for (".,-_'\"()/:;=") |c| r[c] = 90;
-    for (0x80..0x100) |c| r[c] = 30; // UTF-8 lead/continuation bytes
-    break :blk r;
+/// Engine selection. `auto` is Go's dispatch; the others exist so tests can
+/// cross-check every engine on the same regexp (see `Engine.mode`).
+pub const Mode = enum {
+    auto,
+    /// Go's dispatch minus the one-pass engine.
+    no_onepass,
+    /// Always the Pike VM.
+    pike,
+    /// The bitstate backtracker whenever its visited bitmap stays within
+    /// `max_forced_bitstate_bits`; otherwise the Pike VM.
+    bitstate,
 };
 
-fn rarestByteOffset(needle: []const u8) usize {
-    var best: usize = 0;
-    for (needle, 0..) |b, i| {
-        if (byte_rank[b] < byte_rank[needle[best]]) best = i;
-    }
-    return best;
-}
+const max_forced_bitstate_bits = 1 << 26;
 
-/// The scan anchor for a literal prefix: the offset of its rarest byte.
-/// Computed once at compile time (`regexp.compileInternal`) and carried in
-/// `Accel.prefix_anchor`.
-pub fn prefixAnchor(prefix: []const u8) u32 {
-    if (prefix.len < 2) return 0;
-    return @intCast(rarestByteOffset(prefix));
-}
+/// Everything the engines need from a compiled regexp, bundled so it can be
+/// passed by pointer. Owned by `regexp.Regexp`.
+pub const Engine = struct {
+    prog: *const Prog,
+    onepass: ?*const OnePassProg = null,
+    /// Go's `Regexp.cond`: the program's start condition.
+    cond: EmptyOp,
+    /// Leftmost-longest (POSIX) instead of leftmost-first.
+    longest: bool = false,
+    accel: Accel = .{},
+    /// Test hook: force an engine (not part of the public API).
+    mode: Mode = .auto,
+};
 
 /// A lazily-evaluated pair of boundary runes, for checking zero-width
 /// assertions. Mirrors Go's `lazyFlag`.
@@ -195,70 +148,35 @@ pub const Input = struct {
     }
 };
 
-/// Find the first occurrence of `needle` in `haystack`. Scans for the
-/// needle's *rarest* byte with a vectorized search (`indexOfScalar`) and
-/// verifies the rest around each hit — anchoring on the rarest byte (rust
-/// memmem's heuristic) false-starts far less often than anchoring on the
-/// first byte when the first byte is common. Like Go's bytes.Index, it
-/// switches to Rabin-Karp when the anchor still produces too many false
-/// starts (a periodic needle over a periodic haystack is otherwise O(n·m)).
-fn prefixIndex(haystack: []const u8, needle: []const u8) ?usize {
-    return prefixIndexAnchored(haystack, needle, prefixAnchor(needle));
-}
+/// A position plus the two runes decoded from it: Go's `r, width` /
+/// `r1, width1` pairs in `machine.match` and `doOnePass`, which always read
+/// one rune ahead so the boundary flag between them is at hand.
+const Cursor = struct {
+    pos: usize,
+    r: i32,
+    width: usize,
+    r1: i32,
+    width1: usize,
 
-pub fn prefixIndexAnchored(haystack: []const u8, needle: []const u8, anchor: usize) ?usize {
-    if (needle.len == 0) return 0;
-    if (needle.len == 1) return std.mem.indexOfScalar(u8, haystack, needle[0]);
-    if (haystack.len < needle.len) return null;
-    const tail = needle.len - anchor; // needle bytes at/after the anchor
-    var start: usize = 0; // candidate needle start
-    var fails: usize = 0;
-    while (start + needle.len <= haystack.len) {
-        const found = std.mem.indexOfScalarPos(
-            u8,
-            haystack[0 .. haystack.len - tail + 1],
-            start + anchor,
-            needle[anchor],
-        ) orelse return null;
-        const at = found - anchor;
-        if (std.mem.eql(u8, haystack[at .. at + needle.len], needle)) return at;
-        start = at + 1;
-        fails += 1;
-        if (fails > (at + 16) / 8) { // Go's bytes.Index cutover shape
-            if (indexRabinKarp(haystack[start..], needle)) |j| return start + j;
-            return null;
+    /// Decode the rune at `pos` and the rune after it.
+    inline fn at(input: Input, pos: usize) Cursor {
+        const a = input.step(pos);
+        const b = input.step(pos + a.w); // end_of_text when a is
+        return .{ .pos = pos, .r = a.r, .width = a.w, .r1 = b.r, .width1 = b.w };
+    }
+
+    /// Step over `r`.
+    inline fn advance(c: *Cursor, input: Input) void {
+        c.pos += c.width;
+        c.r = c.r1;
+        c.width = c.width1;
+        if (c.r != end_of_text) {
+            const s = input.step(c.pos + c.width);
+            c.r1 = s.r;
+            c.width1 = s.w;
         }
     }
-    return null;
-}
-
-/// Rabin-Karp substring search, mirroring Go's `internal/bytealg`: worst-case
-/// linear, used as `prefixIndex`'s fallback for pathological inputs.
-fn indexRabinKarp(s: []const u8, sep: []const u8) ?usize {
-    if (s.len < sep.len) return null;
-    const prime_rk: u32 = 16777619;
-    var hashsep: u32 = 0;
-    for (sep) |b| hashsep = hashsep *% prime_rk +% b;
-    var pow: u32 = 1;
-    var sq: u32 = prime_rk;
-    var i = sep.len;
-    while (i > 0) : (i >>= 1) {
-        if (i & 1 != 0) pow *%= sq;
-        sq *%= sq;
-    }
-    var h: u32 = 0;
-    for (s[0..sep.len]) |b| h = h *% prime_rk +% b;
-    if (h == hashsep and std.mem.eql(u8, s[0..sep.len], sep)) return 0;
-    var j = sep.len;
-    while (j < s.len) {
-        h *%= prime_rk;
-        h +%= s[j];
-        h -%= pow *% s[j - sep.len];
-        j += 1;
-        if (h == hashsep and std.mem.eql(u8, s[j - sep.len .. j], sep)) return j - sep.len;
-    }
-    return null;
-}
+};
 
 /// Decode the final rune of `s`, returning U+FFFD on malformed trailing bytes.
 fn decodeLastRune(s: []const u8) i32 {
@@ -285,6 +203,15 @@ const Queue = struct {
     n: usize = 0,
 };
 
+/// A pending step of `Machine.add`: visit `pc` (when non-zero), or restore
+/// capture `slot` to `old` and the leftover thread to `t`.
+const AddFrame = struct {
+    pc: u32 = 0,
+    slot: u32 = 0,
+    old: i64 = 0,
+    t: ?*Thread = null,
+};
+
 /// Reusable per-call storage for the Pike-VM and bitstate engines — the
 /// equivalent of Go's per-`Regexp` `*machine` pool, which this port originally
 /// omitted (it allocated a fresh `Machine` on every match). Allocate a `Scratch`
@@ -303,6 +230,7 @@ pub const Scratch = struct {
     dense0: []Entry = &.{},
     dense1: []Entry = &.{},
     matchcap: []i64 = &.{},
+    add_stack: []AddFrame = &.{}, // Machine.add's work stack, one frame per inst
     pool: std.ArrayList(*Thread) = .empty,
     all_threads: std.ArrayList(*Thread) = .empty,
     pike_ninst: usize = 0, // capacity of s0/s1/dense0/dense1 (grow-only)
@@ -334,6 +262,7 @@ pub const Scratch = struct {
         if (self.dense0.len > 0) a.free(self.dense0);
         if (self.dense1.len > 0) a.free(self.dense1);
         if (self.matchcap.len > 0) a.free(self.matchcap);
+        if (self.add_stack.len > 0) a.free(self.add_stack);
         if (self.work.len > 0) a.free(self.work);
         if (self.visited.len > 0) a.free(self.visited);
         if (self.result.len > 0) a.free(self.result);
@@ -341,8 +270,9 @@ pub const Scratch = struct {
     }
 
     /// Grow the Pike-VM buffers to fit `ninst` instructions and `ncap` capture
-    /// slots. The sparse/dense buffers grow monotonically (oversized buffers are
-    /// harmless — only `[0, ninst)`/`[0, q.n)` are ever touched). When `ncap`
+    /// slots. The sparse/dense buffers and the `add` stack grow monotonically
+    /// (oversized buffers are harmless — only `[0, ninst)`/`[0, q.n)` are ever
+    /// touched). When `ncap`
     /// changes, the pooled threads (whose cap arrays are sized to the previous
     /// `ncap`) are discarded so fresh ones are allocated at the new size; a hot
     /// loop keeps `ncap` constant, so this fires only on the first call.
@@ -355,6 +285,7 @@ pub const Scratch = struct {
             @memset(self.s1, 0);
             try replaceBuffer(Entry, a, &self.dense0, ninst);
             try replaceBuffer(Entry, a, &self.dense1, ninst);
+            try replaceBuffer(AddFrame, a, &self.add_stack, ninst);
             self.pike_ninst = ninst;
         }
         if (ncap != self.thread_ncap) {
@@ -372,7 +303,7 @@ pub const Scratch = struct {
     /// Borrow bitstate work/visited buffers, growing each to a high-water mark
     /// and reslicing to the lengths this call needs. `visited` is a per-run set
     /// and is zeroed by the caller every run; only its allocation is reused.
-    fn bitBufs(self: *Scratch, ncap: usize, visited_size: usize) !struct { work: []i64, visited: []u32 } {
+    pub fn bitBufs(self: *Scratch, ncap: usize, visited_size: usize) !struct { work: []i64, visited: []u32 } {
         const a = self.allocator;
         if (ncap > self.work.len) {
             try replaceBuffer(i64, a, &self.work, ncap);
@@ -407,8 +338,7 @@ const Machine = struct {
     longest: bool,
     cond: EmptyOp,
     ncap: usize,
-    accel: Accel,
-    prefix_rune: i32,
+    accel: *const Accel,
     q0: Queue,
     q1: Queue,
     matched: bool = false,
@@ -419,26 +349,15 @@ const Machine = struct {
     /// scratch outlives the Machine. Fresh sparse storage is initialized because
     /// Zig does not permit reading undefined integers. Reused sparse entries
     /// need no clearing: the dense cross-check rejects stale indices.
-    fn init(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, accel: Accel, ncap: usize) !Machine {
-        const ninst = p.insts.len;
-        try scratch.ensurePike(ninst, ncap);
-        var prune: i32 = -1;
-        const prefix = accel.prefix;
-        if (prefix.len > 0) {
-            const n = std.unicode.utf8ByteSequenceLength(prefix[0]) catch 1;
-            prune = if (n <= prefix.len)
-                @intCast(std.unicode.utf8Decode(prefix[0..n]) catch 0xFFFD)
-            else
-                0xFFFD;
-        }
+    fn init(scratch: *Scratch, e: *const Engine, ncap: usize) !Machine {
+        try scratch.ensurePike(e.prog.insts.len, ncap);
         return .{
             .scratch = scratch,
-            .p = p,
-            .longest = longest,
-            .cond = cond,
+            .p = e.prog,
+            .longest = e.longest,
+            .cond = e.cond,
             .ncap = ncap,
-            .accel = accel,
-            .prefix_rune = prune,
+            .accel = &e.accel,
             .q0 = .{ .sparse = scratch.s0, .dense = scratch.dense0 },
             .q1 = .{ .sparse = scratch.s1, .dense = scratch.dense1 },
             .matchcap = scratch.matchcap,
@@ -477,64 +396,85 @@ const Machine = struct {
 
     /// Add pc (and its epsilon-closure under `cond`) to queue `q`, threading
     /// `cap` through capture instructions. Returns the (possibly reusable)
-    /// leftover thread. Mirrors Go's `machine.add`.
+    /// leftover thread. Mirrors Go's `machine.add`, but iterative: Go recurses
+    /// on the `out` branch of an alternation and on the body of a capture,
+    /// which its growable goroutine stacks absorb; a native stack would
+    /// overflow on large programs (e.g. 100k `a??` in a row). Like RE2's
+    /// `AddToThreadq`, pending work goes on an explicit stack instead, in
+    /// the same depth-first order: an alternation follows `out` at once and
+    /// leaves `arg` on the stack; a capture leaves a frame that restores the
+    /// slot (and the caller's leftover thread, which the recursive version
+    /// keeps across the body) once the body is done.
     fn add(m: *Machine, q: *Queue, pc_in: u32, pos: usize, cap: []i64, cond: *const LazyFlag, t_in: ?*Thread) !?*Thread {
+        // Every frame is pushed while visiting an instruction that was just
+        // inserted into `q`, so the depth never exceeds the program length.
+        const stack = m.scratch.add_stack;
+        var depth: usize = 0;
         var pc = pc_in;
         var t = t_in;
         while (true) {
-            if (pc == 0) return t;
-            const sp = q.sparse[pc];
-            if (sp < q.n and q.dense[sp].pc == pc) return t;
+            visit: while (true) {
+                if (pc == 0) break :visit;
+                const sp = q.sparse[pc];
+                if (sp < q.n and q.dense[sp].pc == pc) break :visit;
 
-            const j = q.n;
-            q.sparse[pc] = @intCast(j);
-            q.dense[j] = .{ .pc = pc, .t = null };
-            q.n += 1;
+                const j = q.n;
+                q.sparse[pc] = @intCast(j);
+                q.dense[j] = .{ .pc = pc, .t = null };
+                q.n += 1;
 
-            const i = &m.p.insts[pc];
-            switch (i.op) {
-                .fail => return t,
-                .alt, .alt_match => {
-                    t = try m.add(q, i.out, pos, cap, cond, t);
-                    pc = i.arg;
-                    continue;
-                },
-                .empty_width => {
-                    if (cond.match(@intCast(i.arg))) {
+                const i = &m.p.insts[pc];
+                switch (i.op) {
+                    .fail => break :visit,
+                    .alt, .alt_match => {
+                        if (i.arg != 0) {
+                            stack[depth] = .{ .pc = i.arg };
+                            depth += 1;
+                        }
                         pc = i.out;
-                        continue;
-                    }
-                    return t;
-                },
-                .nop => {
-                    pc = i.out;
-                    continue;
-                },
-                .capture => {
-                    if (i.arg < cap.len) {
-                        const opos = cap[i.arg];
-                        cap[i.arg] = @intCast(pos);
-                        _ = try m.add(q, i.out, pos, cap, cond, null);
-                        cap[i.arg] = opos;
-                        return t;
-                    }
-                    pc = i.out;
-                    continue;
-                },
-                .match, .rune, .rune1, .rune_any, .rune_any_not_nl => {
-                    var th: *Thread = undefined;
-                    if (t) |existing| {
-                        existing.pc = pc;
-                        th = existing;
-                    } else {
-                        th = try m.alloc(pc);
-                    }
-                    if (cap.len > 0 and th.cap.ptr != cap.ptr) {
-                        @memcpy(th.cap, cap);
-                    }
-                    q.dense[j].t = th;
-                    return null;
-                },
+                    },
+                    .empty_width => {
+                        if (!cond.match(@intCast(i.arg))) break :visit;
+                        pc = i.out;
+                    },
+                    .nop => pc = i.out,
+                    .capture => {
+                        if (i.arg < cap.len) {
+                            stack[depth] = .{ .slot = i.arg, .old = cap[i.arg], .t = t };
+                            depth += 1;
+                            cap[i.arg] = @intCast(pos);
+                            t = null;
+                        }
+                        pc = i.out;
+                    },
+                    .match, .rune, .rune1, .rune_any, .rune_any_not_nl => {
+                        var th: *Thread = undefined;
+                        if (t) |existing| {
+                            existing.pc = pc;
+                            th = existing;
+                        } else {
+                            th = try m.alloc(pc);
+                        }
+                        if (cap.len > 0 and th.cap.ptr != cap.ptr) {
+                            @memcpy(th.cap, cap);
+                        }
+                        q.dense[j].t = th;
+                        t = null;
+                        break :visit;
+                    },
+                }
+            }
+            // This path is done: unwind to the next pending alternative.
+            while (true) {
+                if (depth == 0) return t;
+                depth -= 1;
+                const f = stack[depth];
+                if (f.pc != 0) {
+                    pc = f.pc;
+                    break;
+                }
+                cap[f.slot] = f.old;
+                t = f.t;
             }
         }
     }
@@ -586,82 +526,61 @@ const Machine = struct {
     /// Run the machine over `input` starting at `pos`; returns whether a match
     /// was found, leaving the submatch positions in `m.matchcap`.
     /// Mirrors Go's `machine.match`.
-    fn run(m: *Machine, input: Input, pos_in: usize) !bool {
-        var pos = pos_in;
+    fn run(m: *Machine, input: Input, pos: usize) !bool {
         if (m.cond == prog.impossible) return false;
         m.matched = false;
         for (m.matchcap) |*x| x.* = -1;
 
         var runq = &m.q0;
         var nextq = &m.q1;
-        var r: i32 = end_of_text;
-        var r1: i32 = end_of_text;
-        var width: usize = 0;
-        var width1: usize = 0;
-        const s0 = input.step(pos);
-        r = s0.r;
-        width = s0.w;
-        if (r != end_of_text) {
-            const s1 = input.step(pos + width);
-            r1 = s1.r;
-            width1 = s1.w;
-        }
-        var flag: LazyFlag = if (pos == 0) LazyFlag.init(-1, r) else input.context(pos);
+        var c = Cursor.at(input, pos);
+        var flag: LazyFlag = if (pos == 0) LazyFlag.init(-1, c.r) else input.context(pos);
+        // Loop invariants, read once: the per-position checks below would
+        // otherwise reload them through `m.accel` at every input byte.
+        const accel = m.accel;
+        const prefix = accel.prefix;
+        const fbytes = &accel.first_bytes;
+        const has_first_bytes = fbytes.bytes.len > 0;
+        const start_anywhere = m.cond & prog.empty_begin_text == 0;
 
         while (true) {
             if (runq.n == 0) {
-                if (m.cond & prog.empty_begin_text != 0 and pos != 0) break; // anchored, past start
+                if (!start_anywhere and c.pos != 0) break; // anchored, past start
                 if (m.matched) break; // have match, done exploring
                 // Literal-prefix acceleration: every match must start with the
                 // prefix, so fast-forward to its next occurrence (memchr-class
                 // substring search) instead of stepping the NFA at every byte.
-                if (m.accel.prefix.len > 0 and r1 != m.prefix_rune and pos <= input.s.len) {
-                    if (prefixIndexAnchored(input.s[pos..], m.accel.prefix, m.accel.prefix_anchor)) |adv| {
-                        pos += adv;
-                        const sa = input.step(pos);
-                        r = sa.r;
-                        width = sa.w;
-                        const sb = input.step(pos + width);
-                        r1 = sb.r;
-                        width1 = sb.w;
-                    } else break;
-                } else if (m.accel.first_bytes.len > 0 and !inFirstBytes(m.accel.first_bytes, r) and pos <= input.s.len) {
+                if (prefix.len > 0 and c.r1 != accel.prefix_rune) {
+                    const adv = search.prefixIndexAnchored(input.s[c.pos..], prefix, accel.prefix_anchor) orelse break;
+                    c = Cursor.at(input, c.pos + adv);
+                } else if (has_first_bytes and !fbytes.containsRune(c.r)) {
                     // First-byte acceleration: no literal prefix, but every
                     // match starts with one of a few ASCII bytes (e.g. a
                     // case-insensitive literal or a small leading class), so
                     // scan ahead to the next candidate. Unlike the prefix
                     // path, the closure may pass zero-width assertions, so
                     // the boundary flag must be recomputed for the new pos.
-                    if (indexOfAnyByte(input.s[pos..], m.accel.first_bytes)) |adv| {
-                        if (adv > 0) {
-                            pos += adv;
-                            const sa = input.step(pos);
-                            r = sa.r;
-                            width = sa.w;
-                            const sb = input.step(pos + width);
-                            r1 = sb.r;
-                            width1 = sb.w;
-                            flag = input.context(pos);
-                        }
-                    } else break;
+                    const adv = search.indexOfAnyByte(input.s[c.pos..], fbytes) orelse break;
+                    if (adv > 0) {
+                        c = Cursor.at(input, c.pos + adv);
+                        flag = input.context(c.pos);
+                    }
                 }
             }
-            if (!m.matched) {
-                if (m.matchcap.len > 0) m.matchcap[0] = @intCast(pos);
-                _ = try m.add(runq, m.p.start, pos, m.matchcap, &flag, null);
+            // A new thread starts at every position until a match is found,
+            // except that an anchored program can only start at 0. Go 1.27
+            // adds the start thread anyway and lets the `\A` assertion fail
+            // in `add`; RE2's guard skips that dead closure walk without
+            // changing any result.
+            if (!m.matched and (start_anywhere or c.pos == 0)) {
+                if (m.matchcap.len > 0) m.matchcap[0] = @intCast(c.pos);
+                _ = try m.add(runq, m.p.start, c.pos, m.matchcap, &flag, null);
             }
-            flag = LazyFlag.init(r, r1);
-            try m.step(runq, nextq, pos, pos + width, r, &flag);
-            if (width == 0) break;
+            flag = LazyFlag.init(c.r, c.r1);
+            try m.step(runq, nextq, c.pos, c.pos + c.width, c.r, &flag);
+            if (c.width == 0) break;
             if (m.matchcap.len == 0 and m.matched) break; // match-only, any match will do
-            pos += width;
-            r = r1;
-            width = width1;
-            if (r != end_of_text) {
-                const sc = input.step(pos + width);
-                r1 = sc.r;
-                width1 = sc.w;
-            }
+            c.advance(input);
             const tmp = runq;
             runq = nextq;
             nextq = tmp;
@@ -671,247 +590,26 @@ const Machine = struct {
     }
 };
 
-// --- bitstate backtracker (Go's backtrack.go) ---
-//
-// For small programs and inputs, a backtracking search with a (pc, pos)
-// visited bitmap is faster than the Pike VM while staying linear-time. This is
-// the engine Go dispatches to for these cases; porting it closes the one
-// remaining performance gap (small nested-quantifier patterns).
-
-const max_backtrack_prog = 500; // only programs with <= this many insts
-const max_backtrack_vector = 256 * 1024; // visited bitmap size cap, in bits
-const visited_bits = 32;
-
-const Job = struct { pc: u32, arg: bool, pos: i64 };
-
-const BitState = struct {
-    allocator: std.mem.Allocator,
-    p: *const Prog,
-    input: Input,
-    longest: bool,
-    end: usize,
-    cap: []i64, // working capture registers
-    matchcap: []i64, // best match captures (the result)
-    jobs: *std.ArrayList(Job), // borrowed from Scratch, reused across calls
-    visited: []u32,
-
-    fn shouldVisit(b: *BitState, pc: u32, pos: i64) bool {
-        const n: usize = @as(usize, pc) * (b.end + 1) + @as(usize, @intCast(pos));
-        const word = n / visited_bits;
-        const bit = @as(u32, 1) << @intCast(n & (visited_bits - 1));
-        if (b.visited[word] & bit != 0) return false;
-        b.visited[word] |= bit;
-        return true;
-    }
-
-    fn push(b: *BitState, pc: u32, pos: i64, arg: bool) !void {
-        if (b.p.insts[pc].op != .fail and (arg or b.shouldVisit(pc, pos))) {
-            try b.jobs.append(b.allocator, .{ .pc = pc, .arg = arg, .pos = pos });
-        }
-    }
-
-    fn tryBacktrack(b: *BitState, start_pc: u32, start_pos: i64) !bool {
-        const longest = b.longest;
-        try b.push(start_pc, start_pos, false);
-        while (b.jobs.items.len > 0) {
-            const j = b.jobs.pop().?;
-            var pc = j.pc;
-            var pos = j.pos;
-            var arg = j.arg;
-            var need_check = false; // first processing of a popped job skips the visit check
-            process: while (true) {
-                if (need_check and !b.shouldVisit(pc, pos)) break :process;
-                need_check = true;
-                const inst = &b.p.insts[pc];
-                switch (inst.op) {
-                    .fail => unreachable,
-                    .alt => {
-                        if (arg) {
-                            arg = false;
-                            pc = inst.arg;
-                            continue :process;
-                        }
-                        try b.push(pc, pos, true); // revisit to try inst.arg later
-                        pc = inst.out;
-                        continue :process;
-                    },
-                    .alt_match => {
-                        const oop = b.p.insts[inst.out].op;
-                        if (oop == .rune or oop == .rune1 or oop == .rune_any or oop == .rune_any_not_nl) {
-                            try b.push(inst.arg, pos, false);
-                            pc = inst.arg;
-                            pos = @intCast(b.end);
-                            continue :process;
-                        }
-                        try b.push(inst.out, @intCast(b.end), false);
-                        pc = inst.out;
-                        continue :process;
-                    },
-                    .rune => {
-                        const s = b.input.step(@intCast(pos));
-                        if (s.r < 0 or !b.p.matchRuneAt(pc, @intCast(s.r))) break :process;
-                        pos += @intCast(s.w);
-                        pc = inst.out;
-                        continue :process;
-                    },
-                    .rune1 => {
-                        const s = b.input.step(@intCast(pos));
-                        if (s.r != @as(i32, @intCast(inst.runes[0]))) break :process;
-                        pos += @intCast(s.w);
-                        pc = inst.out;
-                        continue :process;
-                    },
-                    .rune_any_not_nl => {
-                        const s = b.input.step(@intCast(pos));
-                        if (s.r == '\n' or s.r == end_of_text) break :process;
-                        pos += @intCast(s.w);
-                        pc = inst.out;
-                        continue :process;
-                    },
-                    .rune_any => {
-                        const s = b.input.step(@intCast(pos));
-                        if (s.r == end_of_text) break :process;
-                        pos += @intCast(s.w);
-                        pc = inst.out;
-                        continue :process;
-                    },
-                    .capture => {
-                        if (arg) {
-                            // Finished inst.out; restore the saved value.
-                            b.cap[inst.arg] = pos;
-                            break :process;
-                        }
-                        if (inst.arg < b.cap.len) {
-                            try b.push(pc, b.cap[inst.arg], true); // come back to restore
-                            b.cap[inst.arg] = pos;
-                        }
-                        pc = inst.out;
-                        continue :process;
-                    },
-                    .empty_width => {
-                        const flag = b.input.context(@intCast(pos));
-                        if (!flag.match(@intCast(inst.arg))) break :process;
-                        pc = inst.out;
-                        continue :process;
-                    },
-                    .nop => {
-                        pc = inst.out;
-                        continue :process;
-                    },
-                    .match => {
-                        if (b.cap.len == 0) return true;
-                        if (b.cap.len > 1) b.cap[1] = pos;
-                        const old = b.matchcap[1];
-                        if (old == -1 or (longest and pos > 0 and pos > old)) {
-                            @memcpy(b.matchcap, b.cap);
-                        }
-                        if (!longest) return true;
-                        if (pos == @as(i64, @intCast(b.end))) return true;
-                        break :process; // hope for a longer match
-                    },
-                }
-            }
-        }
-        return longest and b.matchcap.len > 1 and b.matchcap[1] >= 0;
-    }
-};
-
-fn backtrack(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, accel: Accel, input: Input, pos: usize, caps: []i64) !bool {
-    if (cond == prog.impossible) return false;
-    if (cond & prog.empty_begin_text != 0 and pos != 0) return false;
-
-    const ninst = p.insts.len;
-    const end = input.s.len;
-    const visited_size = (ninst * (end + 1) + visited_bits - 1) / visited_bits;
-
-    // Reuse work/visited from the scratch; only the allocation is amortised —
-    // both are reset below, so no stale state carries between calls.
-    const bufs = try scratch.bitBufs(caps.len, visited_size);
-    const work = bufs.work;
-    const visited = bufs.visited;
-    @memset(work, -1);
-    @memset(caps, -1);
-    @memset(visited, 0);
-
-    scratch.jobs.clearRetainingCapacity();
-    var b = BitState{
-        .allocator = scratch.allocator,
-        .p = p,
-        .input = input,
-        .longest = longest,
-        .end = end,
-        .cap = work,
-        .matchcap = caps,
-        .visited = visited,
-        .jobs = &scratch.jobs,
-    };
-
-    if (cond & prog.empty_begin_text != 0) {
-        if (b.cap.len > 0) b.cap[0] = @intCast(pos);
-        return try b.tryBacktrack(p.start, @intCast(pos));
-    }
-
-    // Unanchored: try each start position. The visited bitmap is shared across
-    // calls (never cleared), so total work stays linear.
-    var p_pos: i64 = @intCast(pos);
-    var width: i64 = -1;
-    const end_i: i64 = @intCast(end);
-    while (p_pos <= end_i and width != 0) {
-        if (accel.prefix.len > 0) {
-            const adv = prefixIndexAnchored(input.s[@intCast(p_pos)..], accel.prefix, accel.prefix_anchor) orelse return false;
-            p_pos += @intCast(adv);
-        } else if (accel.first_bytes.len > 0) {
-            // No literal prefix, but every match starts with one of a few
-            // ASCII bytes: jump to the next candidate start.
-            const adv = indexOfAnyByte(input.s[@intCast(p_pos)..], accel.first_bytes) orelse return false;
-            p_pos += @intCast(adv);
-        }
-        if (b.cap.len > 0) b.cap[0] = p_pos;
-        if (try b.tryBacktrack(p.start, p_pos)) return true; // leftmost match, done
-        width = @intCast(input.step(@intCast(p_pos)).w);
-        p_pos += width;
-    }
-    return false;
-}
-
 /// The one-pass engine: a single deterministic pass following per-instruction
 /// `Next` dispatch tables. Used only for qualifying anchored regexps. Mirrors
 /// Go's `doOnePass`.
-fn doOnePass(op: *const OnePassProg, cond: EmptyOp, accel: Accel, input: Input, pos0: usize, caps: []i64) bool {
+fn doOnePass(op: *const OnePassProg, cond: EmptyOp, input: Input, pos: usize, caps: []i64) bool {
     if (cond == prog.impossible) return false;
-    var pos = pos0;
-    for (caps) |*c| c.* = -1;
+    for (caps) |*x| x.* = -1;
 
-    var r: i32 = end_of_text;
-    var r1: i32 = end_of_text;
-    var width: usize = 0;
-    var width1: usize = 0;
-    const s0 = input.step(pos);
-    r = s0.r;
-    width = s0.w;
-    if (r != end_of_text) {
-        const s1 = input.step(pos + width);
-        r1 = s1.r;
-        width1 = s1.w;
-    }
-    var flag: LazyFlag = if (pos == 0) LazyFlag.init(-1, r) else input.context(pos);
+    var c = Cursor.at(input, pos);
+    var flag: LazyFlag = if (pos == 0) LazyFlag.init(-1, c.r) else input.context(pos);
     var pc = op.start;
     var matched = false;
 
     // If there is a simple literal prefix, skip over it and resume at
-    // `accel.prefix_end` (the prefix crosses no capture instructions, so no
+    // `op.prefix_end` (the prefix crosses no capture instructions, so no
     // recorded state is lost). Mirrors Go's `doOnePass`.
-    if (pos == 0 and flag.match(@intCast(op.insts[pc].arg)) and accel.prefix.len > 0) {
-        if (!std.mem.startsWith(u8, input.s, accel.prefix)) return false;
-        pos += accel.prefix.len;
-        const sa = input.step(pos);
-        r = sa.r;
-        width = sa.w;
-        const sb = input.step(pos + width);
-        r1 = sb.r;
-        width1 = sb.w;
-        flag = input.context(pos);
-        pc = accel.prefix_end;
+    if (pos == 0 and flag.match(@intCast(op.insts[pc].arg)) and op.prefix.len > 0) {
+        if (!std.mem.startsWith(u8, input.s, op.prefix)) return false;
+        c = Cursor.at(input, op.prefix.len);
+        flag = input.context(c.pos);
+        pc = op.prefix_end;
     }
 
     loop: while (true) {
@@ -922,16 +620,16 @@ fn doOnePass(op: *const OnePassProg, cond: EmptyOp, accel: Accel, input: Input, 
                 matched = true;
                 if (caps.len > 0) {
                     caps[0] = 0;
-                    caps[1] = @intCast(pos);
+                    caps[1] = @intCast(c.pos);
                 }
                 break :loop;
             },
-            .rune => if (r < 0 or prog.matchRunePos(inst.runes, inst.arg, @intCast(r)) < 0) break :loop,
-            .rune1 => if (r != @as(i32, @intCast(inst.runes[0]))) break :loop,
+            .rune => if (c.r < 0 or prog.matchRunePos(inst.runes, inst.arg, @intCast(c.r)) < 0) break :loop,
+            .rune1 => if (c.r != @as(i32, @intCast(inst.runes[0]))) break :loop,
             .rune_any => {},
-            .rune_any_not_nl => if (r == '\n') break :loop,
+            .rune_any_not_nl => if (c.r == '\n') break :loop,
             .alt, .alt_match => {
-                pc = onepass.onePassNext(inst, r);
+                pc = onepass.onePassNext(inst, c.r);
                 continue :loop;
             },
             .fail => break :loop,
@@ -941,21 +639,14 @@ fn doOnePass(op: *const OnePassProg, cond: EmptyOp, accel: Accel, input: Input, 
                 continue :loop;
             },
             .capture => {
-                if (inst.arg < caps.len) caps[@intCast(inst.arg)] = @intCast(pos);
+                if (inst.arg < caps.len) caps[@intCast(inst.arg)] = @intCast(c.pos);
                 continue :loop;
             },
         }
         // Reached only by the rune-consuming instructions: advance one rune.
-        if (width == 0) break :loop;
-        flag = LazyFlag.init(r, r1);
-        pos += width;
-        r = r1;
-        width = width1;
-        if (r != end_of_text) {
-            const sc = input.step(pos + width);
-            r1 = sc.r;
-            width1 = sc.w;
-        }
+        if (c.width == 0) break :loop;
+        flag = LazyFlag.init(c.r, c.r1);
+        c.advance(input);
     }
     return matched;
 }
@@ -965,29 +656,31 @@ fn doOnePass(op: *const OnePassProg, cond: EmptyOp, accel: Accel, input: Input, 
 /// recorded; pairs are [start,end], -1 when unset). Returns whether a match was
 /// found. `caps` is only meaningful when `true` is returned.
 ///
-/// Dispatches like Go: the one-pass engine if the regexp qualifies, else the
-/// bitstate backtracker for small programs/inputs, else the Pike VM.
+/// Dispatches like Go's `(*Regexp).find`: the one-pass engine if the regexp
+/// qualifies, else the bitstate backtracker for small programs/inputs, else
+/// the Pike VM (`e.mode` overrides this for tests).
 ///
-/// Reuse variant: borrows all engine storage from `scratch`, so a steady-state
-/// loop over one compiled program allocates nothing. The one-pass path never
-/// allocated and ignores the scratch.
-pub fn executeReuse(
-    scratch: *Scratch,
-    p: *const Prog,
-    op: ?*const OnePassProg,
-    longest: bool,
-    cond: EmptyOp,
-    accel: Accel,
-    input: Input,
-    pos: usize,
-    caps: []i64,
-) !bool {
-    if (op) |onep| return doOnePass(onep, cond, accel, input, pos, caps);
-    const ninst = p.insts.len;
-    if (ninst <= max_backtrack_prog and ninst > 0 and input.s.len < max_backtrack_vector / ninst) {
-        return backtrack(scratch, p, longest, cond, accel, input, pos, caps);
+/// Borrows all engine storage from `scratch`, so a steady-state loop over one
+/// compiled program allocates nothing. The one-pass path never allocates and
+/// ignores the scratch.
+pub fn executeReuse(scratch: *Scratch, e: *const Engine, input: Input, pos: usize, caps: []i64) !bool {
+    const ninst = e.prog.insts.len;
+    switch (e.mode) {
+        .auto => if (e.onepass) |op| return doOnePass(op, e.cond, input, pos, caps),
+        .no_onepass => {},
+        .pike => return pike(scratch, e, input, pos, caps),
+        .bitstate => if (ninst * (input.s.len + 1) <= max_forced_bitstate_bits) {
+            return backtrack_.backtrack(scratch, e, input, pos, caps);
+        },
     }
-    var m = try Machine.init(scratch, p, longest, cond, accel, caps.len);
+    if (ninst <= backtrack_.max_backtrack_prog and input.s.len < backtrack_.max_backtrack_vector / ninst) {
+        return backtrack_.backtrack(scratch, e, input, pos, caps);
+    }
+    return pike(scratch, e, input, pos, caps);
+}
+
+fn pike(scratch: *Scratch, e: *const Engine, input: Input, pos: usize, caps: []i64) !bool {
+    var m = try Machine.init(scratch, e, caps.len);
     if (!try m.run(input, pos)) return false;
     @memcpy(caps, m.matchcap);
     return true;
@@ -1001,84 +694,6 @@ test "decodeLastRune handles ASCII, multibyte, and malformed tails" {
     try expectEqual(@as(i32, 0xFFFD), decodeLastRune("\xE6\x97")); // truncated lead
     try expectEqual(@as(i32, 0xFFFD), decodeLastRune("a\x80")); // lone continuation
     try expectEqual(@as(i32, 0xFFFD), decodeLastRune("\xFF")); // invalid byte
-}
-
-test "prefixIndex finds first occurrence or null" {
-    const expectEqual = std.testing.expectEqual;
-    try expectEqual(@as(?usize, 0), prefixIndex("hello", ""));
-    try expectEqual(@as(?usize, 1), prefixIndex("xyz", "y"));
-    try expectEqual(@as(?usize, 2), prefixIndex("ababc", "abc")); // first-byte false start
-    try expectEqual(@as(?usize, null), prefixIndex("ababab", "abc"));
-    try expectEqual(@as(?usize, null), prefixIndex("ab", "abc")); // needle longer than haystack
-}
-
-test "indexOfAnyByte agrees with the scalar std search" {
-    var prng = std.Random.DefaultPrng.init(42);
-    const rand = prng.random();
-    var hay: [300]u8 = undefined;
-    for (&hay) |*b| b.* = 'a' + rand.uintLessThan(u8, 20);
-    const sets = [_][]const u8{
-        "xy",
-        "qzv",
-        "abcd",
-        "abcdefghijklmnop", // max_first_bytes = 16
-        "QZ", // absent from the haystack
-    };
-    // Slide both endpoints so hits land before, inside, and after the last
-    // full SIMD chunk, plus empty and sub-width slices.
-    for (sets) |set| {
-        var lo: usize = 0;
-        while (lo < hay.len) : (lo += 37) {
-            var hi = lo;
-            while (hi <= hay.len) : (hi += 23) {
-                const want = std.mem.indexOfAny(u8, hay[lo..hi], set);
-                try std.testing.expectEqual(want, indexOfAnyByte(hay[lo..hi], set));
-            }
-        }
-    }
-}
-
-test "prefixIndex anchors on the rarest byte" {
-    // 'x' is rarer than 'a'/'e'; a common-first-byte needle must still be
-    // found correctly wherever it sits.
-    try std.testing.expectEqual(@as(?usize, 6), prefixIndex("aeaeaeaext", "aext"));
-    try std.testing.expectEqual(@as(?usize, 0), prefixIndex("aext", "aext"));
-    try std.testing.expectEqual(@as(?usize, null), prefixIndex("aeaeaeae", "aext"));
-}
-
-test "prefixIndex Rabin-Karp fallback on periodic input" {
-    const expectEqual = std.testing.expectEqual;
-    const hay = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"; // 39 a's + b
-    try expectEqual(@as(?usize, 35), prefixIndex(hay, "aaaab"));
-    try expectEqual(@as(?usize, null), prefixIndex(hay[0..39], "aaaab"));
-    // A needle whose rarest byte is itself the periodic byte: every anchor
-    // hit is a false start, so the cutover to Rabin-Karp fires.
-    const hay2 = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxy"; // 30 x's + y
-    try expectEqual(@as(?usize, 26), prefixIndex(hay2, "xxxxy"));
-    try expectEqual(@as(?usize, null), prefixIndex(hay2[0..30], "xxxxy"));
-    try expectEqual(@as(?usize, 0), indexRabinKarp("abcabd", "abc"));
-    try expectEqual(@as(?usize, 3), indexRabinKarp("abdabc", "abc"));
-    try expectEqual(@as(?usize, null), indexRabinKarp("ab", "abc"));
-}
-
-/// Allocating variant: the existing public entry point. Wraps `executeReuse`
-/// with a temporary scratch, so each call allocates and frees its engine
-/// storage exactly as before — and the differential suite (which routes through
-/// here) validates the shared `executeReuse` code path.
-pub fn execute(
-    allocator: std.mem.Allocator,
-    p: *const Prog,
-    op: ?*const OnePassProg,
-    longest: bool,
-    cond: EmptyOp,
-    accel: Accel,
-    input: Input,
-    pos: usize,
-    caps: []i64,
-) !bool {
-    var scratch = Scratch.init(allocator);
-    defer scratch.deinit();
-    return executeReuse(&scratch, p, op, longest, cond, accel, input, pos, caps);
 }
 
 fn exerciseScratchGrowth(allocator: std.mem.Allocator) !void {

@@ -1,0 +1,343 @@
+//! Substring and byte-set search used by the engines to skip ahead to the
+//! next possible match start. Nothing here has a Go `regexp` counterpart: Go
+//! calls `bytes.Index`/`strings.Index` for its literal-prefix scan, and it
+//! has no first-byte prefilter at all.
+
+const std = @import("std");
+
+/// Max size of the accelerated first-byte set. The SIMD scan's cost grows
+/// only slowly with the set size; past ~16 bytes the set stops *filtering*
+/// (too many positions qualify) rather than costing too much to scan.
+pub const max_first_bytes = 16;
+
+/// The SIMD width `indexOfAnyByte` scans with; null on targets without
+/// vector registers, where it falls back to a scalar loop.
+const vector_len = std.simd.suggestVectorLength(u8);
+const ByteVec = @Vector(vector_len orelse 1, u8);
+
+/// A small set of ASCII bytes, prepared once (at regexp compile time) for
+/// membership tests and for `indexOfAnyByte`.
+pub const ByteSet = struct {
+    /// The members, ascending; empty for "no set".
+    bytes: []const u8 = "",
+    /// Bit b set iff byte b is a member.
+    bitmap: u128 = 0,
+    /// `bytes[k]` broadcast across a vector, so a scan does not rebuild the
+    /// comparison operands on every call.
+    splats: [max_first_bytes]ByteVec = @splat(@splat(0)),
+
+    /// `bytes` must hold 1 to `max_first_bytes` ASCII bytes and outlive
+    /// the set.
+    pub fn init(bytes: []const u8) ByteSet {
+        std.debug.assert(bytes.len >= 1 and bytes.len <= max_first_bytes);
+        var s: ByteSet = .{ .bytes = bytes };
+        for (bytes, 0..) |b, k| {
+            std.debug.assert(b < 0x80);
+            s.bitmap |= @as(u128, 1) << @intCast(b);
+            s.splats[k] = @splat(b);
+        }
+        return s;
+    }
+
+    /// Whether the rune `r` (negative: end of text) is a member.
+    pub inline fn containsRune(s: *const ByteSet, r: i32) bool {
+        if (r < 0 or r > 0x7F) return false;
+        return (s.bitmap >> @intCast(r)) & 1 != 0;
+    }
+};
+
+/// Vectorized first-index-of-any-byte — the memchr2/…/memchr16 analogue used
+/// by the first-byte prefilter. One portable implementation: `@Vector`
+/// compiles to NEON on aarch64, SSE2 on baseline x86_64 (wider with
+/// `-Dcpu=native` on AVX2 machines), and degrades to a scalar loop on
+/// targets without SIMD registers.
+pub fn indexOfAnyByte(haystack: []const u8, set: *const ByteSet) ?usize {
+    const n = set.bytes.len;
+    std.debug.assert(n >= 1 and n <= max_first_bytes);
+    if (n == 1) return std.mem.indexOfScalar(u8, haystack, set.bytes[0]);
+    var i: usize = 0;
+    if (vector_len) |width| {
+        const Mask = @Int(.unsigned, width);
+        const splats = set.splats[0..n];
+        while (i + width <= haystack.len) : (i += width) {
+            const chunk: ByteVec = haystack[i..][0..width].*;
+            var mask: Mask = 0;
+            for (splats) |s| mask |= @as(Mask, @bitCast(chunk == s));
+            if (mask != 0) return i + @ctz(mask);
+        }
+    }
+    while (i < haystack.len) : (i += 1) {
+        if (set.containsRune(haystack[i])) return i;
+    }
+    return null;
+}
+
+/// Heuristic byte-frequency ranks (higher = more common in typical text and
+/// code). Only the relative order matters: `prefixIndex` anchors its scan on
+/// the needle's lowest-ranked byte, the idea behind rust-memmem's rare-byte
+/// heuristic — scanning for `-` or `@` false-starts far less often than
+/// scanning for `a`.
+const byte_rank: [256]u8 = blk: {
+    @setEvalBranchQuota(10_000);
+    var r: [256]u8 = @splat(15);
+    for (0..0x20) |c| r[c] = 3; // control bytes: rare
+    r['\n'] = 180;
+    r['\t'] = 120;
+    r[' '] = 255;
+    const order = "etaoinsrhldcumfpgwybvkxjqz"; // approximate English order
+    for (order, 0..) |c, idx| {
+        const common: u8 = 240 - @as(u8, @intCast(idx)) * 6;
+        r[c] = common;
+        r[std.ascii.toUpper(c)] = common / 3;
+    }
+    for ('0'..'9' + 1) |c| r[c] = 100;
+    for (".,-_'\"()/:;=") |c| r[c] = 90;
+    for (0x80..0x100) |c| r[c] = 30; // UTF-8 lead/continuation bytes
+    break :blk r;
+};
+
+fn rarestByteOffset(needle: []const u8) usize {
+    var best: usize = 0;
+    for (needle, 0..) |b, i| {
+        if (byte_rank[b] < byte_rank[needle[best]]) best = i;
+    }
+    return best;
+}
+
+/// The scan anchor for a literal prefix: the offset of its rarest byte.
+/// Computed once at compile time (`regexp.compileInternal`) and carried in
+/// `Accel.prefix_anchor`.
+pub fn prefixAnchor(prefix: []const u8) u32 {
+    if (prefix.len < 2) return 0;
+    return @intCast(rarestByteOffset(prefix));
+}
+
+/// Find the first occurrence of `needle` in `haystack`, given `anchor =
+/// prefixAnchor(needle)`. Scans for the needle's *rarest* byte with a
+/// vectorized search (`indexOfScalar`) and verifies the needle around each
+/// hit — anchoring on the rarest byte (rust memmem's heuristic) false-starts
+/// far less often than anchoring on the first byte when the first byte is
+/// common. Go's `bytes.Index` instead scans for the first byte and counts
+/// false starts; here the cutover to Rabin-Karp is cost-based (see
+/// `indexAnchored`), which keeps the search linear for any needle.
+pub fn prefixIndexAnchored(haystack: []const u8, needle: []const u8, anchor: usize) ?usize {
+    return indexAnchored(haystack, needle, anchor, null);
+}
+
+/// Work done by one `indexAnchored` call, for tests.
+const SearchStats = struct {
+    /// Cost units spent on candidates (see `candidate_cost`) and on
+    /// comparing needle bytes, before any Rabin-Karp cutover.
+    cost: usize = 0,
+    rabin_karp: bool = false,
+};
+
+/// Charge per anchor hit: about what restarting the vector scan and the
+/// two single-byte checks cost, in byte comparisons.
+const candidate_cost = 16;
+/// Verification compares this many bytes at a time, so a mismatch is
+/// charged within one block of where it occurs.
+const verify_block = 64;
+/// The cutover fires once the cost exceeds `cost_per_byte` per haystack
+/// byte scanned (plus `cost_slack`). Before it, the cost is at most that
+/// bound plus one verification (at most the needle length), and Rabin-Karp
+/// is linear, so the whole search is O(n + m).
+const cost_per_byte = 4;
+const cost_slack = 256;
+
+fn indexAnchored(haystack: []const u8, needle: []const u8, anchor: usize, stats: ?*SearchStats) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len == 1) return std.mem.indexOfScalar(u8, haystack, needle[0]);
+    if (haystack.len < needle.len) return null;
+    const last = needle.len - 1;
+    const tail = needle.len - anchor; // needle bytes at/after the anchor
+    var start: usize = 0; // candidate needle start
+    var cost: usize = 0;
+    defer if (stats) |st| {
+        st.cost = cost;
+    };
+    while (start + needle.len <= haystack.len) {
+        const found = std.mem.indexOfScalarPos(
+            u8,
+            haystack[0 .. haystack.len - tail + 1],
+            start + anchor,
+            needle[anchor],
+        ) orelse return null;
+        const at = found - anchor;
+        cost += candidate_cost;
+        // The anchor byte matched. Reject on the last byte before comparing
+        // the whole needle: a periodic needle over a periodic haystack often
+        // differs only at its end (like the audit's "Qbcdefgh"…"Qbcdefgi").
+        if (haystack[at + last] == needle[last] and verify(haystack[at..][0..needle.len], needle, &cost)) {
+            return at;
+        }
+        start = at + 1;
+        if (cost > cost_per_byte * (found + 1) + cost_slack) {
+            if (stats) |st| st.rabin_karp = true;
+            if (indexRabinKarp(haystack[start..], needle)) |j| return start + j;
+            return null;
+        }
+    }
+    return null;
+}
+
+/// Compare `hay` (as long as `needle`) to `needle` block by block, charging
+/// `cost` for every block compared.
+fn verify(hay: []const u8, needle: []const u8, cost: *usize) bool {
+    if (needle.len <= verify_block) { // the common case: one comparison
+        cost.* += needle.len;
+        return std.mem.eql(u8, hay, needle);
+    }
+    var i: usize = 0;
+    while (i < needle.len) {
+        const end = @min(i + verify_block, needle.len);
+        cost.* += end - i;
+        if (!std.mem.eql(u8, hay[i..end], needle[i..end])) return false;
+        i = end;
+    }
+    return true;
+}
+
+/// Rabin-Karp substring search, mirroring Go's `internal/bytealg`: worst-case
+/// linear, used as `prefixIndex`'s fallback for pathological inputs.
+fn indexRabinKarp(s: []const u8, sep: []const u8) ?usize {
+    if (s.len < sep.len) return null;
+    const prime_rk: u32 = 16777619;
+    var hashsep: u32 = 0;
+    for (sep) |b| hashsep = hashsep *% prime_rk +% b;
+    var pow: u32 = 1;
+    var sq: u32 = prime_rk;
+    var i = sep.len;
+    while (i > 0) : (i >>= 1) {
+        if (i & 1 != 0) pow *%= sq;
+        sq *%= sq;
+    }
+    var h: u32 = 0;
+    for (s[0..sep.len]) |b| h = h *% prime_rk +% b;
+    if (h == hashsep and std.mem.eql(u8, s[0..sep.len], sep)) return 0;
+    var j = sep.len;
+    while (j < s.len) {
+        h *%= prime_rk;
+        h +%= s[j];
+        h -%= pow *% s[j - sep.len];
+        j += 1;
+        if (h == hashsep and std.mem.eql(u8, s[j - sep.len .. j], sep)) return j - sep.len;
+    }
+    return null;
+}
+
+/// Test helper: `prefixIndexAnchored` with the anchor computed on the fly.
+fn prefixIndex(haystack: []const u8, needle: []const u8) ?usize {
+    return prefixIndexAnchored(haystack, needle, prefixAnchor(needle));
+}
+
+test "prefixIndex finds first occurrence or null" {
+    const expectEqual = std.testing.expectEqual;
+    try expectEqual(@as(?usize, 0), prefixIndex("hello", ""));
+    try expectEqual(@as(?usize, 1), prefixIndex("xyz", "y"));
+    try expectEqual(@as(?usize, 2), prefixIndex("ababc", "abc")); // first-byte false start
+    try expectEqual(@as(?usize, null), prefixIndex("ababab", "abc"));
+    try expectEqual(@as(?usize, null), prefixIndex("ab", "abc")); // needle longer than haystack
+}
+
+test "indexOfAnyByte agrees with the scalar std search" {
+    var prng = std.Random.DefaultPrng.init(42);
+    const rand = prng.random();
+    var hay: [300]u8 = undefined;
+    for (&hay) |*b| b.* = 'a' + rand.uintLessThan(u8, 20);
+    const sets = [_][]const u8{
+        "xy",
+        "qzv",
+        "abcd",
+        "abcdefghijklmnop", // max_first_bytes = 16
+        "QZ", // absent from the haystack
+    };
+    // Slide both endpoints so hits land before, inside, and after the last
+    // full SIMD chunk, plus empty and sub-width slices.
+    for (sets) |bytes| {
+        const set = ByteSet.init(bytes);
+        for (0..0x80) |b| {
+            const want = std.mem.indexOfScalar(u8, bytes, @intCast(b)) != null;
+            try std.testing.expectEqual(want, set.containsRune(@intCast(b)));
+        }
+        try std.testing.expect(!set.containsRune(-1));
+        try std.testing.expect(!set.containsRune(0x80));
+        var lo: usize = 0;
+        while (lo < hay.len) : (lo += 37) {
+            var hi = lo;
+            while (hi <= hay.len) : (hi += 23) {
+                const want = std.mem.indexOfAny(u8, hay[lo..hi], bytes);
+                try std.testing.expectEqual(want, indexOfAnyByte(hay[lo..hi], &set));
+            }
+        }
+    }
+}
+
+test "prefixIndex anchors on the rarest byte" {
+    // 'x' is rarer than 'a'/'e'; a common-first-byte needle must still be
+    // found correctly wherever it sits.
+    try std.testing.expectEqual(@as(?usize, 6), prefixIndex("aeaeaeaext", "aext"));
+    try std.testing.expectEqual(@as(?usize, 0), prefixIndex("aext", "aext"));
+    try std.testing.expectEqual(@as(?usize, null), prefixIndex("aeaeaeae", "aext"));
+}
+
+test "prefixIndex on periodic input" {
+    const expectEqual = std.testing.expectEqual;
+    const hay = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"; // 39 a's + b
+    try expectEqual(@as(?usize, 35), prefixIndex(hay, "aaaab"));
+    try expectEqual(@as(?usize, null), prefixIndex(hay[0..39], "aaaab"));
+    // A needle whose rarest byte is itself the periodic byte: every anchor
+    // hit is a false start.
+    const hay2 = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxy"; // 30 x's + y
+    try expectEqual(@as(?usize, 26), prefixIndex(hay2, "xxxxy"));
+    try expectEqual(@as(?usize, null), prefixIndex(hay2[0..30], "xxxxy"));
+    try expectEqual(@as(?usize, 0), indexRabinKarp("abcabd", "abc"));
+    try expectEqual(@as(?usize, 3), indexRabinKarp("abdabc", "abc"));
+    try expectEqual(@as(?usize, null), indexRabinKarp("ab", "abc"));
+}
+
+fn repeatInto(buf: []u8, unit: []const u8) void {
+    for (0..buf.len / unit.len) |k| @memcpy(buf[k * unit.len ..][0..unit.len], unit);
+}
+
+test "prefix search work stays linear on a periodic needle" {
+    // The audit's case, scaled down: "Qbcdefgh" x 1250 + "Qbcdefgi" over
+    // "Qbcdefgh" x 50000. Every 8th byte is an anchor hit, and the old
+    // verification compared the whole 10 KB needle at each (O(n·m)).
+    const a = std.testing.allocator;
+    const unit = "Qbcdefgh";
+    const needle = try a.alloc(u8, unit.len * 1251);
+    defer a.free(needle);
+    repeatInto(needle, unit);
+    needle[needle.len - 1] = 'i';
+    const hay = try a.alloc(u8, unit.len * 50_000);
+    defer a.free(hay);
+    repeatInto(hay, unit);
+
+    var st: SearchStats = .{};
+    try std.testing.expectEqual(@as(?usize, null), indexAnchored(hay, needle, prefixAnchor(needle), &st));
+    try std.testing.expect(st.cost <= cost_per_byte * hay.len + cost_slack + needle.len);
+
+    // A needle that differs only in its middle passes the cheap end checks,
+    // so verification runs long at every hit: the cutover must fire, and
+    // Rabin-Karp must still find a real occurrence.
+    needle[needle.len - 1] = 'h';
+    needle[needle.len / 2] = 'x';
+    @memcpy(hay[hay.len - needle.len - 8 ..][0..needle.len], needle);
+    st = .{};
+    try std.testing.expectEqual(@as(?usize, hay.len - needle.len - 8), indexAnchored(hay, needle, prefixAnchor(needle), &st));
+    try std.testing.expect(st.rabin_karp);
+    try std.testing.expect(st.cost <= cost_per_byte * hay.len + cost_slack + needle.len);
+}
+
+test "prefix search does not cut over on ordinary text" {
+    const text = "the performance of a regular expression engine depends on " ++
+        "its prefilter; a rare anchor byte keeps false starts cheap. " ++
+        "performance";
+    var st: SearchStats = .{};
+    const needle = "performance";
+    try std.testing.expectEqual(@as(?usize, 4), indexAnchored(text, needle, prefixAnchor(needle), &st));
+    st = .{};
+    try std.testing.expectEqual(@as(?usize, text.len - needle.len), indexAnchored(text[5..], needle, prefixAnchor(needle), &st).? + 5);
+    try std.testing.expect(!st.rabin_karp);
+}
