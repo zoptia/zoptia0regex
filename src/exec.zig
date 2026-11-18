@@ -212,6 +212,15 @@ const Queue = struct {
     n: usize = 0,
 };
 
+/// A pending step of `Machine.add`: visit `pc` (when non-zero), or restore
+/// capture `slot` to `old` and the leftover thread to `t`.
+const AddFrame = struct {
+    pc: u32 = 0,
+    slot: u32 = 0,
+    old: i64 = 0,
+    t: ?*Thread = null,
+};
+
 /// Reusable per-call storage for the Pike-VM and bitstate engines — the
 /// equivalent of Go's per-`Regexp` `*machine` pool, which this port originally
 /// omitted (it allocated a fresh `Machine` on every match). Allocate a `Scratch`
@@ -230,6 +239,7 @@ pub const Scratch = struct {
     dense0: []Entry = &.{},
     dense1: []Entry = &.{},
     matchcap: []i64 = &.{},
+    add_stack: []AddFrame = &.{}, // Machine.add's work stack, one frame per inst
     pool: std.ArrayList(*Thread) = .empty,
     all_threads: std.ArrayList(*Thread) = .empty,
     pike_ninst: usize = 0, // capacity of s0/s1/dense0/dense1 (grow-only)
@@ -261,6 +271,7 @@ pub const Scratch = struct {
         if (self.dense0.len > 0) a.free(self.dense0);
         if (self.dense1.len > 0) a.free(self.dense1);
         if (self.matchcap.len > 0) a.free(self.matchcap);
+        if (self.add_stack.len > 0) a.free(self.add_stack);
         if (self.work.len > 0) a.free(self.work);
         if (self.visited.len > 0) a.free(self.visited);
         if (self.result.len > 0) a.free(self.result);
@@ -268,8 +279,9 @@ pub const Scratch = struct {
     }
 
     /// Grow the Pike-VM buffers to fit `ninst` instructions and `ncap` capture
-    /// slots. The sparse/dense buffers grow monotonically (oversized buffers are
-    /// harmless — only `[0, ninst)`/`[0, q.n)` are ever touched). When `ncap`
+    /// slots. The sparse/dense buffers and the `add` stack grow monotonically
+    /// (oversized buffers are harmless — only `[0, ninst)`/`[0, q.n)` are ever
+    /// touched). When `ncap`
     /// changes, the pooled threads (whose cap arrays are sized to the previous
     /// `ncap`) are discarded so fresh ones are allocated at the new size; a hot
     /// loop keeps `ncap` constant, so this fires only on the first call.
@@ -282,6 +294,7 @@ pub const Scratch = struct {
             @memset(self.s1, 0);
             try replaceBuffer(Entry, a, &self.dense0, ninst);
             try replaceBuffer(Entry, a, &self.dense1, ninst);
+            try replaceBuffer(AddFrame, a, &self.add_stack, ninst);
             self.pike_ninst = ninst;
         }
         if (ncap != self.thread_ncap) {
@@ -392,64 +405,85 @@ const Machine = struct {
 
     /// Add pc (and its epsilon-closure under `cond`) to queue `q`, threading
     /// `cap` through capture instructions. Returns the (possibly reusable)
-    /// leftover thread. Mirrors Go's `machine.add`.
+    /// leftover thread. Mirrors Go's `machine.add`, but iterative: Go recurses
+    /// on the `out` branch of an alternation and on the body of a capture,
+    /// which its growable goroutine stacks absorb; a native stack would
+    /// overflow on large programs (e.g. 100k `a??` in a row). Like RE2's
+    /// `AddToThreadq`, pending work goes on an explicit stack instead, in
+    /// the same depth-first order: an alternation follows `out` at once and
+    /// leaves `arg` on the stack; a capture leaves a frame that restores the
+    /// slot (and the caller's leftover thread, which the recursive version
+    /// keeps across the body) once the body is done.
     fn add(m: *Machine, q: *Queue, pc_in: u32, pos: usize, cap: []i64, cond: *const LazyFlag, t_in: ?*Thread) !?*Thread {
+        // Every frame is pushed while visiting an instruction that was just
+        // inserted into `q`, so the depth never exceeds the program length.
+        const stack = m.scratch.add_stack;
+        var depth: usize = 0;
         var pc = pc_in;
         var t = t_in;
         while (true) {
-            if (pc == 0) return t;
-            const sp = q.sparse[pc];
-            if (sp < q.n and q.dense[sp].pc == pc) return t;
+            visit: while (true) {
+                if (pc == 0) break :visit;
+                const sp = q.sparse[pc];
+                if (sp < q.n and q.dense[sp].pc == pc) break :visit;
 
-            const j = q.n;
-            q.sparse[pc] = @intCast(j);
-            q.dense[j] = .{ .pc = pc, .t = null };
-            q.n += 1;
+                const j = q.n;
+                q.sparse[pc] = @intCast(j);
+                q.dense[j] = .{ .pc = pc, .t = null };
+                q.n += 1;
 
-            const i = &m.p.insts[pc];
-            switch (i.op) {
-                .fail => return t,
-                .alt, .alt_match => {
-                    t = try m.add(q, i.out, pos, cap, cond, t);
-                    pc = i.arg;
-                    continue;
-                },
-                .empty_width => {
-                    if (cond.match(@intCast(i.arg))) {
+                const i = &m.p.insts[pc];
+                switch (i.op) {
+                    .fail => break :visit,
+                    .alt, .alt_match => {
+                        if (i.arg != 0) {
+                            stack[depth] = .{ .pc = i.arg };
+                            depth += 1;
+                        }
                         pc = i.out;
-                        continue;
-                    }
-                    return t;
-                },
-                .nop => {
-                    pc = i.out;
-                    continue;
-                },
-                .capture => {
-                    if (i.arg < cap.len) {
-                        const opos = cap[i.arg];
-                        cap[i.arg] = @intCast(pos);
-                        _ = try m.add(q, i.out, pos, cap, cond, null);
-                        cap[i.arg] = opos;
-                        return t;
-                    }
-                    pc = i.out;
-                    continue;
-                },
-                .match, .rune, .rune1, .rune_any, .rune_any_not_nl => {
-                    var th: *Thread = undefined;
-                    if (t) |existing| {
-                        existing.pc = pc;
-                        th = existing;
-                    } else {
-                        th = try m.alloc(pc);
-                    }
-                    if (cap.len > 0 and th.cap.ptr != cap.ptr) {
-                        @memcpy(th.cap, cap);
-                    }
-                    q.dense[j].t = th;
-                    return null;
-                },
+                    },
+                    .empty_width => {
+                        if (!cond.match(@intCast(i.arg))) break :visit;
+                        pc = i.out;
+                    },
+                    .nop => pc = i.out,
+                    .capture => {
+                        if (i.arg < cap.len) {
+                            stack[depth] = .{ .slot = i.arg, .old = cap[i.arg], .t = t };
+                            depth += 1;
+                            cap[i.arg] = @intCast(pos);
+                            t = null;
+                        }
+                        pc = i.out;
+                    },
+                    .match, .rune, .rune1, .rune_any, .rune_any_not_nl => {
+                        var th: *Thread = undefined;
+                        if (t) |existing| {
+                            existing.pc = pc;
+                            th = existing;
+                        } else {
+                            th = try m.alloc(pc);
+                        }
+                        if (cap.len > 0 and th.cap.ptr != cap.ptr) {
+                            @memcpy(th.cap, cap);
+                        }
+                        q.dense[j].t = th;
+                        t = null;
+                        break :visit;
+                    },
+                }
+            }
+            // This path is done: unwind to the next pending alternative.
+            while (true) {
+                if (depth == 0) return t;
+                depth -= 1;
+                const f = stack[depth];
+                if (f.pc != 0) {
+                    pc = f.pc;
+                    break;
+                }
+                cap[f.slot] = f.old;
+                t = f.t;
             }
         }
     }
