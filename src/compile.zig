@@ -75,7 +75,6 @@ const Compiler = struct {
     al: std.mem.Allocator,
     insts: std.ArrayList(Inst) = .empty,
     ascii: std.ArrayList(u128) = .empty,
-    num_cap: usize = 2, // implicit whole-match pair
     depth: u32 = 0,
 
     fn inst(c: *Compiler, op: prog.InstOp) Error!Frag {
@@ -101,7 +100,6 @@ const Compiler = struct {
         var f = try c.inst(.capture);
         f.out = PatchList.make(f.i << 1);
         c.insts.items[f.i].arg = arg;
-        if (c.num_cap < arg + 1) c.num_cap = arg + 1;
         return f;
     }
 
@@ -292,7 +290,6 @@ pub fn compile(al: std.mem.Allocator, re: *Regexp) Error!Prog {
         .insts = try c.insts.toOwnedSlice(al),
         .ascii = try c.ascii.toOwnedSlice(al),
         .start = start,
-        .num_cap = c.num_cap,
     };
 }
 
