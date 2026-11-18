@@ -84,19 +84,48 @@ pub fn prefixAnchor(prefix: []const u8) u32 {
 
 /// Find the first occurrence of `needle` in `haystack`, given `anchor =
 /// prefixAnchor(needle)`. Scans for the needle's *rarest* byte with a
-/// vectorized search (`indexOfScalar`) and verifies the rest around each hit
-/// — anchoring on the rarest byte (rust memmem's heuristic) false-starts far
-/// less often than anchoring on the first byte when the first byte is common.
-/// Like Go's bytes.Index, it switches to Rabin-Karp when the anchor still
-/// produces too many false starts (a periodic needle over a periodic haystack
-/// is otherwise O(n·m)).
+/// vectorized search (`indexOfScalar`) and verifies the needle around each
+/// hit — anchoring on the rarest byte (rust memmem's heuristic) false-starts
+/// far less often than anchoring on the first byte when the first byte is
+/// common. Go's `bytes.Index` instead scans for the first byte and counts
+/// false starts; here the cutover to Rabin-Karp is cost-based (see
+/// `indexAnchored`), which keeps the search linear for any needle.
 pub fn prefixIndexAnchored(haystack: []const u8, needle: []const u8, anchor: usize) ?usize {
+    return indexAnchored(haystack, needle, anchor, null);
+}
+
+/// Work done by one `indexAnchored` call, for tests.
+const SearchStats = struct {
+    /// Cost units spent on candidates (see `candidate_cost`) and on
+    /// comparing needle bytes, before any Rabin-Karp cutover.
+    cost: usize = 0,
+    rabin_karp: bool = false,
+};
+
+/// Charge per anchor hit: about what restarting the vector scan and the
+/// two single-byte checks cost, in byte comparisons.
+const candidate_cost = 16;
+/// Verification compares this many bytes at a time, so a mismatch is
+/// charged within one block of where it occurs.
+const verify_block = 64;
+/// The cutover fires once the cost exceeds `cost_per_byte` per haystack
+/// byte scanned (plus `cost_slack`). Before it, the cost is at most that
+/// bound plus one verification (at most the needle length), and Rabin-Karp
+/// is linear, so the whole search is O(n + m).
+const cost_per_byte = 4;
+const cost_slack = 256;
+
+fn indexAnchored(haystack: []const u8, needle: []const u8, anchor: usize, stats: ?*SearchStats) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len == 1) return std.mem.indexOfScalar(u8, haystack, needle[0]);
     if (haystack.len < needle.len) return null;
+    const last = needle.len - 1;
     const tail = needle.len - anchor; // needle bytes at/after the anchor
     var start: usize = 0; // candidate needle start
-    var fails: usize = 0;
+    var cost: usize = 0;
+    defer if (stats) |st| {
+        st.cost = cost;
+    };
     while (start + needle.len <= haystack.len) {
         const found = std.mem.indexOfScalarPos(
             u8,
@@ -105,15 +134,37 @@ pub fn prefixIndexAnchored(haystack: []const u8, needle: []const u8, anchor: usi
             needle[anchor],
         ) orelse return null;
         const at = found - anchor;
-        if (std.mem.eql(u8, haystack[at .. at + needle.len], needle)) return at;
+        cost += candidate_cost;
+        // The anchor byte matched. Reject on the last and first bytes before
+        // comparing the whole needle: a periodic needle over a periodic
+        // haystack usually differs at an end (the audit's
+        // "Qbcdefgh"…"Qbcdefgi" needle differs only in its last byte).
+        if (haystack[at + last] == needle[last] and haystack[at] == needle[0] and
+            verify(haystack[at..][0..needle.len], needle, &cost))
+        {
+            return at;
+        }
         start = at + 1;
-        fails += 1;
-        if (fails > (at + 16) / 8) { // Go's bytes.Index cutover shape
+        if (cost > cost_per_byte * (found + 1) + cost_slack) {
+            if (stats) |st| st.rabin_karp = true;
             if (indexRabinKarp(haystack[start..], needle)) |j| return start + j;
             return null;
         }
     }
     return null;
+}
+
+/// Compare `hay` (as long as `needle`) to `needle` block by block, charging
+/// `cost` for every block compared.
+fn verify(hay: []const u8, needle: []const u8, cost: *usize) bool {
+    var i: usize = 0;
+    while (i < needle.len) {
+        const end = @min(i + verify_block, needle.len);
+        cost.* += end - i;
+        if (!std.mem.eql(u8, hay[i..end], needle[i..end])) return false;
+        i = end;
+    }
+    return true;
 }
 
 /// Rabin-Karp substring search, mirroring Go's `internal/bytealg`: worst-case
@@ -192,17 +243,63 @@ test "prefixIndex anchors on the rarest byte" {
     try std.testing.expectEqual(@as(?usize, null), prefixIndex("aeaeaeae", "aext"));
 }
 
-test "prefixIndex Rabin-Karp fallback on periodic input" {
+test "prefixIndex on periodic input" {
     const expectEqual = std.testing.expectEqual;
     const hay = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"; // 39 a's + b
     try expectEqual(@as(?usize, 35), prefixIndex(hay, "aaaab"));
     try expectEqual(@as(?usize, null), prefixIndex(hay[0..39], "aaaab"));
     // A needle whose rarest byte is itself the periodic byte: every anchor
-    // hit is a false start, so the cutover to Rabin-Karp fires.
+    // hit is a false start.
     const hay2 = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxy"; // 30 x's + y
     try expectEqual(@as(?usize, 26), prefixIndex(hay2, "xxxxy"));
     try expectEqual(@as(?usize, null), prefixIndex(hay2[0..30], "xxxxy"));
     try expectEqual(@as(?usize, 0), indexRabinKarp("abcabd", "abc"));
     try expectEqual(@as(?usize, 3), indexRabinKarp("abdabc", "abc"));
     try expectEqual(@as(?usize, null), indexRabinKarp("ab", "abc"));
+}
+
+fn repeatInto(buf: []u8, unit: []const u8) void {
+    for (0..buf.len / unit.len) |k| @memcpy(buf[k * unit.len ..][0..unit.len], unit);
+}
+
+test "prefix search work stays linear on a periodic needle" {
+    // The audit's case, scaled down: "Qbcdefgh" x 1250 + "Qbcdefgi" over
+    // "Qbcdefgh" x 50000. Every 8th byte is an anchor hit, and the old
+    // verification compared the whole 10 KB needle at each (O(n·m)).
+    const a = std.testing.allocator;
+    const unit = "Qbcdefgh";
+    const needle = try a.alloc(u8, unit.len * 1251);
+    defer a.free(needle);
+    repeatInto(needle, unit);
+    needle[needle.len - 1] = 'i';
+    const hay = try a.alloc(u8, unit.len * 50_000);
+    defer a.free(hay);
+    repeatInto(hay, unit);
+
+    var st: SearchStats = .{};
+    try std.testing.expectEqual(@as(?usize, null), indexAnchored(hay, needle, prefixAnchor(needle), &st));
+    try std.testing.expect(st.cost <= cost_per_byte * hay.len + cost_slack + needle.len);
+
+    // A needle that differs only in its middle passes the cheap end checks,
+    // so verification runs long at every hit: the cutover must fire, and
+    // Rabin-Karp must still find a real occurrence.
+    needle[needle.len - 1] = 'h';
+    needle[needle.len / 2] = 'x';
+    @memcpy(hay[hay.len - needle.len - 8 ..][0..needle.len], needle);
+    st = .{};
+    try std.testing.expectEqual(@as(?usize, hay.len - needle.len - 8), indexAnchored(hay, needle, prefixAnchor(needle), &st));
+    try std.testing.expect(st.rabin_karp);
+    try std.testing.expect(st.cost <= cost_per_byte * hay.len + cost_slack + needle.len);
+}
+
+test "prefix search does not cut over on ordinary text" {
+    const text = "the performance of a regular expression engine depends on " ++
+        "its prefilter; a rare anchor byte keeps false starts cheap. " ++
+        "performance";
+    var st: SearchStats = .{};
+    const needle = "performance";
+    try std.testing.expectEqual(@as(?usize, 4), indexAnchored(text, needle, prefixAnchor(needle), &st));
+    st = .{};
+    try std.testing.expectEqual(@as(?usize, text.len - needle.len), indexAnchored(text[5..], needle, prefixAnchor(needle), &st).? + 5);
+    try std.testing.expect(!st.rabin_karp);
 }
