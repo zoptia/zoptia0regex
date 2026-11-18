@@ -569,7 +569,12 @@ const Machine = struct {
                     }
                 }
             }
-            if (!m.matched) {
+            // A new thread starts at every position until a match is found,
+            // except that an anchored program can only start at 0. Go 1.27
+            // adds the start thread anyway and lets the `\A` assertion fail
+            // in `add`; RE2's guard skips that dead closure walk without
+            // changing any result.
+            if (!m.matched and (c.pos == 0 or m.cond & prog.empty_begin_text == 0)) {
                 if (m.matchcap.len > 0) m.matchcap[0] = @intCast(c.pos);
                 _ = try m.add(runq, m.p.start, c.pos, m.matchcap, &flag, null);
             }

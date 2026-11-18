@@ -135,3 +135,115 @@ test "matching with an unencodable rune in the literal prefix" {
         }
     }
 }
+
+// --- Every engine agrees with the default dispatch ---
+//
+// `Engine.mode` forces an engine regardless of Go's dispatch heuristics, so
+// each engine is exercised on every pattern below, including the one-pass
+// regexps the default always routes to `doOnePass`. The default dispatch
+// itself is checked against Go by the differential suites. (One-pass
+// regexps whose literal prefix holds a surrogate are left out: there Go's
+// own engines disagree, see above.)
+
+const Mode = @import("exec.zig").Mode;
+
+const cross_patterns = [_][]const u8{
+    "",                    "a",                      "abc",                "a*",
+    "a+?",                 "(a*)+",                  "(a|ab)(c|bcd)(d*)",  "(?:a|b)*c",
+    "x(?:a|b)*?c",         "[a-p]x",                 "(?i)abc",            "(?i)k",
+    "(?i)ſs",
+    "\\d{2,3}-\\d+",       "\\bfoo\\b",              "\\Bo",               "^",
+    "$",                   "(?m)^\\w+$",             "(?s).+",             ".*",
+    "\\A(a+)",             "\\Aab|cd",               "^abc$",              "^(a|b)c",
+    "\\A(\\d+)-(\\d+)\\z", "^(?:(a)|b)*$",           "(a)(b)?(c)",         "(?U)a+",
+    "\\p{Greek}+",         "[^a]+",
+    "日本?",
+    "\\x{FFFD}",           "[\\x{80}-\\x{10FFFF}]+", "(foo|foobar)(bar)?", "a{2,4}?b",
+    "(?:(?:a)|(?:ab))+?$", "(?i)performance|bench",  "\\z",                "(|a)*",
+    "(a?)((ab)?)(b?)",     "^(?:a?)?$",
+};
+
+const cross_inputs = [_][]const u8{
+    "",                     "a",              "abcd",              "aaab",
+    "xabbac xbc",           "foo foobar fob", "12-345 1-2 123-45", "line1\nline2\n",
+    "Kk\u{212A}ſsS",
+    "日本語 日本",
+    "\xff\xfe a\x80b",
+    "αβγ abc",
+    "performance BENCH",    "ab",             "cdab",              "ax bx px qx",
+    "\u{FFFD}\xed\xa0\x80",
+};
+
+const Outcome = struct { m: bool, s: ?[]i64, all: ?[][]i64 };
+
+fn outcome(re: *const regex.Regexp, in: []const u8) !Outcome {
+    const s = try re.findSubmatchIndex(ta, in);
+    errdefer if (s) |x| ta.free(x);
+    return .{
+        .m = try re.match(ta, in),
+        .s = s,
+        .all = try re.findAllSubmatchIndex(ta, in, -1),
+    };
+}
+
+fn freeOutcome(o: Outcome) void {
+    if (o.s) |s| ta.free(s);
+    if (o.all) |a| regex.Regexp.freeAllSubmatchIndex(ta, a);
+}
+
+fn expectSameOutcome(want: Outcome, got: Outcome) !void {
+    try std.testing.expectEqual(want.m, got.m);
+    try std.testing.expectEqual(want.s == null, got.s == null);
+    if (want.s) |s| try std.testing.expectEqualSlices(i64, s, got.s.?);
+    try std.testing.expectEqual(want.all == null, got.all == null);
+    if (want.all) |a| {
+        try std.testing.expectEqual(a.len, got.all.?.len);
+        for (a, got.all.?) |x, y| try std.testing.expectEqualSlices(i64, x, y);
+    }
+}
+
+test "every engine mode agrees with the default dispatch" {
+    var scratch = regex.Scratch.init(ta);
+    defer scratch.deinit();
+    var onepass_seen: usize = 0;
+    for ([_]bool{ false, true }) |posix| {
+        for (cross_patterns) |p| {
+            var re = (if (posix) regex.compilePOSIX(ta, p) else regex.compile(ta, p)) catch continue;
+            defer re.deinit();
+            if (re.onepass != null) onepass_seen += 1;
+            for (cross_inputs) |in| {
+                re.engine.mode = .auto;
+                const want = try outcome(&re, in);
+                defer freeOutcome(want);
+                for ([_]Mode{ .no_onepass, .pike, .bitstate }) |mode| {
+                    re.engine.mode = mode;
+                    errdefer std.debug.print("mode={t} posix={} pattern={s} input={x}\n", .{ mode, posix, p, in });
+                    const got = try outcome(&re, in);
+                    defer freeOutcome(got);
+                    try expectSameOutcome(want, got);
+                    // The scratch-reusing paths share the same dispatch.
+                    try std.testing.expectEqual(want.m, try re.matchScratch(&scratch, in));
+                    const ss = try re.findSubmatchIndexScratch(&scratch, in);
+                    try std.testing.expectEqual(want.s == null, ss == null);
+                    if (want.s) |s| try std.testing.expectEqualSlices(i64, s, ss.?);
+                }
+            }
+        }
+    }
+    try std.testing.expect(onepass_seen >= 4); // the one-pass engine took part
+}
+
+test "anchored Pike VM starts threads only at the beginning" {
+    // Forced onto the Pike VM, an anchored regexp must not find matches at
+    // later positions (findAll restarts the engine at every match end).
+    var re = try regex.compile(ta, "\\A(a|ab)(c|bcd)?");
+    defer re.deinit();
+    re.engine.mode = .pike;
+    const all = (try re.findAllSubmatchIndex(ta, "abcdabcd", -1)).?;
+    defer regex.Regexp.freeAllSubmatchIndex(ta, all);
+    try std.testing.expectEqual(@as(usize, 1), all.len);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 4, 0, 1, 1, 4 }, all[0]);
+    var it = try re.matches(ta, "xab", -1);
+    defer it.deinit();
+    try std.testing.expect(try it.next() == null);
+}
