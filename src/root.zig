@@ -42,4 +42,5 @@ test {
     _ = @import("tests.zig");
     _ = @import("oomtest.zig");
     _ = @import("regressiontest.zig");
+    _ = @import("limitstest.zig");
 }

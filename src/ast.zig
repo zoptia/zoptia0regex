@@ -1,15 +1,16 @@
 //! The regular-expression syntax tree (AST), mirroring Go's
 //! `regexp/syntax.Regexp` node, its `Op` enum, and the `Flags` bitset.
 //!
-//! Port note: Go uses an inline-storage + free-list micro-optimization
-//! (`Sub0`, `Rune0`, `p.free`/`reuse`); we drop it and allocate nodes from an
-//! arena. The AST shape otherwise matches Go's, including `maybeConcat`'s
-//! multi-rune literals and `factor`'s rewritten alternations.
+//! Port note: Go's inline storage (`Sub0`, `Rune0`) is dropped; nodes and
+//! their slices live in an arena. Parser-only state (Go's node free list and
+//! its `p.size` / `p.height` caches) is kept beside each node inside the
+//! parser (`parse.zig`), not here. The AST shape matches Go's, including
+//! `maybeConcat`'s multi-rune literals and `factor`'s rewritten alternations.
 
 const std = @import("std");
 
 /// A single regular-expression operator. Values match Go's ordering so that
-/// `@intFromEnum` comparisons (used for precedence and the parse-stack
+/// `@backingInt` comparisons (used for precedence and the parse-stack
 /// pseudo-ops) behave like Go's `Op` integer comparisons.
 pub const Op = enum(u8) {
     no_match = 1, // matches no strings
@@ -54,9 +55,10 @@ pub const OneLine: Flags = 1 << 4; // treat ^ and $ as only matching begin/end o
 pub const NonGreedy: Flags = 1 << 5; // make repetition operators default to non-greedy
 pub const PerlX: Flags = 1 << 6; // allow Perl extensions
 pub const UnicodeGroups: Flags = 1 << 7; // allow \p{Han}, \P{Han}
-// WasDollar, Simple, and MatchNL mirror Go's Flags bit layout for fidelity;
-// no code in this port consumes them (Go reads WasDollar/Simple only when
-// printing or re-simplifying an AST).
+// WasDollar, Simple, and MatchNL mirror Go's Flags bit layout. WasDollar is
+// read by `Regexp.equal`, as Go's `Equal` reads it (so `$` and `\z` never
+// factor together) and by Go's printer; Simple is declared but never set or
+// read, in Go as here.
 pub const WasDollar: Flags = 1 << 8; // OpEndText was $, not \z
 pub const Simple: Flags = 1 << 9; // regexp contains no counted repetition
 
@@ -78,8 +80,6 @@ pub const Regexp = struct {
     runes: []u21 = &.{},
     min: i32 = 0,
     max: i32 = 0,
-    /// Parser-only cached AST height, checked before recursive passes run.
-    parse_height: u32 = 1,
     cap: i32 = 0, // capturing index, for `capture`
     name: []const u8 = "", // capturing name, for `capture`
 
