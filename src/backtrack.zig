@@ -11,9 +11,8 @@ const exec = @import("exec.zig");
 const search = @import("search.zig");
 
 const Prog = prog.Prog;
-const EmptyOp = prog.EmptyOp;
 const Input = exec.Input;
-const Accel = exec.Accel;
+const Engine = exec.Engine;
 const Scratch = exec.Scratch;
 const end_of_text = exec.end_of_text;
 
@@ -155,7 +154,12 @@ const BitState = struct {
     }
 };
 
-pub fn backtrack(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, accel: Accel, input: Input, pos: usize, caps: []i64) !bool {
+/// Run the backtracker over `input` from `pos`, writing submatches to `caps`.
+/// Mirrors Go's `(*Regexp).backtrack`.
+pub fn backtrack(scratch: *Scratch, e: *const Engine, input: Input, pos: usize, caps: []i64) !bool {
+    const p = e.prog;
+    const cond = e.cond;
+    const accel = &e.accel;
     if (cond == prog.impossible) return false;
     if (cond & prog.empty_begin_text != 0 and pos != 0) return false;
 
@@ -177,7 +181,7 @@ pub fn backtrack(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp
         .allocator = scratch.allocator,
         .p = p,
         .input = input,
-        .longest = longest,
+        .longest = e.longest,
         .end = end,
         .cap = work,
         .matchcap = caps,

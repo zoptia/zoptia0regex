@@ -33,18 +33,21 @@ pub const Regexp = struct {
     base_allocator: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
     expr: []const u8,
-    prog: prog.Prog,
+    prog: *const prog.Prog,
     num_subexp: usize,
     subexp_names: []const []const u8,
-    cond: prog.EmptyOp,
     min_input_len: usize,
-    longest: bool,
+    /// Go's `Regexp.prefix` / `prefixComplete` (what `literalPrefix`
+    /// reports): `onePassPrefix` for one-pass regexps, `Prog.prefix`
+    /// otherwise. The engines read their own copies from `engine`.
     prefix: []const u8,
     prefix_complete: bool,
-    prefix_end: u32,
-    prefix_anchor: u32,
+    /// Same as `engine.accel.first_bytes`; kept for introspection in tests.
     first_bytes: []const u8,
-    onepass: ?*onepass.OnePassProg,
+    /// Same as `engine.onepass`; kept for introspection in tests.
+    onepass: ?*const onepass.OnePassProg,
+    /// Everything the matching engines read (see `exec.Engine`).
+    engine: exec.Engine,
 
     pub fn deinit(re: *Regexp) void {
         const gpa = re.base_allocator;
@@ -62,22 +65,15 @@ pub const Regexp = struct {
     /// Run the engines over `input` starting at `pos` with a per-call scratch.
     /// `caps` receives the submatch offsets (its length bounds how many are
     /// recorded); returns whether a match was found.
-    fn accel(re: *const Regexp) exec.Accel {
-        return .{
-            .prefix = re.prefix,
-            .prefix_end = re.prefix_end,
-            .prefix_anchor = re.prefix_anchor,
-            .first_bytes = re.first_bytes,
-        };
-    }
-
     fn execAt(re: *const Regexp, allocator: std.mem.Allocator, input: exec.Input, pos: usize, caps: []i64) ExecError!bool {
-        return exec.execute(allocator, &re.prog, re.onepass, re.longest, re.cond, re.accel(), input, pos, caps);
+        var scratch = Scratch.init(allocator);
+        defer scratch.deinit();
+        return exec.executeReuse(&scratch, &re.engine, input, pos, caps);
     }
 
     /// `execAt` borrowing all engine storage from a caller-owned `Scratch`.
     fn execAtScratch(re: *const Regexp, scratch: *Scratch, input: exec.Input, pos: usize, caps: []i64) ExecError!bool {
-        return exec.executeReuse(scratch, &re.prog, re.onepass, re.longest, re.cond, re.accel(), input, pos, caps);
+        return exec.executeReuse(scratch, &re.engine, input, pos, caps);
     }
 
     // --- introspection ---
@@ -114,16 +110,17 @@ pub const Regexp = struct {
 
     /// Switch to leftmost-longest (POSIX) matching for future searches.
     pub fn setLongest(re: *Regexp) void {
-        re.longest = true;
+        re.engine.longest = true;
     }
 
     fn isLiteral(re: *const Regexp) bool {
-        return re.prefix_complete and re.onepass == null and re.num_subexp == 0 and re.cond == 0;
+        return re.prefix_complete and re.onepass == null and re.num_subexp == 0 and re.engine.cond == 0;
     }
 
     fn literalIndex(re: *const Regexp, input: []const u8) ?Match {
-        const start = search.prefixIndexAnchored(input, re.prefix, re.prefix_anchor) orelse return null;
-        return .{ .start = start, .end = start + re.prefix.len };
+        const a = &re.engine.accel;
+        const start = search.prefixIndexAnchored(input, a.prefix, a.prefix_anchor) orelse return null;
+        return .{ .start = start, .end = start + a.prefix.len };
     }
 
     // --- boolean match ---
@@ -632,13 +629,15 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
     re_ast.capNamesInto(names);
 
     const simplified = try simplify.simplify(al, re_ast);
-    const p = try compile_.compile(al, simplified);
+    const p = try al.create(prog.Prog);
+    p.* = try compile_.compile(al, simplified);
 
     const cond = p.startCond();
 
-    // Build the one-pass program if the regexp qualifies (anchored, unambiguous).
-    const op_prog: ?*onepass.OnePassProg = blk: {
-        if (try onepass.compileOnePass(gpa, al, &p)) |opp| {
+    // Build the one-pass program if the regexp qualifies (anchored,
+    // unambiguous). It carries its own prefix (Go's onePassPrefix).
+    const op_prog: ?*const onepass.OnePassProg = blk: {
+        if (try onepass.compileOnePass(gpa, al, p)) |opp| {
             const ptr = try al.create(onepass.OnePassProg);
             ptr.* = opp;
             break :blk ptr;
@@ -646,30 +645,18 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
         break :blk null;
     };
 
-    // Like Go: one-pass regexps use onePassPrefix (which also yields the pc to
-    // resume at after the prefix); everything else uses Prog.prefix.
-    var prefix_str: []const u8 = "";
-    var prefix_complete = false;
-    var prefix_end: u32 = 0;
-    if (op_prog != null) {
-        const opfx = try onepass.onePassPrefix(al, &p);
-        prefix_str = opfx.str;
-        prefix_complete = opfx.complete;
-        prefix_end = opfx.pc;
-    } else {
-        const pfx = try p.prefix(al);
-        prefix_str = pfx.str;
-        prefix_complete = pfx.complete;
-    }
+    // The scan prefix for the Pike VM and bitstate engines. Go computes
+    // Prog.prefix only for non-one-pass regexps; for one-pass ones it is
+    // always empty anyway (their programs start with \A), so computing it
+    // unconditionally keeps every engine runnable on every regexp.
+    const pfx = try p.prefix(al);
 
     // With no literal prefix, a small set of possible first bytes still lets
     // the Pike VM / bitstate engines skip ahead (see exec.Accel.first_bytes).
-    // Anchored programs never scan, and one-pass never uses it.
+    // Anchored programs never scan.
     var first_bytes: []const u8 = "";
-    if (op_prog == null and prefix_str.len == 0 and
-        cond != prog.impossible and (cond & prog.empty_begin_text) == 0)
-    {
-        if (try firstBytes(gpa, al, &p)) |fb| first_bytes = fb;
+    if (pfx.str.len == 0 and cond != prog.impossible and (cond & prog.empty_begin_text) == 0) {
+        if (try firstBytes(gpa, al, p)) |fb| first_bytes = fb;
     }
 
     return Regexp{
@@ -679,15 +666,23 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
         .prog = p,
         .num_subexp = @intCast(max_cap),
         .subexp_names = names,
-        .cond = cond,
         .min_input_len = minInputLen(simplified),
-        .longest = longest,
-        .prefix = prefix_str,
-        .prefix_complete = prefix_complete,
-        .prefix_end = prefix_end,
-        .prefix_anchor = search.prefixAnchor(prefix_str),
+        .prefix = if (op_prog) |op| op.prefix else pfx.str,
+        .prefix_complete = if (op_prog) |op| op.prefix_complete else pfx.complete,
         .first_bytes = first_bytes,
         .onepass = op_prog,
+        .engine = .{
+            .prog = p,
+            .onepass = op_prog,
+            .cond = cond,
+            .longest = longest,
+            .accel = .{
+                .prefix = pfx.str,
+                .prefix_anchor = search.prefixAnchor(pfx.str),
+                .prefix_rune = if (pfx.str.len > 0) (exec.Input{ .s = pfx.str }).step(0).r else -1,
+                .first_bytes = first_bytes,
+            },
+        },
     };
 }
 

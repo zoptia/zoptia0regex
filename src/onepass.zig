@@ -26,6 +26,14 @@ pub const OnePassInst = struct {
 pub const OnePassProg = struct {
     insts: []OnePassInst,
     start: u32,
+    /// Go's `onePassPrefix`: the literal following the leading `\A`, which
+    /// `doOnePass` skips without stepping the program. It reaches past `\A`,
+    /// so it is valid only for the one-pass engine, never as a scan prefix.
+    prefix: []const u8 = "",
+    /// Whether `prefix` (followed by `\z`) is the entire regexp.
+    prefix_complete: bool = false,
+    /// The pc to resume at once `prefix` has been consumed.
+    prefix_end: u32 = 0,
 };
 
 const merge_failed: u32 = 0xffffffff;
@@ -38,7 +46,7 @@ pub const Prefix = struct { str: []const u8, complete: bool, pc: u32 };
 /// `Prog.prefix`, the walk never crosses a capture instruction, so `doOnePass`
 /// can jump straight to `pc` without losing recorded submatches. Mirrors Go's
 /// `onePassPrefix`.
-pub fn onePassPrefix(al: std.mem.Allocator, p: *const Prog) !Prefix {
+fn onePassPrefix(al: std.mem.Allocator, p: *const Prog) !Prefix {
     var i = &p.insts[p.start];
     if (i.op != .empty_width or (@as(prog.EmptyOp, @intCast(i.arg)) & prog.empty_begin_text) == 0) {
         return .{ .str = "", .complete = i.op == .match, .pc = p.start };
@@ -447,6 +455,7 @@ pub fn compileOnePass(gpa: std.mem.Allocator, al: std.mem.Allocator, p: *const P
     if (!try makeOnePass(tal, &opp)) return null;
     cleanupOnePass(&opp, p);
 
+    const pfx = try onePassPrefix(al, p);
     const insts = try al.alloc(OnePassInst, opp.insts.len);
     for (opp.insts, 0..) |inst, i| {
         insts[i] = .{
@@ -457,7 +466,13 @@ pub fn compileOnePass(gpa: std.mem.Allocator, al: std.mem.Allocator, p: *const P
             .next = if (inst.next.len > 0) try al.dupe(u32, inst.next) else &.{},
         };
     }
-    return .{ .insts = insts, .start = opp.start };
+    return .{
+        .insts = insts,
+        .start = opp.start,
+        .prefix = pfx.str,
+        .prefix_complete = pfx.complete,
+        .prefix_end = pfx.pc,
+    };
 }
 
 test "fresh one-pass sparse indices are initialized" {

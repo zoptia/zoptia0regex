@@ -28,23 +28,54 @@ const Job = backtrack_.Job;
 
 pub const end_of_text: i32 = -1;
 
-pub const max_first_bytes = search.max_first_bytes;
-
-/// Match-acceleration data computed at compile time (see `regexp.compileInternal`).
+/// Scan acceleration for the Pike VM and the bitstate engine, computed at
+/// compile time (see `regexp.compileInternal`). The one-pass engine never
+/// scans; its own prefix lives in `OnePassProg` (Go's `onePassPrefix`, which
+/// reaches past `\A` and so is valid only for `doOnePass`).
 pub const Accel = struct {
-    /// Literal string every match must start with ("" = none). For one-pass
-    /// regexps this is Go's `onePassPrefix`; otherwise `Prog.prefix`.
+    /// Go's `Prog.Prefix`: a literal every match must start with ("" =
+    /// none). Always empty for one-pass regexps, whose programs begin with
+    /// `\A`.
     prefix: []const u8 = "",
-    /// One-pass only: the pc to resume at after `prefix` has been consumed.
-    prefix_end: u32 = 0,
-    /// Offset of `prefix`'s rarest byte (see `prefixAnchor`), precomputed at
-    /// compile time so the per-call search does not rescan the needle.
+    /// Offset of `prefix`'s rarest byte (see `search.prefixAnchor`),
+    /// precomputed so the per-call search does not rescan the needle.
     prefix_anchor: u32 = 0,
+    /// The first rune of `prefix` (Go's `prefixRune`); unused when empty.
+    prefix_rune: i32 = -1,
     /// When `prefix` is empty: the (ASCII) bytes a match can start with
-    /// (at most `max_first_bytes`), or empty when no such small set exists.
-    /// A superset of the true first bytes, so skipping to the next
+    /// (at most `search.max_first_bytes`), or empty when no such small set
+    /// exists. A superset of the true first bytes, so skipping to the next
     /// occurrence can never skip a match.
     first_bytes: []const u8 = "",
+};
+
+/// Engine selection. `auto` is Go's dispatch; the others exist so tests can
+/// cross-check every engine on the same regexp (see `Engine.mode`).
+pub const Mode = enum {
+    auto,
+    /// Go's dispatch minus the one-pass engine.
+    no_onepass,
+    /// Always the Pike VM.
+    pike,
+    /// The bitstate backtracker whenever its visited bitmap stays within
+    /// `max_forced_bitstate_bits`; otherwise the Pike VM.
+    bitstate,
+};
+
+const max_forced_bitstate_bits = 1 << 26;
+
+/// Everything the engines need from a compiled regexp, bundled so it can be
+/// passed by pointer. Owned by `regexp.Regexp`.
+pub const Engine = struct {
+    prog: *const Prog,
+    onepass: ?*const OnePassProg = null,
+    /// Go's `Regexp.cond`: the program's start condition.
+    cond: EmptyOp,
+    /// Leftmost-longest (POSIX) instead of leftmost-first.
+    longest: bool = false,
+    accel: Accel = .{},
+    /// Test hook: force an engine (not part of the public API).
+    mode: Mode = .auto,
 };
 
 fn inFirstBytes(set: []const u8, r: i32) bool {
@@ -123,6 +154,36 @@ pub const Input = struct {
         if (pos > 0 and pos <= self.s.len) r1 = decodeLastRune(self.s[0..pos]);
         if (pos < self.s.len) r2 = self.step(pos).r;
         return LazyFlag.init(r1, r2);
+    }
+};
+
+/// A position plus the two runes decoded from it: Go's `r, width` /
+/// `r1, width1` pairs in `machine.match` and `doOnePass`, which always read
+/// one rune ahead so the boundary flag between them is at hand.
+const Cursor = struct {
+    pos: usize,
+    r: i32,
+    width: usize,
+    r1: i32,
+    width1: usize,
+
+    /// Decode the rune at `pos` and the rune after it.
+    inline fn at(input: Input, pos: usize) Cursor {
+        const a = input.step(pos);
+        const b = input.step(pos + a.w); // end_of_text when a is
+        return .{ .pos = pos, .r = a.r, .width = a.w, .r1 = b.r, .width1 = b.w };
+    }
+
+    /// Step over `r`.
+    inline fn advance(c: *Cursor, input: Input) void {
+        c.pos += c.width;
+        c.r = c.r1;
+        c.width = c.width1;
+        if (c.r != end_of_text) {
+            const s = input.step(c.pos + c.width);
+            c.r1 = s.r;
+            c.width1 = s.w;
+        }
     }
 };
 
@@ -274,7 +335,6 @@ const Machine = struct {
     cond: EmptyOp,
     ncap: usize,
     accel: Accel,
-    prefix_rune: i32,
     q0: Queue,
     q1: Queue,
     matched: bool = false,
@@ -285,26 +345,15 @@ const Machine = struct {
     /// scratch outlives the Machine. Fresh sparse storage is initialized because
     /// Zig does not permit reading undefined integers. Reused sparse entries
     /// need no clearing: the dense cross-check rejects stale indices.
-    fn init(scratch: *Scratch, p: *const Prog, longest: bool, cond: EmptyOp, accel: Accel, ncap: usize) !Machine {
-        const ninst = p.insts.len;
-        try scratch.ensurePike(ninst, ncap);
-        var prune: i32 = -1;
-        const prefix = accel.prefix;
-        if (prefix.len > 0) {
-            const n = std.unicode.utf8ByteSequenceLength(prefix[0]) catch 1;
-            prune = if (n <= prefix.len)
-                @intCast(std.unicode.utf8Decode(prefix[0..n]) catch 0xFFFD)
-            else
-                0xFFFD;
-        }
+    fn init(scratch: *Scratch, e: *const Engine, ncap: usize) !Machine {
+        try scratch.ensurePike(e.prog.insts.len, ncap);
         return .{
             .scratch = scratch,
-            .p = p,
-            .longest = longest,
-            .cond = cond,
+            .p = e.prog,
+            .longest = e.longest,
+            .cond = e.cond,
             .ncap = ncap,
-            .accel = accel,
-            .prefix_rune = prune,
+            .accel = e.accel,
             .q0 = .{ .sparse = scratch.s0, .dense = scratch.dense0 },
             .q1 = .{ .sparse = scratch.s1, .dense = scratch.dense1 },
             .matchcap = scratch.matchcap,
@@ -452,82 +501,49 @@ const Machine = struct {
     /// Run the machine over `input` starting at `pos`; returns whether a match
     /// was found, leaving the submatch positions in `m.matchcap`.
     /// Mirrors Go's `machine.match`.
-    fn run(m: *Machine, input: Input, pos_in: usize) !bool {
-        var pos = pos_in;
+    fn run(m: *Machine, input: Input, pos: usize) !bool {
         if (m.cond == prog.impossible) return false;
         m.matched = false;
         for (m.matchcap) |*x| x.* = -1;
 
         var runq = &m.q0;
         var nextq = &m.q1;
-        var r: i32 = end_of_text;
-        var r1: i32 = end_of_text;
-        var width: usize = 0;
-        var width1: usize = 0;
-        const s0 = input.step(pos);
-        r = s0.r;
-        width = s0.w;
-        if (r != end_of_text) {
-            const s1 = input.step(pos + width);
-            r1 = s1.r;
-            width1 = s1.w;
-        }
-        var flag: LazyFlag = if (pos == 0) LazyFlag.init(-1, r) else input.context(pos);
+        var c = Cursor.at(input, pos);
+        var flag: LazyFlag = if (pos == 0) LazyFlag.init(-1, c.r) else input.context(pos);
 
         while (true) {
             if (runq.n == 0) {
-                if (m.cond & prog.empty_begin_text != 0 and pos != 0) break; // anchored, past start
+                if (m.cond & prog.empty_begin_text != 0 and c.pos != 0) break; // anchored, past start
                 if (m.matched) break; // have match, done exploring
                 // Literal-prefix acceleration: every match must start with the
                 // prefix, so fast-forward to its next occurrence (memchr-class
                 // substring search) instead of stepping the NFA at every byte.
-                if (m.accel.prefix.len > 0 and r1 != m.prefix_rune) {
-                    if (search.prefixIndexAnchored(input.s[pos..], m.accel.prefix, m.accel.prefix_anchor)) |adv| {
-                        pos += adv;
-                        const sa = input.step(pos);
-                        r = sa.r;
-                        width = sa.w;
-                        const sb = input.step(pos + width);
-                        r1 = sb.r;
-                        width1 = sb.w;
-                    } else break;
-                } else if (m.accel.first_bytes.len > 0 and !inFirstBytes(m.accel.first_bytes, r)) {
+                if (m.accel.prefix.len > 0 and c.r1 != m.accel.prefix_rune) {
+                    const adv = search.prefixIndexAnchored(input.s[c.pos..], m.accel.prefix, m.accel.prefix_anchor) orelse break;
+                    c = Cursor.at(input, c.pos + adv);
+                } else if (m.accel.first_bytes.len > 0 and !inFirstBytes(m.accel.first_bytes, c.r)) {
                     // First-byte acceleration: no literal prefix, but every
                     // match starts with one of a few ASCII bytes (e.g. a
                     // case-insensitive literal or a small leading class), so
                     // scan ahead to the next candidate. Unlike the prefix
                     // path, the closure may pass zero-width assertions, so
                     // the boundary flag must be recomputed for the new pos.
-                    if (search.indexOfAnyByte(input.s[pos..], m.accel.first_bytes)) |adv| {
-                        if (adv > 0) {
-                            pos += adv;
-                            const sa = input.step(pos);
-                            r = sa.r;
-                            width = sa.w;
-                            const sb = input.step(pos + width);
-                            r1 = sb.r;
-                            width1 = sb.w;
-                            flag = input.context(pos);
-                        }
-                    } else break;
+                    const adv = search.indexOfAnyByte(input.s[c.pos..], m.accel.first_bytes) orelse break;
+                    if (adv > 0) {
+                        c = Cursor.at(input, c.pos + adv);
+                        flag = input.context(c.pos);
+                    }
                 }
             }
             if (!m.matched) {
-                if (m.matchcap.len > 0) m.matchcap[0] = @intCast(pos);
-                _ = try m.add(runq, m.p.start, pos, m.matchcap, &flag, null);
+                if (m.matchcap.len > 0) m.matchcap[0] = @intCast(c.pos);
+                _ = try m.add(runq, m.p.start, c.pos, m.matchcap, &flag, null);
             }
-            flag = LazyFlag.init(r, r1);
-            try m.step(runq, nextq, pos, pos + width, r, &flag);
-            if (width == 0) break;
+            flag = LazyFlag.init(c.r, c.r1);
+            try m.step(runq, nextq, c.pos, c.pos + c.width, c.r, &flag);
+            if (c.width == 0) break;
             if (m.matchcap.len == 0 and m.matched) break; // match-only, any match will do
-            pos += width;
-            r = r1;
-            width = width1;
-            if (r != end_of_text) {
-                const sc = input.step(pos + width);
-                r1 = sc.r;
-                width1 = sc.w;
-            }
+            c.advance(input);
             const tmp = runq;
             runq = nextq;
             nextq = tmp;
@@ -540,41 +556,23 @@ const Machine = struct {
 /// The one-pass engine: a single deterministic pass following per-instruction
 /// `Next` dispatch tables. Used only for qualifying anchored regexps. Mirrors
 /// Go's `doOnePass`.
-fn doOnePass(op: *const OnePassProg, cond: EmptyOp, accel: Accel, input: Input, pos0: usize, caps: []i64) bool {
+fn doOnePass(op: *const OnePassProg, cond: EmptyOp, input: Input, pos: usize, caps: []i64) bool {
     if (cond == prog.impossible) return false;
-    var pos = pos0;
-    for (caps) |*c| c.* = -1;
+    for (caps) |*x| x.* = -1;
 
-    var r: i32 = end_of_text;
-    var r1: i32 = end_of_text;
-    var width: usize = 0;
-    var width1: usize = 0;
-    const s0 = input.step(pos);
-    r = s0.r;
-    width = s0.w;
-    if (r != end_of_text) {
-        const s1 = input.step(pos + width);
-        r1 = s1.r;
-        width1 = s1.w;
-    }
-    var flag: LazyFlag = if (pos == 0) LazyFlag.init(-1, r) else input.context(pos);
+    var c = Cursor.at(input, pos);
+    var flag: LazyFlag = if (pos == 0) LazyFlag.init(-1, c.r) else input.context(pos);
     var pc = op.start;
     var matched = false;
 
     // If there is a simple literal prefix, skip over it and resume at
-    // `accel.prefix_end` (the prefix crosses no capture instructions, so no
+    // `op.prefix_end` (the prefix crosses no capture instructions, so no
     // recorded state is lost). Mirrors Go's `doOnePass`.
-    if (pos == 0 and flag.match(@intCast(op.insts[pc].arg)) and accel.prefix.len > 0) {
-        if (!std.mem.startsWith(u8, input.s, accel.prefix)) return false;
-        pos += accel.prefix.len;
-        const sa = input.step(pos);
-        r = sa.r;
-        width = sa.w;
-        const sb = input.step(pos + width);
-        r1 = sb.r;
-        width1 = sb.w;
-        flag = input.context(pos);
-        pc = accel.prefix_end;
+    if (pos == 0 and flag.match(@intCast(op.insts[pc].arg)) and op.prefix.len > 0) {
+        if (!std.mem.startsWith(u8, input.s, op.prefix)) return false;
+        c = Cursor.at(input, op.prefix.len);
+        flag = input.context(c.pos);
+        pc = op.prefix_end;
     }
 
     loop: while (true) {
@@ -585,16 +583,16 @@ fn doOnePass(op: *const OnePassProg, cond: EmptyOp, accel: Accel, input: Input, 
                 matched = true;
                 if (caps.len > 0) {
                     caps[0] = 0;
-                    caps[1] = @intCast(pos);
+                    caps[1] = @intCast(c.pos);
                 }
                 break :loop;
             },
-            .rune => if (r < 0 or prog.matchRunePos(inst.runes, inst.arg, @intCast(r)) < 0) break :loop,
-            .rune1 => if (r != @as(i32, @intCast(inst.runes[0]))) break :loop,
+            .rune => if (c.r < 0 or prog.matchRunePos(inst.runes, inst.arg, @intCast(c.r)) < 0) break :loop,
+            .rune1 => if (c.r != @as(i32, @intCast(inst.runes[0]))) break :loop,
             .rune_any => {},
-            .rune_any_not_nl => if (r == '\n') break :loop,
+            .rune_any_not_nl => if (c.r == '\n') break :loop,
             .alt, .alt_match => {
-                pc = onepass.onePassNext(inst, r);
+                pc = onepass.onePassNext(inst, c.r);
                 continue :loop;
             },
             .fail => break :loop,
@@ -604,21 +602,14 @@ fn doOnePass(op: *const OnePassProg, cond: EmptyOp, accel: Accel, input: Input, 
                 continue :loop;
             },
             .capture => {
-                if (inst.arg < caps.len) caps[@intCast(inst.arg)] = @intCast(pos);
+                if (inst.arg < caps.len) caps[@intCast(inst.arg)] = @intCast(c.pos);
                 continue :loop;
             },
         }
         // Reached only by the rune-consuming instructions: advance one rune.
-        if (width == 0) break :loop;
-        flag = LazyFlag.init(r, r1);
-        pos += width;
-        r = r1;
-        width = width1;
-        if (r != end_of_text) {
-            const sc = input.step(pos + width);
-            r1 = sc.r;
-            width1 = sc.w;
-        }
+        if (c.width == 0) break :loop;
+        flag = LazyFlag.init(c.r, c.r1);
+        c.advance(input);
     }
     return matched;
 }
@@ -628,29 +619,31 @@ fn doOnePass(op: *const OnePassProg, cond: EmptyOp, accel: Accel, input: Input, 
 /// recorded; pairs are [start,end], -1 when unset). Returns whether a match was
 /// found. `caps` is only meaningful when `true` is returned.
 ///
-/// Dispatches like Go: the one-pass engine if the regexp qualifies, else the
-/// bitstate backtracker for small programs/inputs, else the Pike VM.
+/// Dispatches like Go's `(*Regexp).find`: the one-pass engine if the regexp
+/// qualifies, else the bitstate backtracker for small programs/inputs, else
+/// the Pike VM (`e.mode` overrides this for tests).
 ///
-/// Reuse variant: borrows all engine storage from `scratch`, so a steady-state
-/// loop over one compiled program allocates nothing. The one-pass path never
-/// allocated and ignores the scratch.
-pub fn executeReuse(
-    scratch: *Scratch,
-    p: *const Prog,
-    op: ?*const OnePassProg,
-    longest: bool,
-    cond: EmptyOp,
-    accel: Accel,
-    input: Input,
-    pos: usize,
-    caps: []i64,
-) !bool {
-    if (op) |onep| return doOnePass(onep, cond, accel, input, pos, caps);
-    const ninst = p.insts.len;
-    if (ninst <= backtrack_.max_backtrack_prog and ninst > 0 and input.s.len < backtrack_.max_backtrack_vector / ninst) {
-        return backtrack_.backtrack(scratch, p, longest, cond, accel, input, pos, caps);
+/// Borrows all engine storage from `scratch`, so a steady-state loop over one
+/// compiled program allocates nothing. The one-pass path never allocates and
+/// ignores the scratch.
+pub fn executeReuse(scratch: *Scratch, e: *const Engine, input: Input, pos: usize, caps: []i64) !bool {
+    const ninst = e.prog.insts.len;
+    switch (e.mode) {
+        .auto => if (e.onepass) |op| return doOnePass(op, e.cond, input, pos, caps),
+        .no_onepass => {},
+        .pike => return pike(scratch, e, input, pos, caps),
+        .bitstate => if (ninst * (input.s.len + 1) <= max_forced_bitstate_bits) {
+            return backtrack_.backtrack(scratch, e, input, pos, caps);
+        },
     }
-    var m = try Machine.init(scratch, p, longest, cond, accel, caps.len);
+    if (ninst <= backtrack_.max_backtrack_prog and input.s.len < backtrack_.max_backtrack_vector / ninst) {
+        return backtrack_.backtrack(scratch, e, input, pos, caps);
+    }
+    return pike(scratch, e, input, pos, caps);
+}
+
+fn pike(scratch: *Scratch, e: *const Engine, input: Input, pos: usize, caps: []i64) !bool {
+    var m = try Machine.init(scratch, e, caps.len);
     if (!try m.run(input, pos)) return false;
     @memcpy(caps, m.matchcap);
     return true;
@@ -664,26 +657,6 @@ test "decodeLastRune handles ASCII, multibyte, and malformed tails" {
     try expectEqual(@as(i32, 0xFFFD), decodeLastRune("\xE6\x97")); // truncated lead
     try expectEqual(@as(i32, 0xFFFD), decodeLastRune("a\x80")); // lone continuation
     try expectEqual(@as(i32, 0xFFFD), decodeLastRune("\xFF")); // invalid byte
-}
-
-/// Allocating variant: the existing public entry point. Wraps `executeReuse`
-/// with a temporary scratch, so each call allocates and frees its engine
-/// storage exactly as before — and the differential suite (which routes through
-/// here) validates the shared `executeReuse` code path.
-pub fn execute(
-    allocator: std.mem.Allocator,
-    p: *const Prog,
-    op: ?*const OnePassProg,
-    longest: bool,
-    cond: EmptyOp,
-    accel: Accel,
-    input: Input,
-    pos: usize,
-    caps: []i64,
-) !bool {
-    var scratch = Scratch.init(allocator);
-    defer scratch.deinit();
-    return executeReuse(&scratch, p, op, longest, cond, accel, input, pos, caps);
 }
 
 fn exerciseScratchGrowth(allocator: std.mem.Allocator) !void {
