@@ -1,18 +1,21 @@
+// Command genuni writes src/unicode_tables.zig to stdout, generated from the
+// Go toolchain's unicode package: every general category and script table
+// (the full set Go's regexp accepts), the case-fold companion tables
+// (unicode.FoldCategory / unicode.FoldScript) that regexp/syntax merges under
+// (?i), and unicode.CategoryAliases. Names are emitted alongside their
+// canonical form (see canonicalName below, a copy of regexp/syntax's) so
+// lookups can ignore case, '_', '-' and spaces exactly like Go 1.27's
+// unicodeTable. Run via tools/regen.sh.
 package main
-
-// Generates src/unicode_tables.zig from the Go toolchain's unicode package:
-// every general category and script table (the full set Go's regexp accepts),
-// the case-fold companion tables (unicode.FoldCategory / unicode.FoldScript)
-// that regexp/syntax merges under (?i), and unicode.CategoryAliases. Names are
-// emitted alongside their canonical form (see canonicalName below, a copy of
-// regexp/syntax's) so lookups can ignore case, '_', '-' and spaces exactly
-// like Go 1.27's unicodeTable.
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"unicode"
+
+	"zoptia0regex/tools/internal/gen"
 )
 
 type rng struct{ lo, hi, stride uint32 }
@@ -62,7 +65,7 @@ func sortedKeys[T any](m map[string]T) []string {
 	return ks
 }
 
-func emitRanges(f *os.File, indent string, rs []rng) {
+func emitRanges(f io.Writer, indent string, rs []rng) {
 	fmt.Fprintf(f, "&[_]URange{\n")
 	for _, r := range rs {
 		fmt.Fprintf(f, "%s    .{ .lo = 0x%X, .hi = 0x%X, .stride = %d },\n", indent, r.lo, r.hi, r.stride)
@@ -70,7 +73,7 @@ func emitRanges(f *os.File, indent string, rs []rng) {
 	fmt.Fprintf(f, "%s}", indent)
 }
 
-func emitClasses(f *os.File, varname string, tables map[string]*unicode.RangeTable, folds map[string]*unicode.RangeTable) int {
+func emitClasses(f io.Writer, varname string, tables map[string]*unicode.RangeTable, folds map[string]*unicode.RangeTable) int {
 	total := 0
 	fmt.Fprintf(f, "pub const %s = [_]UnicodeClass{\n", varname)
 	for _, name := range sortedKeys(tables) {
@@ -91,12 +94,7 @@ func emitClasses(f *os.File, varname string, tables map[string]*unicode.RangeTab
 }
 
 func main() {
-	f, err := os.Create("unicode_tables.zig")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	defer f.Close()
+	f := gen.Stdout()
 	fmt.Fprintln(f, "// Code generated from Go's unicode package; DO NOT EDIT.")
 	fmt.Fprintf(f, "// Unicode %s: every general category and script table Go's regexp accepts,\n", unicode.Version)
 	fmt.Fprintln(f, "// stored as (lo, hi, stride) ranges replicating Go's RangeTable / appendTable.")
@@ -118,6 +116,7 @@ func main() {
 		fmt.Fprintf(f, "    .{ .canon = \"%s\", .actual = \"%s\" },\n", canonicalName(name), unicode.CategoryAliases[name])
 	}
 	fmt.Fprintln(f, "};")
+	f.Close()
 	fmt.Fprintf(os.Stderr, "unicode %s: %d categories, %d scripts, %d aliases, %d ranges total\n",
 		unicode.Version, len(unicode.Categories), len(unicode.Scripts), len(unicode.CategoryAliases), total)
 }

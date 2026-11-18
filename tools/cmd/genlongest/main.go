@@ -1,78 +1,57 @@
+// Command genlongest generates test/data/longest.jsonl, the randomized
+// leftmost-longest differential corpus. Run via tools/regen.sh.
+//
+// Streams, each with its own seed:
+//
+//	longest  Perl-syntax patterns compiled with regexp.Compile and switched
+//	         to Longest(), isolating leftmost-longest semantics from POSIX
+//	         syntax
+//	posix    POSIX ERE patterns compiled with regexp.CompilePOSIX (POSIX
+//	         syntax: line-anchored ^ and $, stacked repetition, no Perl
+//	         classes), on inputs that may hold NULs and malformed UTF-8
+//
+// Patterns that fail to compile are recorded as error cases. Every case
+// also records the find-all family (unlimited, template "[$0/$1]").
 package main
 
 import (
-	"bufio"
-	"encoding/json"
 	"math/rand"
-	"os"
-	"regexp"
+
+	"zoptia0regex/tools/internal/corpus"
+	"zoptia0regex/tools/internal/randre"
 )
 
-type LCase struct {
-	P   string  `json:"p"`
-	I   string  `json:"i"`
-	M   []int   `json:"m"`
-	All [][]int `json:"all"`
+const replT = "[$0/$1]"
+
+const inputsPerPattern = 6
+
+type stream struct {
+	seed    int64
+	count   int
+	mode    corpus.Mode
+	pattern func(*rand.Rand) string
+	input   func(*rand.Rand) string
 }
 
-var latoms = []string{"a", "b", "c", "x", " ", "1", "2", "Z", ".", "\\d", "\\w", "\\s", "[abc]", "[a-c]", "[^a-c]", "[0-9]"}
-var lquants = []string{"", "", "*", "+", "?", "{2}", "{1,3}", "{0,2}", "{2,}"}
-var lanchors = []string{"^", "$", "\\b"}
-
-func lgenAtom(r *rand.Rand, depth int) string {
-	if depth > 0 && r.Intn(3) == 0 {
-		inner := lgenConcat(r, depth-1)
-		if r.Intn(2) == 0 {
-			return "(" + inner + ")"
-		}
-		return "(?:" + inner + ")"
-	}
-	return latoms[r.Intn(len(latoms))]
-}
-func lgenPiece(r *rand.Rand, depth int) string {
-	return lgenAtom(r, depth) + lquants[r.Intn(len(lquants))]
-}
-func lgenConcat(r *rand.Rand, depth int) string {
-	n := 1 + r.Intn(3)
-	s := ""
-	for i := 0; i < n; i++ {
-		if r.Intn(7) == 0 {
-			s += lanchors[r.Intn(len(lanchors))]
-		}
-		s += lgenPiece(r, depth)
-	}
-	if r.Intn(3) == 0 && depth > 0 {
-		s += "|" + lgenConcat(r, depth-1)
-	}
-	return s
-}
-
-var linput = []rune("abcxZ12 αβ")
-
-func lgenInput(r *rand.Rand) string {
-	n := r.Intn(10)
-	rs := make([]rune, n)
-	for i := range rs {
-		rs[i] = linput[r.Intn(len(linput))]
-	}
-	return string(rs)
+var streams = []stream{
+	{424242, 2500, corpus.Longest, randre.Longest, randre.LongestInput},
+	{20261119, 800, corpus.POSIX, randre.POSIX, randre.ByteInput},
 }
 
 func main() {
-	r := rand.New(rand.NewSource(424242))
-	w := bufio.NewWriter(os.Stdout)
-	defer w.Flush()
-	enc := json.NewEncoder(w)
-	for k := 0; k < 2500; k++ {
-		p := lgenConcat(r, 3)
-		re, err := regexp.Compile(p)
-		if err != nil {
-			continue
-		}
-		re.Longest() // switch to leftmost-longest
-		for j := 0; j < 6; j++ {
-			in := lgenInput(r)
-			enc.Encode(LCase{P: p, I: in, M: re.FindStringSubmatchIndex(in), All: re.FindAllStringSubmatchIndex(in, -1)})
+	w := corpus.NewWriter()
+	for _, s := range streams {
+		r := rand.New(rand.NewSource(s.seed))
+		for k := 0; k < s.count; k++ {
+			c := corpus.Compile(s.pattern(r), s.mode)
+			if c.Err != "" {
+				w.Write(c.Case(""))
+				continue
+			}
+			for j := 0; j < inputsPerPattern; j++ {
+				w.Write(c.CaseAll(s.input(r), -1, replT))
+			}
 		}
 	}
+	w.Close()
 }

@@ -1,40 +1,63 @@
 #!/bin/sh
-# Regenerate the Unicode tables and the differential-test corpora from the
-# locally-installed Go toolchain (the golden reference for this port).
+# Regenerate the Unicode tables, the differential-test corpora and the
+# benchmark workloads from Go (the golden reference for this port).
 #
-#   tools/regen.sh        # regenerate everything
+#   tools/regen.sh
+#
+# The reference is pinned to Go 1.27.1 / Unicode 17.0: GOTOOLCHAIN forces
+# that exact toolchain (the go command downloads it if needed), whatever
+# `go` is on PATH. Everything is generated into a temporary directory first
+# and moved into place only after every generator succeeded, so a failing
+# generator can never leave a truncated or partial output behind.
 #
 # Outputs (all committed; rerun only when a generator changes):
-#   src/fold_table.zig      faithful unicode.SimpleFold table (all of Unicode)
-#   src/unicode_tables.zig  full \p{...} category/script/fold/alias tables
-#   src/cases.jsonl         curated differential corpus
-#   src/fuzz.jsonl          large random differential corpus
-#   src/longest.jsonl       POSIX leftmost-longest corpus
-#   src/bytes.jsonl         byte-level differential corpus (raw bytes, POSIX, templates, limits)
-#   src/bench.jsonl + src/bench_*.txt  benchmark workloads and corpus
-set -e
+#   src/fold_table.zig        unicode.SimpleFold orbits (all of Unicode)
+#   src/unicode_tables.zig    \p{...} category/script/fold/alias tables
+#   test/data/cases.jsonl     curated differential corpus
+#   test/data/fuzz.jsonl      randomized Perl-syntax corpus
+#   test/data/longest.jsonl   randomized leftmost-longest / POSIX corpus
+#   test/data/bytes.jsonl     byte-level corpus (malformed UTF-8, NULs, modes, limits)
+#   test/data/MANIFEST.json   Go/Unicode versions and per-corpus case counts
+#   bench/data/*              benchmark workloads and corpus
+set -eu
 cd "$(dirname "$0")/.."
+root=$(pwd)
 
-echo "generating Unicode fold table ..."
-( cd tools && go run genfold.go && mv fold_table.zig ../src/fold_table.zig )
+GO_REF=go1.27.1
+export GOTOOLCHAIN="$GO_REF"
+version=$(cd tools && go version)
+case "$version" in
+"go version $GO_REF "*) ;;
+*)
+	echo "regen.sh: need $GO_REF, got: $version" >&2
+	exit 1
+	;;
+esac
+echo "using $version"
 
-echo "generating Unicode class tables ..."
-( cd tools && go run genuni.go && mv unicode_tables.zig ../src/unicode_tables.zig )
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/zoptia0regex-regen.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/bin" "$tmp/src" "$tmp/test" "$tmp/bench"
 
-echo "generating curated differential corpus (src/cases.jsonl) ..."
-( cd tools && go run gencases.go ) > src/cases.jsonl
+echo "building generators ..."
+(cd tools && go build -o "$tmp/bin/" ./cmd/genfold ./cmd/genuni ./cmd/gencases ./cmd/genfuzz ./cmd/genlongest ./cmd/genbytes ./cmd/genbench ./cmd/manifest)
 
-echo "generating random fuzz corpus (src/fuzz.jsonl) ..."
-( cd tools && go run genfuzz.go ) > src/fuzz.jsonl
+echo "generating Unicode tables ..."
+"$tmp/bin/genfold" >"$tmp/src/fold_table.zig"
+"$tmp/bin/genuni" >"$tmp/src/unicode_tables.zig"
 
-echo "generating leftmost-longest corpus (src/longest.jsonl) ..."
-( cd tools && go run genlongest.go ) > src/longest.jsonl
+for corpus in cases fuzz longest bytes; do
+	echo "generating test/data/$corpus.jsonl ..."
+	"$tmp/bin/gen$corpus" >"$tmp/test/$corpus.jsonl"
+done
+"$tmp/bin/manifest" "$tmp/test/cases.jsonl" "$tmp/test/fuzz.jsonl" "$tmp/test/longest.jsonl" "$tmp/test/bytes.jsonl" >"$tmp/test/MANIFEST.json"
 
-echo "generating byte-level corpus (src/bytes.jsonl) ..."
-( cd tools && go run genbytes.go ) > src/bytes.jsonl
+echo "generating benchmark workloads ..."
+"$tmp/bin/genbench" -dir "$tmp/bench"
 
-echo "generating benchmark corpus (src/bench*.{jsonl,txt}) ..."
-( cd tools && go run genbench.go ) > src/bench.jsonl
-
-echo "done. counts:"
-wc -l src/cases.jsonl src/fuzz.jsonl src/longest.jsonl src/bytes.jsonl src/bench.jsonl
+# Every generator succeeded: install the outputs.
+mv "$tmp/src/fold_table.zig" "$tmp/src/unicode_tables.zig" "$root/src/"
+mv "$tmp/test/"* "$root/test/data/"
+mv "$tmp/bench/"* "$root/bench/data/"
+echo "done."
+cat "$root/test/data/MANIFEST.json"

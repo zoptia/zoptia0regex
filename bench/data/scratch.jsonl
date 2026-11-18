@@ -1,0 +1,6 @@
+{"name":"literal","p":"needle","in":"a haystack with a needle hidden somewhere near the end"}
+{"name":"prefix_digits","p":"needle\\d+","in":"a haystack with a needle42 hidden somewhere near the end"}
+{"name":"alternation","p":"(foo|bar|baz)+","in":"zz bar foo baz qux barbaz zz"}
+{"name":"email_unanchored","p":"[a-z]+@[a-z]+\\.[a-z]+","in":"please contact us at user@example.com today"}
+{"name":"charclass_plus","p":"[0-9]+","in":"order 12345 shipped on 2024"}
+{"name":"anchored_onepass","p":"\\A\\d+\\z","in":"1234567890"}
