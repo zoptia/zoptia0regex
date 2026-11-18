@@ -46,7 +46,7 @@ pub const Accel = struct {
     /// (at most `search.max_first_bytes`), or empty when no such small set
     /// exists. A superset of the true first bytes, so skipping to the next
     /// occurrence can never skip a match.
-    first_bytes: []const u8 = "",
+    first_bytes: search.ByteSet = .{},
 };
 
 /// Engine selection. `auto` is Go's dispatch; the others exist so tests can
@@ -77,15 +77,6 @@ pub const Engine = struct {
     /// Test hook: force an engine (not part of the public API).
     mode: Mode = .auto,
 };
-
-fn inFirstBytes(set: []const u8, r: i32) bool {
-    if (r < 0 or r > 0x7F) return false;
-    const b: u8 = @intCast(r);
-    for (set) |x| {
-        if (x == b) return true;
-    }
-    return false;
-}
 
 /// A lazily-evaluated pair of boundary runes, for checking zero-width
 /// assertions. Mirrors Go's `lazyFlag`.
@@ -347,7 +338,7 @@ const Machine = struct {
     longest: bool,
     cond: EmptyOp,
     ncap: usize,
-    accel: Accel,
+    accel: *const Accel,
     q0: Queue,
     q1: Queue,
     matched: bool = false,
@@ -366,7 +357,7 @@ const Machine = struct {
             .longest = e.longest,
             .cond = e.cond,
             .ncap = ncap,
-            .accel = e.accel,
+            .accel = &e.accel,
             .q0 = .{ .sparse = scratch.s0, .dense = scratch.dense0 },
             .q1 = .{ .sparse = scratch.s1, .dense = scratch.dense1 },
             .matchcap = scratch.matchcap,
@@ -555,14 +546,14 @@ const Machine = struct {
                 if (m.accel.prefix.len > 0 and c.r1 != m.accel.prefix_rune) {
                     const adv = search.prefixIndexAnchored(input.s[c.pos..], m.accel.prefix, m.accel.prefix_anchor) orelse break;
                     c = Cursor.at(input, c.pos + adv);
-                } else if (m.accel.first_bytes.len > 0 and !inFirstBytes(m.accel.first_bytes, c.r)) {
+                } else if (m.accel.first_bytes.bytes.len > 0 and !m.accel.first_bytes.containsRune(c.r)) {
                     // First-byte acceleration: no literal prefix, but every
                     // match starts with one of a few ASCII bytes (e.g. a
                     // case-insensitive literal or a small leading class), so
                     // scan ahead to the next candidate. Unlike the prefix
                     // path, the closure may pass zero-width assertions, so
                     // the boundary flag must be recomputed for the new pos.
-                    const adv = search.indexOfAnyByte(input.s[c.pos..], m.accel.first_bytes) orelse break;
+                    const adv = search.indexOfAnyByte(input.s[c.pos..], &m.accel.first_bytes) orelse break;
                     if (adv > 0) {
                         c = Cursor.at(input, c.pos + adv);
                         flag = input.context(c.pos);

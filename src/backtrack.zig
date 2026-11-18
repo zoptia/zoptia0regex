@@ -203,10 +203,10 @@ pub fn backtrack(scratch: *Scratch, e: *const Engine, input: Input, pos: usize, 
         if (accel.prefix.len > 0) {
             const adv = search.prefixIndexAnchored(input.s[@intCast(p_pos)..], accel.prefix, accel.prefix_anchor) orelse return false;
             p_pos += @intCast(adv);
-        } else if (accel.first_bytes.len > 0) {
+        } else if (accel.first_bytes.bytes.len > 0) {
             // No literal prefix, but every match starts with one of a few
             // ASCII bytes: jump to the next candidate start.
-            const adv = search.indexOfAnyByte(input.s[@intCast(p_pos)..], accel.first_bytes) orelse return false;
+            const adv = search.indexOfAnyByte(input.s[@intCast(p_pos)..], &accel.first_bytes) orelse return false;
             p_pos += @intCast(adv);
         }
         if (b.cap.len > 0) b.cap[0] = p_pos;

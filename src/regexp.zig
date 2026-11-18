@@ -47,7 +47,8 @@ pub const Regexp = struct {
     /// holds no U+FFFD stand-in for an unencodable rune. Matching is then
     /// a substring search (see `findAt`).
     literal: bool,
-    /// Same as `engine.accel.first_bytes`; kept for introspection in tests.
+    /// Same as `engine.accel.first_bytes.bytes`; kept for introspection in
+    /// tests.
     first_bytes: []const u8,
     /// Same as `engine.onepass`; kept for introspection in tests.
     onepass: ?*const onepass.OnePassProg,
@@ -686,7 +687,7 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
                 .prefix = pfx.str,
                 .prefix_anchor = search.prefixAnchor(pfx.str),
                 .prefix_rune = if (pfx.str.len > 0) (exec.Input{ .s = pfx.str }).step(0).r else -1,
-                .first_bytes = first_bytes,
+                .first_bytes = if (first_bytes.len > 0) search.ByteSet.init(first_bytes) else .{},
             },
         },
     };

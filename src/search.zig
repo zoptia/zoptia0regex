@@ -10,34 +10,64 @@ const std = @import("std");
 /// (too many positions qualify) rather than costing too much to scan.
 pub const max_first_bytes = 16;
 
+/// The SIMD width `indexOfAnyByte` scans with; null on targets without
+/// vector registers, where it falls back to a scalar loop.
+const vector_len = std.simd.suggestVectorLength(u8);
+const ByteVec = @Vector(vector_len orelse 1, u8);
+
+/// A small set of ASCII bytes, prepared once (at regexp compile time) for
+/// membership tests and for `indexOfAnyByte`.
+pub const ByteSet = struct {
+    /// The members, ascending; empty for "no set".
+    bytes: []const u8 = "",
+    /// Bit b set iff byte b is a member.
+    bitmap: u128 = 0,
+    /// `bytes[k]` broadcast across a vector, so a scan does not rebuild the
+    /// comparison operands on every call.
+    splats: [max_first_bytes]ByteVec = @splat(@splat(0)),
+
+    /// `bytes` must hold 1 to `max_first_bytes` ASCII bytes and outlive
+    /// the set.
+    pub fn init(bytes: []const u8) ByteSet {
+        std.debug.assert(bytes.len >= 1 and bytes.len <= max_first_bytes);
+        var s: ByteSet = .{ .bytes = bytes };
+        for (bytes, 0..) |b, k| {
+            std.debug.assert(b < 0x80);
+            s.bitmap |= @as(u128, 1) << @intCast(b);
+            s.splats[k] = @splat(b);
+        }
+        return s;
+    }
+
+    /// Whether the rune `r` (negative: end of text) is a member.
+    pub inline fn containsRune(s: *const ByteSet, r: i32) bool {
+        if (r < 0 or r > 0x7F) return false;
+        return (s.bitmap >> @intCast(r)) & 1 != 0;
+    }
+};
+
 /// Vectorized first-index-of-any-byte — the memchr2/…/memchr16 analogue used
 /// by the first-byte prefilter. One portable implementation: `@Vector`
 /// compiles to NEON on aarch64, SSE2 on baseline x86_64 (wider with
-/// `-Dcpu=native` on AVX2 machines), and degrades to the scalar std search on
+/// `-Dcpu=native` on AVX2 machines), and degrades to a scalar loop on
 /// targets without SIMD registers.
-pub fn indexOfAnyByte(haystack: []const u8, set: []const u8) ?usize {
-    std.debug.assert(set.len >= 1 and set.len <= max_first_bytes);
-    if (set.len == 1) return std.mem.indexOfScalar(u8, haystack, set[0]);
-    const width = comptime std.simd.suggestVectorLength(u8) orelse
-        return std.mem.indexOfAny(u8, haystack, set);
-    const V = @Vector(width, u8);
-    const Mask = @Int(.unsigned, width);
-
-    var splats: [max_first_bytes]V = undefined;
-    for (set, 0..) |b, k| splats[k] = @splat(b);
-
+pub fn indexOfAnyByte(haystack: []const u8, set: *const ByteSet) ?usize {
+    const n = set.bytes.len;
+    std.debug.assert(n >= 1 and n <= max_first_bytes);
+    if (n == 1) return std.mem.indexOfScalar(u8, haystack, set.bytes[0]);
     var i: usize = 0;
-    while (i + width <= haystack.len) : (i += width) {
-        const chunk: V = haystack[i..][0..width].*;
-        var mask: Mask = 0;
-        for (splats[0..set.len]) |s| mask |= @as(Mask, @bitCast(chunk == s));
-        if (mask != 0) return i + @ctz(mask);
+    if (vector_len) |width| {
+        const Mask = @Int(.unsigned, width);
+        const splats = set.splats[0..n];
+        while (i + width <= haystack.len) : (i += width) {
+            const chunk: ByteVec = haystack[i..][0..width].*;
+            var mask: Mask = 0;
+            for (splats) |s| mask |= @as(Mask, @bitCast(chunk == s));
+            if (mask != 0) return i + @ctz(mask);
+        }
     }
     while (i < haystack.len) : (i += 1) {
-        const c = haystack[i];
-        for (set) |b| {
-            if (c == b) return i;
-        }
+        if (set.containsRune(haystack[i])) return i;
     }
     return null;
 }
@@ -223,13 +253,20 @@ test "indexOfAnyByte agrees with the scalar std search" {
     };
     // Slide both endpoints so hits land before, inside, and after the last
     // full SIMD chunk, plus empty and sub-width slices.
-    for (sets) |set| {
+    for (sets) |bytes| {
+        const set = ByteSet.init(bytes);
+        for (0..0x80) |b| {
+            const want = std.mem.indexOfScalar(u8, bytes, @intCast(b)) != null;
+            try std.testing.expectEqual(want, set.containsRune(@intCast(b)));
+        }
+        try std.testing.expect(!set.containsRune(-1));
+        try std.testing.expect(!set.containsRune(0x80));
         var lo: usize = 0;
         while (lo < hay.len) : (lo += 37) {
             var hi = lo;
             while (hi <= hay.len) : (hi += 23) {
-                const want = std.mem.indexOfAny(u8, hay[lo..hi], set);
-                try std.testing.expectEqual(want, indexOfAnyByte(hay[lo..hi], set));
+                const want = std.mem.indexOfAny(u8, hay[lo..hi], bytes);
+                try std.testing.expectEqual(want, indexOfAnyByte(hay[lo..hi], &set));
             }
         }
     }
