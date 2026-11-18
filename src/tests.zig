@@ -198,25 +198,55 @@ test "leftmost-first vs longest" {
     try std.testing.expectEqualStrings("a", got);
 }
 
-test "invalid patterns error (no crash)" {
-    const bad = [_][]const u8{
-        "(",           "(abc",             ")",           "a)",
-        "[",           "[a-",              "a{2,1}",      "a**",
-        "\\",          "(?P<>x)",          "[z-a]",       "(?P<a)x)",
-        "x{1001}",     "*",                "+",           "?",
-        "(?",          "(?<",              "\\x{110000}", "\\xG",
-        "[[:bogus:]]", "\\p{Nonexistent}", "{2}",
+test "invalid patterns fail with Go's error code" {
+    // `code` is the syntax.ErrorCode Go 1.27.1's regexp.Compile reports.
+    const bad = [_]struct { p: []const u8, code: []const u8, err: regex.ParseError }{
+        .{ .p = "(", .code = "missing closing )", .err = error.MissingParen },
+        .{ .p = "(abc", .code = "missing closing )", .err = error.MissingParen },
+        .{ .p = ")", .code = "unexpected )", .err = error.UnexpectedParen },
+        .{ .p = "a)", .code = "unexpected )", .err = error.UnexpectedParen },
+        .{ .p = "[", .code = "missing closing ]", .err = error.MissingBracket },
+        .{ .p = "[a-", .code = "missing closing ]", .err = error.MissingBracket },
+        .{ .p = "a{2,1}", .code = "invalid repeat count", .err = error.InvalidRepeatSize },
+        .{ .p = "a**", .code = "invalid nested repetition operator", .err = error.InvalidRepeatOp },
+        .{ .p = "\\", .code = "trailing backslash at end of expression", .err = error.TrailingBackslash },
+        .{ .p = "(?P<>x)", .code = "invalid named capture", .err = error.InvalidNamedCapture },
+        .{ .p = "[z-a]", .code = "invalid character class range", .err = error.InvalidCharRange },
+        .{ .p = "(?P<a)x)", .code = "invalid named capture", .err = error.InvalidNamedCapture },
+        .{ .p = "x{1001}", .code = "invalid repeat count", .err = error.InvalidRepeatSize },
+        .{ .p = "*", .code = "missing argument to repetition operator", .err = error.MissingRepeatArgument },
+        .{ .p = "+", .code = "missing argument to repetition operator", .err = error.MissingRepeatArgument },
+        .{ .p = "?", .code = "missing argument to repetition operator", .err = error.MissingRepeatArgument },
+        .{ .p = "(?", .code = "invalid or unsupported Perl syntax", .err = error.InvalidPerlOp },
+        .{ .p = "(?<", .code = "invalid or unsupported Perl syntax", .err = error.InvalidPerlOp },
+        .{ .p = "\\x{110000}", .code = "invalid escape sequence", .err = error.InvalidEscape },
+        .{ .p = "\\xG", .code = "invalid escape sequence", .err = error.InvalidEscape },
+        .{ .p = "[[:bogus:]]", .code = "invalid character class range", .err = error.InvalidCharRange },
+        .{ .p = "\\p{Nonexistent}", .code = "invalid character class range", .err = error.InvalidCharRange },
+        .{ .p = "{2}", .code = "missing argument to repetition operator", .err = error.MissingRepeatArgument },
+        .{ .p = "(?<\xff", .code = "invalid UTF-8", .err = error.InvalidUTF8 },
+        .{ .p = "\\p{\xff}", .code = "invalid UTF-8", .err = error.InvalidUTF8 },
     };
-    for (bad) |p| {
-        if (regex.compile(ta, p)) |*re| {
-            var r = re.*;
-            r.deinit();
-            std.debug.print("expected error for pattern: /{s}/\n", .{p});
+    for (bad) |c| {
+        try std.testing.expectEqualStrings(c.code, regex.errorString(c.err));
+        if (regex.compile(ta, c.p)) |compiled| {
+            var re = compiled;
+            re.deinit();
+            std.debug.print("expected error for pattern: /{s}/\n", .{c.p});
             return error.ShouldHaveErrored;
-        } else |_| {
-            // expected: errored cleanly
+        } else |err| {
+            try std.testing.expectEqual(c.err, err);
         }
     }
+}
+
+test "errorString of the errors the invalid-pattern table cannot reach" {
+    // errorString's switch is exhaustive over ParseError, so a new error
+    // member fails to compile until it gets a message.
+    try std.testing.expectEqualStrings("invalid character class", regex.errorString(error.InvalidCharClass));
+    try std.testing.expectEqualStrings("expression nests too deeply", regex.errorString(error.NestingDepth));
+    try std.testing.expectEqualStrings("expression too large", regex.errorString(error.TooLarge));
+    try std.testing.expectEqualStrings("out of memory", regex.errorString(error.OutOfMemory));
 }
 
 test "linear time on ReDoS-style pattern" {
@@ -448,26 +478,137 @@ test "replace func" {
     try std.testing.expectEqualStrings("a[d]b[BIG]", out);
 }
 
-fn exerciseExecutionAllocationFailures(allocator: std.mem.Allocator, re: *const regex.Regexp, input: []const u8) !void {
-    const matches = try re.findAllSubmatchIndex(allocator, input, -1);
-    defer if (matches) |m| regex.Regexp.freeAllSubmatchIndex(allocator, m);
-    try std.testing.expect(matches != null);
+test "replaceAllFunc appends allocated replacement text" {
+    // Go: MustCompile(`(\w)(\w+)`).ReplaceAllFunc("hello big world", ToUpper)
+    // == "HELLO BIG WORLD".
+    var re = try regex.compile(ta, "(\\w)(\\w+)");
+    defer re.deinit();
+    const Upper = struct {
+        fn f(_: void, al: std.mem.Allocator, out: *std.ArrayList(u8), m: []const u8) regex.ExecError!void {
+            // Temporary allocation of its own, freed before returning.
+            const tmp = try std.ascii.allocUpperString(al, m);
+            defer al.free(tmp);
+            try out.appendSlice(al, tmp);
+        }
+    };
+    const up = try re.replaceAllFunc(ta, "hello big world", {}, Upper.f);
+    defer ta.free(up);
+    try std.testing.expectEqualStrings("HELLO BIG WORLD", up);
+
+    // Empty matches, Go: MustCompile("a*").ReplaceAllFunc("baaab", "<"+m+">")
+    // == "<>b<aaa>b<>".
+    var star = try regex.compile(ta, "a*");
+    defer star.deinit();
+    const Wrap = struct {
+        fn f(_: void, al: std.mem.Allocator, out: *std.ArrayList(u8), m: []const u8) regex.ExecError!void {
+            try out.print(al, "<{s}>", .{m});
+        }
+    };
+    const wrapped = try star.replaceAllFunc(ta, "baaab", {}, Wrap.f);
+    defer ta.free(wrapped);
+    try std.testing.expectEqualStrings("<>b<aaa>b<>", wrapped);
+
+    // A callback error propagates and the partial output is freed.
+    const Fail = struct {
+        fn f(_: void, al: std.mem.Allocator, out: *std.ArrayList(u8), m: []const u8) regex.ExecError!void {
+            if (std.mem.eql(u8, m, "big")) return error.OutOfMemory;
+            try out.appendSlice(al, m);
+        }
+    };
+    try std.testing.expectError(error.OutOfMemory, re.replaceAllFunc(ta, "hello big world", {}, Fail.f));
 }
 
-test "execution and collected captures clean up on allocation failure" {
-    var re = try regex.compile(ta, "(a|b)+");
+test "expand composes with the matches iterator" {
+    // Go: for each FindAllStringSubmatchIndex("a@b c@d") m:
+    // dst = ExpandString(dst, "[$2.$1]", src, m)  ->  "[b.a][d.c]".
+    var re = try regex.compile(ta, "(\\w+)@(\\w+)");
     defer re.deinit();
-    // Growth must go through alloc: an in-place resize/remap succeeds or not
-    // depending on heap layout, which would change the allocation count
-    // between runs (NondeterministicMemoryUsage). resize_index only advances
-    // on success, so fail index 0 fails every resize.
-    var no_resize = std.testing.FailingAllocator.init(ta, .{ .resize_fail_index = 0 });
-    const backing = no_resize.allocator();
-    try std.testing.checkAllAllocationFailures(backing, exerciseExecutionAllocationFailures, .{ &re, "aa bb aa bb aa bb aa bb aa bb aa bb" });
-    const input = try ta.alloc(u8, 40000);
-    defer ta.free(input);
-    @memset(input, 'a');
-    try std.testing.checkAllAllocationFailures(backing, exerciseExecutionAllocationFailures, .{ &re, input });
+    const input = "a@b c@d";
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(ta);
+    var it = try re.matches(ta, input, -1);
+    defer it.deinit();
+    while (try it.next()) |m| try re.expand(ta, &buf, "[$2.$1]", input, m);
+    try std.testing.expectEqualStrings("[b.a][d.c]", buf.items);
+}
+
+/// Renders a `findAllSubmatch` result the way the Go reference program
+/// printed `FindAllSubmatch`: `["a" nil ]` per match, `nil` for no matches.
+fn renderAllSubmatch(all: ?[][]?[]const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(ta);
+    const x = all orelse {
+        try out.appendSlice(ta, "nil");
+        return out.toOwnedSlice(ta);
+    };
+    for (x) |m| {
+        try out.append(ta, '[');
+        for (m) |g| {
+            if (g) |text| try out.print(ta, "\"{s}\" ", .{text}) else try out.appendSlice(ta, "nil ");
+        }
+        try out.append(ta, ']');
+    }
+    return out.toOwnedSlice(ta);
+}
+
+test "findAllSubmatch matches Go's FindAllSubmatch" {
+    // Expectations recorded from Go 1.27.1 regexp.FindAllSubmatch.
+    const cases = [_]struct { p: []const u8, in: []const u8, n: i64, want: []const u8 }{
+        .{ .p = "(a)|(b)", .in = "abab", .n = -1, .want = "[\"a\" \"a\" nil ][\"b\" nil \"b\" ][\"a\" \"a\" nil ][\"b\" nil \"b\" ]" },
+        .{ .p = "(a)|(b)", .in = "abab", .n = 2, .want = "[\"a\" \"a\" nil ][\"b\" nil \"b\" ]" },
+        .{ .p = "(a)|(b)", .in = "abab", .n = 0, .want = "nil" },
+        .{ .p = "a*", .in = "baaab", .n = -1, .want = "[\"\" ][\"aaa\" ][\"\" ]" },
+        .{ .p = "(a*)(x)?", .in = "baaab", .n = -1, .want = "[\"\" \"\" nil ][\"aaa\" \"aaa\" nil ][\"\" \"\" nil ]" },
+        .{ .p = "(a*)", .in = "", .n = -1, .want = "[\"\" \"\" ]" },
+        .{ .p = "(a*)", .in = "", .n = 1, .want = "[\"\" \"\" ]" },
+        .{ .p = "x(y)?", .in = "zzz", .n = -1, .want = "nil" },
+        .{ .p = "(\\w+)=(\\d*)", .in = "k=1, j=, l=22", .n = -1, .want = "[\"k=1\" \"k\" \"1\" ][\"j=\" \"j\" \"\" ][\"l=22\" \"l\" \"22\" ]" },
+    };
+    for (cases) |c| {
+        var re = try regex.compile(ta, c.p);
+        defer re.deinit();
+        const all = try re.findAllSubmatch(ta, c.in, c.n);
+        defer if (all) |x| regex.Regexp.freeAllSubmatch(ta, x);
+        const got = try renderAllSubmatch(all);
+        defer ta.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+        // Texts are sub-slices of the input, not copies.
+        if (all) |x| for (x) |m| for (m) |g| if (g) |text| {
+            try std.testing.expect(@intFromPtr(text.ptr) >= @intFromPtr(c.in.ptr));
+            try std.testing.expect(@intFromPtr(text.ptr) + text.len <= @intFromPtr(c.in.ptr) + c.in.len);
+        };
+    }
+}
+
+test "mustCompilePOSIX and package-level match" {
+    // Go: MustCompilePOSIX("a|ab").FindString("xab") == "ab";
+    // FindAllString("abab a", -1) == [ab ab a].
+    var re = regex.mustCompilePOSIX(ta, "a|ab");
+    defer re.deinit();
+    try std.testing.expectEqualStrings("ab", (try re.find(ta, "xab")).?);
+    const all = (try re.findAll(ta, "abab a", -1)).?;
+    defer ta.free(all);
+    try std.testing.expectEqual(@as(usize, 3), all.len);
+    try std.testing.expectEqualStrings("ab", all[0]);
+    try std.testing.expectEqualStrings("ab", all[1]);
+    try std.testing.expectEqualStrings("a", all[2]);
+
+    // Go: regexp.MatchString(p, s).
+    try std.testing.expect(try regex.match(ta, "a.c", "xabcx"));
+    try std.testing.expect(try regex.match(ta, "^$", ""));
+    try std.testing.expect(!try regex.match(ta, "^$", "x"));
+    try std.testing.expect(try regex.match(ta, "(?i)K", "\u{212A}"));
+    // Go: MatchString("a(", "x") fails with "missing closing )".
+    try std.testing.expectError(error.MissingParen, regex.match(ta, "a(", "x"));
+}
+
+test "literalPrefix has a nameable type" {
+    var re = try regex.compile(ta, "abc+");
+    defer re.deinit();
+    // Go: MustCompile("abc+").LiteralPrefix() == ("abc", false).
+    const lp: regex.LiteralPrefix = re.literalPrefix();
+    try std.testing.expectEqualStrings("abc", lp.prefix);
+    try std.testing.expect(!lp.complete);
 }
 
 test "literal fast paths agree with engine results without allocations" {
