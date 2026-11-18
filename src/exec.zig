@@ -481,7 +481,7 @@ const Machine = struct {
                 // Literal-prefix acceleration: every match must start with the
                 // prefix, so fast-forward to its next occurrence (memchr-class
                 // substring search) instead of stepping the NFA at every byte.
-                if (m.accel.prefix.len > 0 and r1 != m.prefix_rune and pos <= input.s.len) {
+                if (m.accel.prefix.len > 0 and r1 != m.prefix_rune) {
                     if (search.prefixIndexAnchored(input.s[pos..], m.accel.prefix, m.accel.prefix_anchor)) |adv| {
                         pos += adv;
                         const sa = input.step(pos);
@@ -491,7 +491,7 @@ const Machine = struct {
                         r1 = sb.r;
                         width1 = sb.w;
                     } else break;
-                } else if (m.accel.first_bytes.len > 0 and !inFirstBytes(m.accel.first_bytes, r) and pos <= input.s.len) {
+                } else if (m.accel.first_bytes.len > 0 and !inFirstBytes(m.accel.first_bytes, r)) {
                     // First-byte acceleration: no literal prefix, but every
                     // match starts with one of a few ASCII bytes (e.g. a
                     // case-insensitive literal or a small leading class), so

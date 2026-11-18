@@ -1,5 +1,6 @@
 //! The compiled program: a list of NFA instructions, mirroring Go's
-//! `regexp/syntax.Prog` / `Inst`. The Pike VM in `exec.zig` interprets this.
+//! `regexp/syntax.Prog` / `Inst`. The engines in `exec.zig` and
+//! `backtrack.zig` interpret this.
 
 const std = @import("std");
 const unicode = @import("unicode.zig");
@@ -98,6 +99,8 @@ pub const Prog = struct {
     /// walking the range list or the fold orbit.
     ascii: []const u128 = &.{},
     start: u32 = 0,
+    /// Go's `Prog.NumCap`. Kept for parity with Go; nothing reads it (results
+    /// are padded to the Regexp's `padLen` instead).
     num_cap: usize = 2, // implicit whole-match capture pair
 
     /// `Inst.matchRune` for `insts[pc]` with the ASCII fast path.
@@ -165,30 +168,6 @@ pub fn mergedOp(op: InstOp) InstOp {
     };
 }
 
-/// The zero-width assertions satisfied between runes r1 and r2 (each -1 at the
-/// text boundary). Mirrors Go's `EmptyOpContext`. Provided for completeness;
-/// the Pike VM uses the lazy variant in `exec.zig`.
-pub fn emptyOpContext(r1: i32, r2: i32) EmptyOp {
-    var op: EmptyOp = empty_no_word_boundary;
-    var boundary: u8 = 0;
-    if (unicode.isWordChar(r1)) {
-        boundary = 1;
-    } else if (r1 == '\n') {
-        op |= empty_begin_line;
-    } else if (r1 < 0) {
-        op |= empty_begin_text | empty_begin_line;
-    }
-    if (unicode.isWordChar(r2)) {
-        boundary ^= 1;
-    } else if (r2 == '\n') {
-        op |= empty_end_line;
-    } else if (r2 < 0) {
-        op |= empty_end_text | empty_end_line;
-    }
-    if (boundary != 0) op ^= (empty_word_boundary | empty_no_word_boundary);
-    return op;
-}
-
 test "matchRune single, range, fold" {
     const i = Inst{ .op = .rune, .runes = &[_]u21{ 'a', 'z' } };
     try std.testing.expect(i.matchRune('m'));
@@ -198,10 +177,4 @@ test "matchRune single, range, fold" {
     try std.testing.expect(lit.matchRune('a'));
     try std.testing.expect(lit.matchRune('A'));
     try std.testing.expect(!lit.matchRune('b'));
-}
-
-test "emptyOpContext begin/end text" {
-    const ctx = emptyOpContext(-1, 'a');
-    try std.testing.expect(ctx & empty_begin_text != 0);
-    try std.testing.expect(ctx & empty_begin_line != 0);
 }

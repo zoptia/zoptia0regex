@@ -82,17 +82,14 @@ pub fn prefixAnchor(prefix: []const u8) u32 {
     return @intCast(rarestByteOffset(prefix));
 }
 
-/// Find the first occurrence of `needle` in `haystack`. Scans for the
-/// needle's *rarest* byte with a vectorized search (`indexOfScalar`) and
-/// verifies the rest around each hit — anchoring on the rarest byte (rust
-/// memmem's heuristic) false-starts far less often than anchoring on the
-/// first byte when the first byte is common. Like Go's bytes.Index, it
-/// switches to Rabin-Karp when the anchor still produces too many false
-/// starts (a periodic needle over a periodic haystack is otherwise O(n·m)).
-fn prefixIndex(haystack: []const u8, needle: []const u8) ?usize {
-    return prefixIndexAnchored(haystack, needle, prefixAnchor(needle));
-}
-
+/// Find the first occurrence of `needle` in `haystack`, given `anchor =
+/// prefixAnchor(needle)`. Scans for the needle's *rarest* byte with a
+/// vectorized search (`indexOfScalar`) and verifies the rest around each hit
+/// — anchoring on the rarest byte (rust memmem's heuristic) false-starts far
+/// less often than anchoring on the first byte when the first byte is common.
+/// Like Go's bytes.Index, it switches to Rabin-Karp when the anchor still
+/// produces too many false starts (a periodic needle over a periodic haystack
+/// is otherwise O(n·m)).
 pub fn prefixIndexAnchored(haystack: []const u8, needle: []const u8, anchor: usize) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len == 1) return std.mem.indexOfScalar(u8, haystack, needle[0]);
@@ -145,6 +142,11 @@ fn indexRabinKarp(s: []const u8, sep: []const u8) ?usize {
         if (h == hashsep and std.mem.eql(u8, s[j - sep.len .. j], sep)) return j - sep.len;
     }
     return null;
+}
+
+/// Test helper: `prefixIndexAnchored` with the anchor computed on the fly.
+fn prefixIndex(haystack: []const u8, needle: []const u8) ?usize {
+    return prefixIndexAnchored(haystack, needle, prefixAnchor(needle));
 }
 
 test "prefixIndex finds first occurrence or null" {

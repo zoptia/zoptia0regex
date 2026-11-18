@@ -26,7 +26,6 @@ pub const OnePassInst = struct {
 pub const OnePassProg = struct {
     insts: []OnePassInst,
     start: u32,
-    num_cap: usize,
 };
 
 const merge_failed: u32 = 0xffffffff;
@@ -353,7 +352,7 @@ fn onePassCopy(al: std.mem.Allocator, p: *const Prog) !OnePassProg {
         // empty transition to common target: A:BC + B:DC => A:DC + B:DC
         if (p_a_other.* == p_b_alt.*) p_a_alt.* = p_b_other.*;
     }
-    return .{ .insts = insts, .start = p.start, .num_cap = p.num_cap };
+    return .{ .insts = insts, .start = p.start };
 }
 
 fn cleanupOnePass(p: *OnePassProg, original: *const Prog) void {
@@ -458,7 +457,7 @@ pub fn compileOnePass(gpa: std.mem.Allocator, al: std.mem.Allocator, p: *const P
             .next = if (inst.next.len > 0) try al.dupe(u32, inst.next) else &.{},
         };
     }
-    return .{ .insts = insts, .start = opp.start, .num_cap = opp.num_cap };
+    return .{ .insts = insts, .start = opp.start };
 }
 
 test "fresh one-pass sparse indices are initialized" {
