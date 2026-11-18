@@ -1,20 +1,63 @@
+// Command genbench writes the benchmark workloads shared by the Zig and Go
+// harnesses into a directory (bench/data via tools/regen.sh):
+//
+//	bench.jsonl        throughput cases (bench/bench.zig, cmd/benchgo)
+//	bench_corpus.txt   256 KB deterministic mixed-text corpus
+//	bench_aaa.txt      2 KB of 'a' for the nested-quantifier case
+//	scratch.jsonl      short-input cases of the Scratch micro-benchmark
+//	                   (bench/bench_scratch.zig, cmd/benchscratchgo)
+//
+// Usage: genbench -dir bench/data
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strings"
+
+	"zoptia0regex/tools/internal/gen"
 )
 
+// Case is one throughput case.
 type Case struct {
 	Name string `json:"name"`
 	P    string `json:"p"`
 	Op   string `json:"op"`  // match | find | findall | submatch
 	In   string `json:"in"`  // "corpus" | "aaa"  (reference, not the bytes)
 	Lit  string `json:"lit"` // inline literal input (when non-empty)
+}
+
+// ScratchCase is one Scratch micro-benchmark case (op is always match).
+type ScratchCase struct {
+	Name string `json:"name"`
+	P    string `json:"p"`
+	In   string `json:"in"`
+}
+
+// scratchCases are short inputs where per-call setup dominates. Each row
+// runs an engine except "literal", which the port answers with its
+// literal fast path (no engine, no allocation).
+var scratchCases = []ScratchCase{
+	{"literal", "needle", "a haystack with a needle hidden somewhere near the end"},
+	{"prefix_digits", `needle\d+`, "a haystack with a needle42 hidden somewhere near the end"},
+	{"alternation", "(foo|bar|baz)+", "zz bar foo baz qux barbaz zz"},
+	{"email_unanchored", `[a-z]+@[a-z]+\.[a-z]+`, "please contact us at user@example.com today"},
+	{"charclass_plus", "[0-9]+", "order 12345 shipped on 2024"},
+	{"anchored_onepass", `\A\d+\z`, "1234567890"},
+}
+
+func writeJSONL[T any](path string, items []T) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	for _, it := range items {
+		gen.Check(enc.Encode(it))
+	}
+	gen.WriteFile(path, buf.Bytes())
 }
 
 var words = strings.Fields(`the quick brown fox jumps over lazy dog lorem ipsum dolor sit amet consectetur
@@ -48,11 +91,16 @@ func buildCorpus(r *rand.Rand, targetLen int) string {
 }
 
 func main() {
+	dir := flag.String("dir", "", "output directory")
+	flag.Parse()
+	if *dir == "" || flag.NArg() != 0 {
+		gen.Fatalf("usage: genbench -dir DIR")
+	}
 	r := rand.New(rand.NewSource(20260626))
 	corpus := buildCorpus(r, 256*1024)
 	aaa := strings.Repeat("a", 2048)
-	os.WriteFile("../src/bench_corpus.txt", []byte(corpus), 0644)
-	os.WriteFile("../src/bench_aaa.txt", []byte(aaa), 0644)
+	gen.WriteFile(filepath.Join(*dir, "bench_corpus.txt"), []byte(corpus))
+	gen.WriteFile(filepath.Join(*dir, "bench_aaa.txt"), []byte(aaa))
 
 	cases := []Case{
 		{"literal_hit", "performance", "find", "corpus", ""},
@@ -80,11 +128,7 @@ func main() {
 		{"keyword_list", "performance|performer|perform|period|periodic|permit|permission|persist|person|personal|benchmark|bench|benefit|between|beyond|expression|express|expressive|extend|extension|external|extra|throughput|through|throw|thread|threshold|threat|compile|compiler|complete|complex|component|compose|computer|compute|concept|concern|condition|connect", "findall", "corpus", ""},
 		{"domain_allowlist", "(?i)\\A(?:mail\\.example\\.com|www\\.example\\.com|api\\.example\\.com|cdn\\.example\\.com|static\\.example\\.com|login\\.example\\.com|auth\\.example\\.com|vpn\\.example\\.com|git\\.example\\.com|ci\\.example\\.com|mail\\.corp\\.net|www\\.corp\\.net|api\\.corp\\.net|wiki\\.corp\\.net|jira\\.corp\\.net|git\\.corp\\.net|vpn\\.corp\\.net|sso\\.corp\\.net|docs\\.corp\\.net|chat\\.corp\\.net)\\z", "match", "", "SSO.corp.net"},
 	}
-	w := bufio.NewWriter(os.Stdout)
-	defer w.Flush()
-	enc := json.NewEncoder(w)
-	for _, c := range cases {
-		enc.Encode(c)
-	}
-	fmt.Fprintf(os.Stderr, "corpus=%d bytes, aaa=%d, %d cases\n", len(corpus), len(aaa), len(cases))
+	writeJSONL(filepath.Join(*dir, "bench.jsonl"), cases)
+	writeJSONL(filepath.Join(*dir, "scratch.jsonl"), scratchCases)
+	fmt.Fprintf(os.Stderr, "corpus=%d bytes, aaa=%d, %d cases, %d scratch cases\n", len(corpus), len(aaa), len(cases), len(scratchCases))
 }

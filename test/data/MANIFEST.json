@@ -1,0 +1,10 @@
+{
+  "go_version": "go1.27.1",
+  "unicode_version": "17.0.0",
+  "corpora": {
+    "bytes": 10016,
+    "cases": 16280,
+    "fuzz": 13970,
+    "longest": 19545
+  }
+}

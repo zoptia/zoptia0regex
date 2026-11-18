@@ -4,18 +4,32 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, so drift in the zvk-managed toolchains (release and nightly) is
+  # noticed even when nobody pushes.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
+  # The release toolchain (`zig`, 0.17.x) on Linux and macOS: the full gate.
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
-      # Zig 0.16.0 is a zvk-managed build, not a plain ziglang.org release, so
-      # install the toolchain through zvk (https://github.com/zoptia/zvk).
-      # install.sh fetches a managed Go, builds zvk, and runs `zvk zig install`,
-      # leaving the `zig` shim in ~/.zvk/bin. GitHub Actions doesn't read shell
-      # rc files, so add that dir to PATH via $GITHUB_PATH.
+      # Zig is installed through zvk (https://github.com/zoptia/zvk), which
+      # manages the release and nightly toolchains this project pins.
+      # install.sh fetches a managed Go, builds zvk and runs `zvk zig
+      # install`, leaving the `zig` shim in ~/.zvk/bin. GitHub Actions does
+      # not read shell rc files, so add that directory via $GITHUB_PATH.
       - name: Install Zig via zvk
         env:
           ZVK_NO_DOCS: "1"
@@ -24,31 +38,66 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/zoptia/zvk/main/install.sh | sh
           echo "$HOME/.zvk/bin" >> "$GITHUB_PATH"
 
-      - name: Zig version
-        run: zig version
+      - name: Zig version (must satisfy minimum_zig_version)
+        run: tools/check-zig-version.sh
 
+      # The release toolchain's `zig fmt` is the formatting gate.
       - name: Check formatting
-        run: zig fmt --check src/*.zig build.zig
+        run: zig build fmt
 
       - name: Build
         run: zig build
 
-      - name: Unit & behaviour tests
+      - name: Unit & behaviour tests (Debug)
         run: zig build test
 
-      # The differential corpora are committed, so this runs without a Go
-      # toolchain of its own — it replays ~30k cases recorded from Go and
-      # asserts the results are byte-for-byte identical (and leak-free).
+      - name: Unit & behaviour tests (ReleaseFast)
+        run: zig build test -Doptimize=ReleaseFast
+
+      # The corpora are committed, so this needs no Go toolchain: it replays
+      # every case recorded from Go 1.27.1 (counts in test/data/MANIFEST.json)
+      # and requires identical results, error codes, program sizes and
+      # literal prefixes, leak-free.
       - name: Differential tests vs Go
         run: zig build difftest
 
-  # Smoke test on the Zig nightly zvk tracks (`zig-nightly`), so a std rename
-  # that would break consumers on 0.17-dev is caught early. Nightly's `zig fmt`
-  # rewrites builtins that 0.16 does not know (e.g. @intFromEnum ->
-  # @backingInt), so the formatting gate stays 0.16-only.
+      # Compiles the benchmarks (and everything else) without running them.
+      - name: Compile all artifacts
+        run: zig build check
+
+  # Targets without SIMD vector units or with 32-bit pointers, compiled but
+  # not run (`check` builds every artifact without executing anything).
+  cross:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-wasi, riscv64-linux, x86-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Zig via zvk
+        env:
+          ZVK_NO_DOCS: "1"
+          ZVK_NO_CLAUDE_MD: "1"
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/zoptia/zvk/main/install.sh | sh
+          echo "$HOME/.zvk/bin" >> "$GITHUB_PATH"
+
+      - name: Zig version (must satisfy minimum_zig_version)
+        run: tools/check-zig-version.sh
+
+      - name: Cross-compile for ${{ matrix.target }}
+        run: zig build check -Dtarget=${{ matrix.target }}
+
+  # zvk's Zig nightly (`zig-nightly`): downstream packages pin it, and a
+  # dependency's build.zig is compiled into every consumer's build runner,
+  # so a break here is a real failure (no continue-on-error). Its `zig fmt`
+  # is not the gate: the release toolchain's formatting rules apply.
   test-nightly:
     runs-on: ubuntu-latest
-    continue-on-error: true
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -61,10 +110,10 @@ jobs:
           echo "$HOME/.zvk/bin" >> "$GITHUB_PATH"
           "$HOME/.zvk/bin/zvk" zig install nightly
 
-      - name: Zig nightly version
-        run: zig-nightly version
+      - name: Zig nightly version (must satisfy minimum_zig_version)
+        run: ZIG=zig-nightly tools/check-zig-version.sh
 
-      - name: Build (all steps' artifacts)
+      - name: Build
         run: zig-nightly build && zig-nightly build demo -- 'a+b' 'xaab'
 
       - name: Unit & behaviour tests
@@ -72,3 +121,6 @@ jobs:
 
       - name: Differential tests vs Go
         run: zig-nightly build difftest
+
+      - name: Compile all artifacts
+        run: zig-nightly build check

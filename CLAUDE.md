@@ -4,166 +4,201 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A **faithful Zig 0.16 port of Go's standard-library `regexp` package** (RE2
-design). The overriding rule: **observable behaviour must match Go exactly** for
-the supported feature set. Almost every `src/*.zig` file is a direct port of a
-specific Go source file, and correctness is enforced by **differential testing
-against Go's actual recorded output** — not hand-written expectations alone.
+A **faithful Zig port of Go's standard-library `regexp` package** (RE2
+design), targeting **Zig 0.17**. The overriding rule: **observable behaviour,
+error class and compiled program shape must match Go exactly** for the
+supported feature set. Almost every `src/*.zig` file is a direct port of a
+specific Go source file, and correctness is enforced by **differential
+testing against Go's actual recorded output** — not hand-written
+expectations.
 
 The Go reference source is on this machine at
 `~/.zvk/go/versions/go1.27.1/src/regexp/` (the port tracks **go1.27.1 /
-Unicode 17.0**; `tools/regen.sh` must run with that toolchain so the generated
-tables and corpora stay in step) — **read the corresponding Go file before
-changing any matching/parsing behaviour.** The port-to-Go file map:
+Unicode 17.0**; `tools/regen.sh` forces that toolchain) — **read the
+corresponding Go file before changing any matching/parsing behaviour.** The
+port-to-Go file map:
 
-| Zig | Go |
+| Zig (`src/`) | Go (`src/regexp/`) |
 |-----|-----|
 | `parse.zig` | `syntax/parse.go` |
-| `simplify.zig` | `syntax/simplify.go` |
-| `compile.zig` + `prog.zig` | `syntax/compile.go` + `prog.go` |
-| `exec.zig` | `exec.go` + `backtrack.go` |
-| `onepass.zig` | `onepass.go` |
-| `regexp.zig` | `regexp.go` (public API: find/replace/split/expand) |
 | `ast.zig` | `syntax/regexp.go` |
+| `simplify.zig` | `syntax/simplify.go` |
+| `compile.zig` + `prog.zig` | `syntax/compile.go` + `syntax/prog.go` |
+| `exec.zig` | `exec.go` (Pike VM, one-pass runner, dispatch) |
+| `backtrack.zig` | `backtrack.go` |
+| `onepass.zig` | `onepass.go` |
+| `search.zig` | none (Go calls `bytes.Index`; the first-byte prefilter is port-only) |
+| `regexp.zig` | `regexp.go` (public API: find/replace/split/expand) |
 | `unicode.zig` | the bits of `unicode` the engine needs |
+
+## Layout
+
+- `src/` — the library and its unit tests (`tests.zig`, `regressiontest.zig`,
+  `oomtest.zig`, `limitstest.zig`, `enginetest.zig`). The only directory the
+  package ships (`build.zig.zon` `.paths`).
+- `test/` — differential drivers, one per corpus, all running
+  `test/difftest_common.zig`; corpora and `MANIFEST.json` in `test/data/`.
+  They import the library as `@import("regex")`.
+- `bench/` — benchmark harnesses; workloads in `bench/data/`.
+- `tools/` — Go module (`go 1.27`, `toolchain go1.27.1`): `cmd/<name>/` per
+  generator or Go harness, shared code in `internal/` (`corpus`: record
+  format and compile/record logic; `randre`: random grammars; `gen`:
+  fail-loudly I/O). `regen.sh`, `bench.sh`, `check-zig-version.sh`.
 
 ## Commands
 
 ```sh
 zig build test                          # unit + behaviour tests (fast)
-zig build difftest                      # ~54k differential cases vs Go (ReleaseSafe, ~20 s)
-zig build bench                         # benchmark, ReleaseFast (stderr TSV)
+zig build test -Doptimize=ReleaseFast   # same, optimized (CI runs both)
+zig build difftest                      # all four differential corpora (ReleaseSafe)
+zig build difftest-cases                # one corpus: -cases | -fuzz | -longest | -bytes
+zig build check                         # compile everything without running (any -Dtarget)
+zig build check -Dtarget=wasm32-wasi    # cross-compile smoke (also riscv64-linux, x86-linux)
+zig build fmt                           # formatting gate over src/ test/ bench/ build.zig
 zig build demo -- '<pattern>' '<input>' # CLI demo
-zig fmt --check src/*.zig build.zig     # must be clean; CI enforces it
+zig build bench                         # throughput benchmark (ReleaseFast, TSV on stdout)
+zig build bench-scratch                 # Scratch micro-benchmark
 
-# Single test file / single test by name:
-zig test src/exec.zig                            # one module's tests
-zig test src/tests.zig --test-filter "split"     # one test by name substring
-zig test src/difftest.zig                         # run the differential test alone
+# One library module's tests / one test by name (src/ files only; the
+# drivers in test/ need the build's `regex` module, use the steps above):
+zig test src/exec.zig
+zig test src/tests.zig --test-filter "split"
 
-# Go-side benchmark (compare with `zig build bench`):
-( cd tools && go run benchgo.go )
-
-# Regenerate the generated Unicode tables AND the test/benchmark corpora from
-# the local Go toolchain (the golden reference). Needed only when changing them:
-tools/regen.sh
+tools/regen.sh     # regenerate Unicode tables, corpora, manifest, bench workloads
+tools/bench.sh     # run Zig + Go benchmarks, rewrite BENCHMARKS.md / README.md blocks
+( cd tools && go vet ./... && gofmt -l . )   # must be clean
 ```
 
-Zig 0.16.0 here is a **zvk-managed build, not a plain ziglang.org release** —
-`zig` resolves through `~/.zvk/bin`. CI installs it via zvk's `install.sh`
-(`.github/workflows/ci.yml`), not `setup-zig`. The 0.16 std differs a lot from
-older Zig: `ArrayList` is unmanaged (`.empty`, `.append(allocator, x)`); there
-is no `std.time.Timer` / `std.process.argsAlloc` / `std.fs.cwd` (the Io rework);
-`main(init: std.process.Init.Minimal)` is how `demo.zig` gets args.
-
-**Must also build on Zig 0.17.0-dev (`zig-nightly`)** — downstream packages
-pin it, and a dependency's `build.zig` is compiled into every consumer's build
-runner. Run `zig-nightly build test` before releasing. Known 0.16 ↔ 0.17-dev
-splits, all handled: `b.args` vs `Run.addPassthruArgs` and `Fmt.Options.paths`
-(`[]const u8` vs `LazyPath`) are gated in `build.zig`; array repetition `**`
-is a 0.17 parse error (use `@splat` into a typed array); `std.meta.Int` is
-gone (use `@Int`). Keep `@intFromEnum` — nightly's `zig fmt` rewrites it to
-`@backingInt`, which 0.16 does not compile, so never run nightly `fmt` on the
-tree; the fmt gate is 0.16-only.
+Zig here is **zvk-managed** (`zig` = 0.17.x release, `zig-nightly` =
+0.18.0-dev) and resolves through `~/.zvk/bin`; CI installs it with zvk's
+`install.sh`, not `setup-zig`. `build.zig.zon` says
+`minimum_zig_version = "0.17.0"`; Zig 0.16 is not supported. **The fmt gate
+is the release toolchain's `zig fmt`**; never run `zig-nightly fmt` on the
+tree. The package must also build and pass on `zig-nightly` (downstream
+packages pin it, and a dependency's `build.zig` is compiled into every
+consumer's build runner): run `zig-nightly build test` and
+`zig-nightly build difftest` before releasing. CI (push to main, PRs,
+weekly) runs the release toolchain on Linux and macOS, the cross-compile
+smokes, and the nightly as a blocking job.
 
 ## Architecture
 
 **Pipeline:** `compile()` runs `parse → simplify → compile (→ Prog) → build
-onepass (if it qualifies)`. Matching runs the compiled program through one of
-three engines.
+onepass (if it qualifies)`, then precomputes the literal prefix, first-byte
+set and literal-fast-path flag. Every search goes through
+`Regexp.findAt` (Go's `(*Regexp).find`): minimum-length rejection, the
+literal fast path, then `exec.executeReuse`, which dispatches exactly like Go
+(`onepass != null` → one-pass; small prog+input → bitstate; else Pike VM).
+`exec.Engine` bundles what the engines read (prog, onepass, cond, longest,
+`Accel`); its `mode` field is a test hook used by `enginetest.zig` to force
+each engine on the same regexps. Engine storage is a `Scratch` (the
+caller's, or a temporary one the allocating API creates only when an engine
+runs).
 
-**Three execution engines, dispatched in `exec.zig:execute()` exactly as Go
-does** (`onepass != null` → one-pass; small prog+input → bitstate; else Pike VM),
-all sharing the compile-time acceleration data in `exec.Accel`: a literal
-prefix (`prefixIndexAnchored` — scan anchored on the prefix's rarest byte,
-precomputed into `Accel.prefix_anchor`, with a Rabin-Karp fallback like Go's
-`bytes.Index`; for one-pass regexps `onePassPrefix` also yields the pc to
-resume at after the prefix), and — a port-specific addition with no Go
-counterpart — a `first_bytes` set (`regexp.zig:firstBytes`): when there is no
-literal prefix, a ≤16-byte ASCII set of possible match-start bytes that the
-Pike VM / bitstate engines skip ahead to via `exec.indexOfAnyByte`, a portable
-`@Vector` SIMD sweep (this is what makes unanchored `(?i)` and `\d`-led scans
-fast). `first_bytes` must stay a *superset* of the true start bytes —
-e.g. it is disabled when a case-fold cycle leaves ASCII (`(?i)k` matches
-U+212A) — and the Pike VM must recompute the boundary `flag` after a
-first-bytes skip (`\b` before the first rune). All three engines must produce
-identical results; the differential suite routes anchored patterns through
-one-pass and small ones through bitstate, so it tests all of them. Match
-semantics: leftmost-first (`compile`) vs POSIX leftmost-longest
-(`compilePOSIX` / `setLongest`).
+**Scan acceleration** (`exec.Accel`, `search.zig`): a literal prefix
+searched by `prefixIndexAnchored` — anchored on the prefix's rarest byte
+(`Accel.prefix_anchor`), with a **cost-based** cutover to Rabin-Karp that
+keeps it O(n + m) (not Go's `bytes.Index` strategy); for one-pass regexps
+`onePassPrefix` also yields the pc to resume at. And — port-only — a
+`first_bytes` `ByteSet` (`regexp.zig:firstBytes`): with no literal prefix,
+a ≤16-byte ASCII set of possible match-start bytes the Pike VM / bitstate
+engines skip to via `search.indexOfAnyByte` (portable `@Vector` sweep,
+scalar on targets without vectors). `first_bytes` must stay a *superset* of
+the true start bytes — e.g. it is disabled when a case-fold cycle leaves
+ASCII (`(?i)k` matches U+212A) — and the Pike VM must recompute the boundary
+`flag` after a skip (`\b` before the first rune). Literal prefixes keep
+collecting past an unencodable rune (a surrogate) as U+FFFD, like Go's
+`strings.Builder.WriteRune`; such a `lossy` prefix disables the literal fast
+path.
+
+**Literal fast path:** when `Regexp.literal` holds (complete, non-lossy
+prefix; no one-pass program, capture groups or start condition), any search
+needing at most the whole-match slots is `prefixIndexAnchored` alone. Any new
+shortcut must stay covered by the differential drivers' `match` /
+`findIndex` / Scratch / find-all checks.
+
+**Parser limits:** Go's `checkLimits` (rune budget → `checkSize` →
+`checkHeight`) is ported exactly, at Go's call sites. Go's per-node size and
+height maps and its node free list are observable (a recycled node keeps a
+stale size), so the parser keeps them in a parser-private `Node` wrapper
+around each `ast.Regexp` (`parse.zig`); the AST carries no parser state.
+`factor` / `collapse` run on an explicit heap frame stack (no native
+recursion), class rune lists grow with amortised capacity. Boundaries are
+pinned in `src/limitstest.zig` and the curated corpus.
+
+**Pike VM `add` is iterative:** Go recurses on `alt.out` and capture
+bodies; the port follows `out` immediately and pushes `arg` / capture-restore
+frames on `Scratch.add_stack` (≤ one frame per instruction), preserving the
+depth-first order and hence match priority.
 
 **Subtle invariants to preserve when editing the engine/compiler:**
 - Greedy vs non-greedy is encoded purely by the **order of an `alt`
   instruction's two successors** (`compile.zig`). Leftmost-first priority falls
   out of the Pike VM's epsilon-closure order in `add()`.
-- Character-class rune lists are **sorted, merged `(lo,hi)` pairs**; `MatchRune`
-  binary-searches them. Don't produce unsorted classes.
-- Submatch results are padded to `2*(numSubexp+1)` (`padLen`), which can exceed
-  `prog.num_cap` when a group is compiled away (e.g. `(a){0}`).
+- Character-class rune lists are **sorted, merged `(lo,hi)` pairs**;
+  `matchRunePos` binary-searches them. Don't produce unsorted classes.
+- Submatch results are padded to `2*(numSubexp+1)` (`padLen`), which can
+  exceed `prog.num_cap` when a group is compiled away (e.g. `(a){0}`).
 - Range arithmetic near `0` and `max_rune` (0x10FFFF) must use a wider int
   (`u21` overflows on `hi+1`).
+- **Keep `Inst` at 32 bytes.** The per-pc ASCII membership bitmap
+  (`Prog.ascii`, built by `compile.zig:asciiBitmap`, read through
+  `Prog.matchRuneAt`) is a side table because putting it in `Inst` slowed
+  the bitstate engine by ~25%. The bitmap must agree with
+  `prog.matchRunePos` for every ASCII rune (unit test in `compile.zig`).
 
-**Generated, never hand-edited:** `fold_table.zig`, `unicode_tables.zig`, and all
-`src/*.jsonl` corpora are produced by `tools/*.go` from Go and `@embedFile`'d
-into the engine/tests. To change them, edit the generator in `tools/` and run
-`tools/regen.sh`. The corpora are committed, so `zig build difftest` needs no Go
-toolchain (only `regen.sh` does).
-
-**ASCII rune bitmap:** `Prog.ascii` is a side table (one `u128` per pc,
-built by `compile.zig:asciiBitmap`) giving each `.rune` instruction's ASCII
-membership; the Pike VM and bitstate engines call `Prog.matchRuneAt`, which
-answers `r < 0x80` with one bit test. Keep it out of `Inst`: growing `Inst`
-past 32 bytes measurably slows the bitstate engine. The bitmap must agree
-with `prog.matchRunePos` for every ASCII rune (unit test in `compile.zig`).
-
-**Literal fast path:** `match` / `findIndex` (and their Scratch variants) skip
-the engines entirely when `Regexp.isLiteral()` holds (`prefix_complete`, no
-one-pass program, no capture groups, no start condition): the answer is
-`prefixIndexAnchored` alone. Any new shortcut must be covered by the
-`difftest.zig` per-case checks of `match`/`findIndex`/Scratch variants.
-
-**AST shape must equal Go's.** `cases.jsonl` and `fuzz.jsonl` carry `ni`,
-the instruction count of Go's `syntax.Compile(Parse(p).Simplify())`, and the
-tests require `re.prog.insts.len == ni`. A parser/simplifier/compiler change
-that alters program shape fails there even when match results still agree.
-
-**Parser limits:** AST height is tracked per node (`ast.Regexp.parse_height`,
-parser-only) and checked in `push` and `repeat` like Go's `checkHeight`;
-redundant `(?:…)` groups do not add height, POSIX stacked quantifiers do.
-
-**Find-all loops:** `findAll*`, `split` and the `replaceAll*` family run on
-`Regexp.Matches` (`regexp.zig`), the port of Go 1.27's `matches` iterator: one
-`Scratch` for the whole loop, `ncap = 2` when only the whole-match location is
-needed (like Go's `all`/`allIndex`), full `padLen` captures otherwise.
+**Find-all and replace loops:** `findAll*` and `split` run on
+`Regexp.Matches` (`regexp.zig`), the port of Go 1.27's `matches` iterator:
+one `Scratch` for the whole loop, `ncap = 2` when only the whole-match
+location is needed, full `padLen` captures otherwise. `replaceAllCore` is
+its own loop, like Go's `replaceAll`.
 
 **Memory model:** a compiled `Regexp` owns a heap-allocated arena (`re.arena`)
 holding its program, capture names and prefix; `deinit()` frees it. Execution /
-result methods each take an `allocator` for transient VM scratch and (where they
-return owned memory) the result, which the caller frees. The differential test
-runs under `std.testing.allocator`, so any leak fails the build.
+result methods take an `allocator` for transient engine storage and (where
+they return owned memory) the result, which the caller frees. The tests and
+drivers run under `std.testing.allocator`, so any leak fails the build.
+
+## Differential testing
+
+`tools/cmd/gen{cases,fuzz,longest,bytes}` record Go's behaviour into
+`test/data/*.jsonl` (format documented in `tools/internal/corpus`). For
+**every** case the drivers check: compile outcome and Go's
+`syntax.ErrorCode` text (OOM always fails), `ni` (Go's instruction count of
+`syntax.Compile(syntax.Parse(p, flags).Simplify())` — mandatory, so a
+parser/simplifier/compiler change that alters program shape fails even when
+results agree), `literalPrefix()` (bytes + complete flag), and the leftmost
+match via `findSubmatchIndex` / `match` / `findIndex` / Scratch variants;
+the fuzz, longest and bytes corpora also check `findAllSubmatchIndex`,
+`findAllIndex`, `matchesScratch`, `replaceAllString` and `split`. Each
+corpus ends with a `{"count":N}` trailer that must match the case count and
+`test/data/MANIFEST.json`. The Zig-side error-code table is
+`test/difftest_common.zig:privateGoErrorCode`. Never type expectations by
+hand: change a generator and run `tools/regen.sh`.
+
+**Generated, never hand-edited:** `src/fold_table.zig`,
+`src/unicode_tables.zig`, everything in `test/data/` and `bench/data/`, and
+the `BEGIN/END GENERATED` blocks in `BENCHMARKS.md` / `README.md`
+(`tools/bench.sh`).
 
 ## Adding or changing behaviour
 
 1. Consult the corresponding Go source first; mirror its logic.
 2. Add patterns exercising the change to the relevant generator
-   (`tools/gencases.go` for curated, `genfuzz.go` for random, `genlongest.go`
-   for POSIX, `genbytes.go` for byte-level cases whose inputs must carry
-   malformed UTF-8 / NULs or exercise `compilePOSIX`, `FindAll`/`Split`
-   limits and `$` templates), run `tools/regen.sh`, and commit the
-   regenerated `.jsonl`.
-3. `zig build test && zig build difftest` must pass; `zig fmt` must be clean.
+   (`gencases` for curated, `genfuzz` for random Perl, `genlongest` for
+   leftmost-longest / random POSIX, `genbytes` for byte-level inputs, modes,
+   limits and templates), run `tools/regen.sh`, and commit the regenerated
+   data.
+3. `zig build test && zig build difftest` must pass on `zig` and
+   `zig-nightly`; `zig build fmt` must be clean.
 
 ## Intentional omissions — do not "fix" these
 
 Backreferences and `\C` are unsupported — **same as Go** (RE2). Inputs
 are `[]const u8` only (no `io.RuneReader`), and Go 1.27's `All*` iterator
-methods collapse into the single `Regexp.matches` iterator. See the README
-"Scope" table.
+methods collapse into the single `Regexp.matches` iterator. See
+`docs/usage.md` §6 "Scope & differences from Go".
 
-(Once omitted, now ported: `onePassCopy`'s Prog-idiom rewrites,
-`doOnePass`'s literal-prefix skip, and the parser's AST-shaping passes —
-`maybeConcat`, `push`'s single-rune class rewrite, the `swapVerticalBar`
-class merge and alternation `factor`. Skipping `factor` left keyword-list
-alternations 3× slower than Go. The port also *adds* one accelerator Go
-lacks: the `first_bytes` prefilter described above — behaviour-neutral by
-construction and covered by the differential suite.)
+Port-only additions, behaviour-neutral by construction and covered by the
+differential suite: the `first_bytes` prefilter, the literal fast path, the
+ASCII rune bitmap, and the cost-based prefix search.

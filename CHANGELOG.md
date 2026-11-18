@@ -4,19 +4,129 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.0] — 2026-11-17
 
-### Testing / CI
+### Toolchain
 
-- Fix the `test-nightly` CI failure (`NondeterministicMemoryUsage` in the
-  Pike-VM OOM regression on Linux x86_64 with Zig 0.17.0-dev.2264). The
-  allocation-failure tests counted allocations while `ArrayList` growth could
-  resize in place or not depending on heap layout; every
-  `checkAllAllocationFailures` call now uses a backing allocator that fails
-  all resizes (as `regressiontest.zig` already did), so growth always goes
-  through `alloc`. No library change. Verified on Debian 13 x86_64 with
-  nightly 2264: 67/67 unit tests (five seeds) and all differential cases.
-- CI: `actions/checkout@v4` → `@v7` (Node 24 LTS; Node 20 is deprecated on
+- **Zig 0.17 baseline.** `minimum_zig_version = "0.17.0"`; Zig 0.16 is no
+  longer supported, and the 0.16/0.17 gates in `build.zig` are gone. The
+  release toolchain's `zig fmt` is the formatting gate. The package is also
+  tested on zvk's nightly (0.18.0-dev).
+- **Non-SIMD and 32-bit targets build again.** `indexOfAnyByte`'s scalar
+  fallback failed to compile on targets without vector registers (wasm32,
+  riscv64), and the parser's node cast failed on 32-bit targets, where the
+  parser's `Node` is more aligned than the `Regexp` it wraps; the demo now
+  uses the args iterator that also compiles for WASI. CI now
+  cross-compiles for `wasm32-wasi`, `riscv64-linux` and `x86-linux`.
+
+### Fixed
+
+- **Parser stack overflow in alternation factoring.** Go's `factor`
+  recurses once per factored prefix and relies on growable goroutine
+  stacks; the port segfaulted on a long common prefix. `factor` /
+  `collapse` now run on an explicit heap frame stack in Go's step order,
+  and report Go's `NestingDepth` where Go does.
+- **Quadratic class merges.** Merging single-rune alternatives into a
+  class (`swapVerticalBar`, `factor`) copied the whole rune list on every
+  merge (1.5 GB for a 20,000-way alternation); rune lists now grow in
+  place with amortised capacity, like Go's `append`.
+- **Pike VM stack overflow.** `Machine.add` recursed like Go's
+  `machine.add`; programs past roughly 100k instructions (e.g. 21k `a??`
+  in a row, 10k empty captures) overflowed the native stack. The epsilon
+  closure is now iterative on an explicit stack in `Scratch`, in the same
+  order, so match priority is unchanged.
+- **Exact Go resource limits.** The parser approximated Go's limits with a
+  2M-node stack cap and a 3.3M-instruction compiler cap, disagreeing with
+  Go in both directions (and on the error class). Go's `checkLimits` —
+  rune budget, then `checkSize`'s program-size estimate, then
+  `checkHeight` — is now ported exactly at Go's call sites, including Go's
+  node free list and its observable stale size cache.
+- **Surrogates in literal prefixes.** A literal prefix stopped at a
+  surrogate code point (`\x{D800}`), while Go writes it as U+FFFD and keeps
+  going: in Go `^a\x{D800}` matches `"a\u{FFFD}"` through the one-pass
+  prefix skip and `LiteralPrefix` of `a\x{D800}b` is `("a\u{FFFD}b",
+  true)`. The port now does the same; such a prefix never takes the
+  literal fast path.
+- **Prefix search worst case.** The rarest-byte prefix search switched to
+  Rabin-Karp only after a false-start count that a periodic haystack never
+  reached, so a 100 KB needle over a 4 MB periodic input took over a
+  second (Go: 5 ms). The cutover is now cost-based, keeping the search
+  O(n + m).
+- The Literal flag builds one literal node like Go's `literalRegexp`.
+- Fix the nondeterministic `NondeterministicMemoryUsage` failure of the
+  Pike-VM OOM regression test on nightly (Linux x86_64): every
+  `checkAllAllocationFailures` call now uses a backing allocator that
+  fails all resizes, so growth always goes through `alloc`. No library
+  change.
+
+### Changed
+
+- **Engine files follow Go's layout.** `exec.zig` keeps the input decoding,
+  `Scratch`, the Pike VM, the one-pass runner and the dispatch
+  (`exec.Engine`); the bitstate backtracker moves to `backtrack.zig` and
+  the substring / byte-set scans to `search.zig`. Every search goes through
+  one internal entry point, `Regexp.findAt` (Go's `find`), and the
+  allocating API sets up engine storage only when an engine runs.
+- **The package no longer ships test data.** The differential drivers and
+  corpora moved to `test/`, the benchmarks to `bench/`; `src/` holds only
+  the library and its unit tests, which shrinks a consumer's download from
+  about 7.6 MB to about 0.8 MB.
+- Removed an editor swap file (`src/.exec.zig.swp`) committed by mistake
+  after 0.6.0; editor and OS droppings are now ignored.
+
+### API
+
+<!-- Placeholder: public API additions and changes from the parallel API
+     work (replaceAllFunc, findAllSubmatch, mustCompilePOSIX, the public
+     ParseError → Go error-text mapping, doc comments) go here. -->
+
+### Testing
+
+- **Every corpus checks the error class.** Generators record Go's
+  `syntax.ErrorCode` text and the drivers compare it with the port's error;
+  an `OutOfMemory` now fails instead of passing as "errored like Go".
+- **Program shape everywhere.** `ni` (Go's instruction count) is recorded
+  and mandatory for every accepted pattern in every corpus, including the
+  `Longest()` and `CompilePOSIX` modes, which had no shape check.
+- **Literal prefixes** (`LiteralPrefix()`, bytes and complete flag) are
+  checked for every case.
+- **No silent truncation.** Each corpus ends with a `{"count":N}` trailer
+  that must equal the cases read and `test/data/MANIFEST.json` (which also
+  records the Go and Unicode versions); `tools/regen.sh` writes to a
+  temporary directory and installs the results only when every generator
+  succeeded.
+- **New cases:** Go's `invalidRegexps` / `onlyPerl` / `onlyPOSIX` parser
+  lists and `badRe` in both syntaxes; the parser's size, height and
+  factor-recursion boundaries; surrogate prefixes; random patterns with
+  spliced-in syntax errors; random inputs with NULs and malformed UTF-8; a
+  random POSIX ERE stream. `genlongest` records patterns that fail to
+  compile instead of dropping them, and the longest corpus now also checks
+  `findAllIndex`, `replaceAllString` and `split`.
+- One shared driver (`test/difftest_common.zig`) with per-corpus build
+  steps (`zig build difftest-cases|fuzz|longest|bytes`); new unit tests for
+  the parser limits (`limitstest.zig`) and an engine cross-check that forces
+  every engine on the same regexps (`enginetest.zig`).
+- **Generators are a Go module** (`tools/go.mod`, one command per
+  directory, shared `internal/` packages, every error checked); `regen.sh`
+  pins `GOTOOLCHAIN=go1.27.1` and checks `go version`.
+- **Benchmarks are generated, not hand-copied.** Both harnesses print TSV
+  with a cross-checked per-run result, the Go side is built as a binary,
+  and `tools/bench.sh` / `tools/cmd/benchtable` rewrite the tables in
+  `BENCHMARKS.md` and the README headline. The Scratch benchmark replaces
+  the `needle` case (now a literal fast-path hit) with `needle\d+`.
+
+### CI
+
+- Runs on push to main, pull requests and weekly; least-privilege token;
+  timeouts on every job.
+- Release toolchain on Linux and macOS: fmt gate (over `src/`, `test/`,
+  `bench/`, `build.zig`), build, unit tests in Debug and ReleaseFast,
+  differential suite, and `zig build check` (compiles the benchmarks).
+- Cross-compile smoke for `wasm32-wasi`, `riscv64-linux`, `x86-linux`.
+- The nightly job is blocking (no `continue-on-error`, which had hidden a
+  real failure). Every job checks the installed Zig against
+  `minimum_zig_version`.
+- `actions/checkout@v4` → `@v7` (Node 24 LTS; Node 20 is deprecated on
   GitHub runners).
 
 ## [0.6.0] — 2026-09-22
