@@ -13,11 +13,17 @@ pub const Match = regexp.Match;
 pub const Scratch = regexp.Scratch;
 pub const ParseError = regexp.ParseError;
 pub const ExecError = regexp.ExecError;
+pub const LiteralPrefix = regexp.LiteralPrefix;
 
 pub const compile = regexp.compile;
 pub const compilePOSIX = regexp.compilePOSIX;
 pub const mustCompile = regexp.mustCompile;
+pub const mustCompilePOSIX = regexp.mustCompilePOSIX;
+/// Go's package-level `regexp.MatchString`: compile, match once, free.
+pub const match = regexp.match;
 pub const quoteMeta = regexp.quoteMeta;
+/// Go's `syntax.ErrorCode` text for a `ParseError`.
+pub const errorString = regexp.errorString;
 
 /// Low-level building blocks, exposed for advanced use and testing.
 pub const syntax = struct {

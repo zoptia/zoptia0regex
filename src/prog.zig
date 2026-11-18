@@ -99,9 +99,6 @@ pub const Prog = struct {
     /// walking the range list or the fold orbit.
     ascii: []const u128 = &.{},
     start: u32 = 0,
-    /// Go's `Prog.NumCap`. Kept for parity with Go; nothing reads it (results
-    /// are padded to the Regexp's `padLen` instead).
-    num_cap: usize = 2, // implicit whole-match capture pair
 
     /// `Inst.matchRune` for `insts[pc]` with the ASCII fast path.
     pub inline fn matchRuneAt(p: *const Prog, pc: u32, r: u21) bool {
