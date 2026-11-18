@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const input = args.next() orelse "";
 
     var re = regex.compile(gpa, pattern) catch |e| {
-        std.debug.print("compile error: {s}\n", .{@errorName(e)});
+        std.debug.print("compile error: {s} ({s})\n", .{ regex.errorString(e), @errorName(e) });
         return;
     };
     defer re.deinit();

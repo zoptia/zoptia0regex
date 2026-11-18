@@ -6,6 +6,17 @@
 //! its program, capture names and literal prefix; `deinit` frees it. Execution
 //! and result-producing methods each take an `allocator` used for transient VM
 //! scratch and (where noted) the returned slice, which the caller owns.
+//!
+//! Ownership and thread-safety rules (see also `docs/usage.md`):
+//! - A `Regexp` is a value that owns its arena through a pointer. Never copy
+//!   it and `deinit` both copies (a double free); pass `*const Regexp` around
+//!   instead. Exactly one `deinit` per `compile`.
+//! - Every search method takes `*const Regexp` and may run concurrently on
+//!   one shared `Regexp`, as long as each call has its own allocator or
+//!   `Scratch`. `setLongest` mutates the `Regexp`: call it before sharing,
+//!   never while another thread is matching.
+//! - A `Scratch` serves one match at a time; see `matchesScratch` for the
+//!   nested-iteration rule.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -25,45 +36,101 @@ pub const ExecError = std.mem.Allocator.Error;
 pub const Match = struct { start: usize, end: usize };
 
 /// Reusable match storage for the allocation-free `*Scratch` API
-/// (`matchScratch` / `findSubmatchIndexScratch`). Allocate once, reuse across
-/// many matches on the same compiled `Regexp`. See `exec.Scratch`.
+/// (`matchScratch` / `findIndexScratch` / `findSubmatchIndexScratch` /
+/// `matchesScratch`). Allocate once, reuse across many matches, even on
+/// different compiled `Regexp`s. See `exec.Scratch`.
+///
+/// One `Scratch` serves one match at a time: it carries no synchronisation,
+/// and every result it hands out (the `findSubmatchIndexScratch` slice, the
+/// offsets a `matchesScratch` iterator yields) lives in a single shared
+/// buffer that the next call reusing the `Scratch` overwrites or even
+/// reallocates. In particular two live `matchesScratch` iterators on one
+/// `Scratch` (nested iteration) clobber each other; give each its own
+/// `Scratch`, or use `matches`.
 pub const Scratch = exec.Scratch;
 
+/// What `Regexp.literalPrefix` returns: a literal every match must begin
+/// with, and whether it is the whole regexp (Go's `LiteralPrefix`).
+pub const LiteralPrefix = struct { prefix: []const u8, complete: bool };
+
+/// Stand-in arena `deinit` leaves behind so that a second `deinit` of the
+/// same variable trips an assertion in safe builds. Never dereferenced.
+var deinitialized_arena: std.heap.ArenaAllocator = undefined;
+
+/// A compiled regular expression, Go's `*regexp.Regexp`.
+///
+/// Ownership: a `Regexp` owns a heap arena through `arena`, so it must not
+/// be copied: `var b = a;` followed by `deinit` on both frees the arena
+/// twice. Keep one value, call `deinit` on it exactly once, and pass
+/// `*const Regexp` to everything else. A second `deinit` of the same
+/// variable is caught by an assertion in safe builds; a `deinit` of a copy
+/// is not.
+///
+/// Thread safety: every search method takes `*const Regexp` and may run
+/// concurrently with other searches on the same `Regexp`, given a separate
+/// allocator or `Scratch` per call. `setLongest` is the only mutator; do not
+/// call it while any other thread may be matching.
+///
+/// All fields are internal: they are public only so tests and the
+/// low-level `syntax` API can inspect them. Read them through the methods
+/// (`string`, `numSubexp`, `subexpNames`, `literalPrefix`, ...) and never
+/// write them.
 pub const Regexp = struct {
+    /// Internal: the allocator `arena` was created from.
     base_allocator: std.mem.Allocator,
+    /// Internal: owns everything below; freed by `deinit`.
     arena: *std.heap.ArenaAllocator,
+    /// Internal: the source text (see `string`).
     expr: []const u8,
+    /// Internal: the compiled program.
     prog: *const prog.Prog,
+    /// Internal: see `numSubexp`.
     num_subexp: usize,
+    /// Internal: see `subexpNames`.
     subexp_names: []const []const u8,
+    /// Internal: inputs shorter than this cannot match (Go's `minInputLen`).
     min_input_len: usize,
-    /// Go's `Regexp.prefix` / `prefixComplete` (what `literalPrefix`
-    /// reports): `onePassPrefix` for one-pass regexps, `Prog.prefix`
-    /// otherwise. The engines read their own copies from `engine`.
+    /// Internal: Go's `Regexp.prefix` / `prefixComplete` (what
+    /// `literalPrefix` reports): `onePassPrefix` for one-pass regexps,
+    /// `Prog.prefix` otherwise. The engines read their own copies from
+    /// `engine`.
     prefix: []const u8,
+    /// Internal: see `prefix`.
     prefix_complete: bool,
-    /// The regexp is a plain literal (`engine.accel.prefix`, complete): no
-    /// one-pass program, captures or start condition, and a prefix that
-    /// holds no U+FFFD stand-in for an unencodable rune. Matching is then
-    /// a substring search (see `findAt`).
+    /// Internal: the regexp is a plain literal (`engine.accel.prefix`,
+    /// complete): no one-pass program, captures or start condition, and a
+    /// prefix that holds no U+FFFD stand-in for an unencodable rune.
+    /// Matching is then a substring search (see `findAt`).
     literal: bool,
-    /// Same as `engine.accel.first_bytes.bytes`; kept for introspection in
-    /// tests.
+    /// Internal: same as `engine.accel.first_bytes.bytes`; kept for
+    /// introspection in tests.
     first_bytes: []const u8,
-    /// Same as `engine.onepass`; kept for introspection in tests.
+    /// Internal: same as `engine.onepass`; kept for introspection in tests.
     onepass: ?*const onepass.OnePassProg,
-    /// Everything the matching engines read (see `exec.Engine`).
+    /// Internal: everything the matching engines read (see `exec.Engine`).
     engine: exec.Engine,
 
+    /// Frees everything the `Regexp` owns. Call it exactly once, on the
+    /// value `compile` returned (not on a copy of it); the `Regexp` is
+    /// unusable afterwards.
     pub fn deinit(re: *Regexp) void {
+        std.debug.assert(!re.isDeinitialized()); // double deinit
         const gpa = re.base_allocator;
         re.arena.deinit();
         gpa.destroy(re.arena);
+        re.* = undefined;
+        re.arena = &deinitialized_arena;
+    }
+
+    /// Whether `deinit` has run on this variable (the poison it leaves).
+    fn isDeinitialized(re: *const Regexp) bool {
+        return re.arena == &deinitialized_arena;
     }
 
     /// The length Go pads submatch results to: `2*(numSubexp+1)`. This can
-    /// exceed `prog.num_cap` when a capturing group is compiled away (e.g.
-    /// `(a){0}`); the extra trailing slots stay -1, exactly like Go's `pad`.
+    /// exceed the program's capture slots when a capturing group is compiled
+    /// away (e.g. `(a){0}`); the extra trailing slots stay -1, exactly like
+    /// Go's `pad`.
     fn padLen(re: *const Regexp) usize {
         return (re.num_subexp + 1) * 2;
     }
@@ -142,11 +209,13 @@ pub const Regexp = struct {
 
     /// A literal string that must begin any match, and whether it is the whole
     /// regexp.
-    pub fn literalPrefix(re: *const Regexp) struct { prefix: []const u8, complete: bool } {
+    pub fn literalPrefix(re: *const Regexp) LiteralPrefix {
         return .{ .prefix = re.prefix, .complete = re.prefix_complete };
     }
 
-    /// Switch to leftmost-longest (POSIX) matching for future searches.
+    /// Switch to leftmost-longest (POSIX) matching for future searches
+    /// (Go's `Longest`). This mutates the `Regexp`: call it before the
+    /// regexp is shared, never concurrently with a search on it.
     pub fn setLongest(re: *Regexp) void {
         re.engine.longest = true;
     }
@@ -224,15 +293,8 @@ pub const Regexp = struct {
     pub fn findSubmatch(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!?[]?[]const u8 {
         const caps = (try re.findSubmatchIndex(allocator, input)) orelse return null;
         defer allocator.free(caps);
-        const n = caps.len / 2;
-        const out = try allocator.alloc(?[]const u8, n);
-        for (0..n) |k| {
-            if (caps[2 * k] < 0 or caps[2 * k + 1] < 0) {
-                out[k] = null;
-            } else {
-                out[k] = input[@intCast(caps[2 * k])..@intCast(caps[2 * k + 1])];
-            }
-        }
+        const out = try allocator.alloc(?[]const u8, caps.len / 2);
+        submatchTexts(input, caps, out);
         return out;
     }
 
@@ -243,7 +305,12 @@ pub const Regexp = struct {
     /// Go's `All*` iterators and `FindAll*`), including the empty-match rule:
     /// an empty match abutting the previous match is skipped. The engine
     /// scratch is allocated once and reused for every match, so a long scan
-    /// allocates nothing per match. Build one with `Regexp.matches`.
+    /// allocates nothing per match. Build one with `Regexp.matches` (owns its
+    /// buffers; call `deinit`) or `Regexp.matchesScratch` (borrows them).
+    ///
+    /// Do not copy a `Matches` and keep using both copies: they share the
+    /// offsets buffer and, for `matches`, either copy's `deinit` frees it.
+    /// All fields are internal.
     pub const Matches = struct {
         re: *const Regexp,
         input: []const u8,
@@ -328,6 +395,12 @@ pub const Regexp = struct {
     /// of scans allocates nothing. The iterator and the slices it yields are
     /// valid until the next call that reuses `scratch` (including another
     /// `findSubmatchIndexScratch`); `deinit` is optional and frees nothing.
+    ///
+    /// No nesting on one `Scratch`: a second `matchesScratch` (or any other
+    /// `*Scratch` call) on the same `scratch` while this iterator is still
+    /// in use shares, and may reallocate, the buffer its offsets live in, so
+    /// the outer loop reads clobbered or freed results. Give an inner loop
+    /// its own `Scratch`, or use `matches`.
     pub fn matchesScratch(re: *const Regexp, scratch: *Scratch, input: []const u8, n: i64) ExecError!Matches {
         const caps = try scratch.resultBuf(re.padLen());
         return .{
@@ -398,7 +471,41 @@ pub const Regexp = struct {
         return try out.toOwnedSlice(allocator);
     }
 
+    /// Frees the result of `findAllSubmatchIndex`.
     pub fn freeAllSubmatchIndex(allocator: std.mem.Allocator, x: [][]i64) void {
+        for (x) |c| allocator.free(c);
+        allocator.free(x);
+    }
+
+    /// Submatch texts of all successive matches (Go's `FindAllSubmatch`):
+    /// one inner slice of length `numSubexp+1` per match, whose elements are
+    /// sub-slices of `input` (null for groups that did not participate).
+    /// Caller owns every inner slice and the outer slice; free with
+    /// `freeAllSubmatch`. Null if there are no matches.
+    pub fn findAllSubmatch(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8, n: i64) ExecError!?[][]?[]const u8 {
+        var it = try re.matches(allocator, input, n);
+        defer it.deinit();
+        var out: std.ArrayList([]?[]const u8) = .empty;
+        errdefer {
+            for (out.items) |c| allocator.free(c);
+            out.deinit(allocator);
+        }
+        while (try it.next()) |m| {
+            const texts = try allocator.alloc(?[]const u8, m.len / 2);
+            errdefer allocator.free(texts);
+            submatchTexts(input, m, texts);
+            try out.append(allocator, texts);
+        }
+        if (out.items.len == 0) {
+            out.deinit(allocator);
+            return null;
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// Frees the result of `findAllSubmatch`; the texts themselves point
+    /// into the input and are not freed.
+    pub fn freeAllSubmatch(allocator: std.mem.Allocator, x: [][]?[]const u8) void {
         for (x) |c| allocator.free(c);
         allocator.free(x);
     }
@@ -411,7 +518,7 @@ pub const Regexp = struct {
         const ncap: usize = if (std.mem.indexOfScalar(u8, repl, '$') != null) re.padLen() else 2;
         const Ctx = struct { re: *const Regexp, repl: []const u8 };
         return re.replaceAllCore(allocator, src, ncap, Ctx{ .re = re, .repl = repl }, struct {
-            fn f(ctx: Ctx, al: std.mem.Allocator, buf: *std.ArrayList(u8), m: []i64, source: []const u8) ExecError!void {
+            fn f(ctx: Ctx, al: std.mem.Allocator, buf: *std.ArrayList(u8), m: []const i64, source: []const u8) ExecError!void {
                 try ctx.re.expandInto(al, buf, ctx.repl, source, m);
             }
         }.f);
@@ -421,7 +528,7 @@ pub const Regexp = struct {
     pub fn replaceAllLiteralString(re: *const Regexp, allocator: std.mem.Allocator, src: []const u8, repl: []const u8) ExecError![]u8 {
         const Ctx = struct { repl: []const u8 };
         return re.replaceAllCore(allocator, src, 2, Ctx{ .repl = repl }, struct {
-            fn f(ctx: Ctx, al: std.mem.Allocator, buf: *std.ArrayList(u8), m: []i64, source: []const u8) ExecError!void {
+            fn f(ctx: Ctx, al: std.mem.Allocator, buf: *std.ArrayList(u8), m: []const i64, source: []const u8) ExecError!void {
                 _ = m;
                 _ = source;
                 try buf.appendSlice(al, ctx.repl);
@@ -429,8 +536,38 @@ pub const Regexp = struct {
         }.f);
     }
 
-    /// Replace every match with the result of `func` applied to the matched
-    /// text. `func` returns a slice valid for the duration of the call.
+    /// Replace every match with the text `func` appends to `out` (Go's
+    /// `ReplaceAllFunc` / `ReplaceAllStringFunc`). `func` receives `ctx`,
+    /// `allocator`, the output buffer and the matched text (a sub-slice of
+    /// `src`); it appends the replacement with `out.appendSlice(allocator,
+    /// ...)` / `out.print(allocator, ...)` and may use `allocator` for
+    /// temporary memory of its own, freeing it before it returns. An error
+    /// from `func` aborts the replacement: the partial output is freed and
+    /// the error returned. Caller owns the result.
+    pub fn replaceAllFunc(
+        re: *const Regexp,
+        allocator: std.mem.Allocator,
+        src: []const u8,
+        ctx: anytype,
+        comptime func: fn (@TypeOf(ctx), std.mem.Allocator, *std.ArrayList(u8), []const u8) ExecError!void,
+    ) ExecError![]u8 {
+        const Ctx = struct { inner: @TypeOf(ctx) };
+        return re.replaceAllCore(allocator, src, 2, Ctx{ .inner = ctx }, struct {
+            fn f(c: Ctx, al: std.mem.Allocator, buf: *std.ArrayList(u8), m: []const i64, source: []const u8) ExecError!void {
+                try func(c.inner, al, buf, source[@intCast(m[0])..@intCast(m[1])]);
+            }
+        }.f);
+    }
+
+    /// Replace every match with the slice `func` returns for the matched
+    /// text. Kept for compatibility; prefer `replaceAllFunc`.
+    ///
+    /// Lifetime rule: the returned slice is copied into the output as soon
+    /// as `func` returns, so it only has to stay valid until then. But
+    /// `func` cannot fail, gets no allocator, and the library never frees
+    /// what it returns: return a literal, a sub-slice of the match, or
+    /// memory `ctx` owns and frees. Text built per match (upper-casing,
+    /// say) needs `replaceAllFunc`.
     pub fn replaceAllStringFunc(
         re: *const Regexp,
         allocator: std.mem.Allocator,
@@ -438,11 +575,9 @@ pub const Regexp = struct {
         ctx: anytype,
         comptime func: fn (@TypeOf(ctx), []const u8) []const u8,
     ) ExecError![]u8 {
-        const Ctx = struct { inner: @TypeOf(ctx) };
-        return re.replaceAllCore(allocator, src, 2, Ctx{ .inner = ctx }, struct {
-            fn f(c: Ctx, al: std.mem.Allocator, buf: *std.ArrayList(u8), m: []i64, source: []const u8) ExecError!void {
-                const matched = source[@intCast(m[0])..@intCast(m[1])];
-                try buf.appendSlice(al, func(c.inner, matched));
+        return re.replaceAllFunc(allocator, src, ctx, struct {
+            fn f(c: @TypeOf(ctx), al: std.mem.Allocator, out: *std.ArrayList(u8), matched: []const u8) ExecError!void {
+                try out.appendSlice(al, func(c, matched));
             }
         }.f);
     }
@@ -453,7 +588,7 @@ pub const Regexp = struct {
         src: []const u8,
         ncap: usize,
         ctx: anytype,
-        comptime replFn: fn (@TypeOf(ctx), std.mem.Allocator, *std.ArrayList(u8), []i64, []const u8) ExecError!void,
+        comptime replFn: fn (@TypeOf(ctx), std.mem.Allocator, *std.ArrayList(u8), []const i64, []const u8) ExecError!void,
     ) ExecError![]u8 {
         var last_match_end: usize = 0;
         var search_pos: usize = 0;
@@ -497,11 +632,11 @@ pub const Regexp = struct {
     /// Append `template` to `buf`, expanding `$name` / `${name}` / `$1`
     /// references using `match` (submatch offsets into `src`). Mirrors Go's
     /// `expand`.
-    pub fn expand(re: *const Regexp, allocator: std.mem.Allocator, buf: *std.ArrayList(u8), template: []const u8, src: []const u8, m: []i64) ExecError!void {
+    pub fn expand(re: *const Regexp, allocator: std.mem.Allocator, buf: *std.ArrayList(u8), template: []const u8, src: []const u8, m: []const i64) ExecError!void {
         return re.expandInto(allocator, buf, template, src, m);
     }
 
-    fn expandInto(re: *const Regexp, allocator: std.mem.Allocator, dst: *std.ArrayList(u8), template0: []const u8, src: []const u8, m: []i64) ExecError!void {
+    fn expandInto(re: *const Regexp, allocator: std.mem.Allocator, dst: *std.ArrayList(u8), template0: []const u8, src: []const u8, m: []const i64) ExecError!void {
         var template = template0;
         while (template.len > 0) {
             const dollar = std.mem.indexOfScalar(u8, template, '$') orelse break;
@@ -568,6 +703,14 @@ pub const Regexp = struct {
         return try out.toOwnedSlice(allocator);
     }
 };
+
+/// Submatch offsets to texts: `out[k]` is `input[m[2k]..m[2k+1]]`, or null
+/// for a group that did not participate.
+fn submatchTexts(input: []const u8, m: []const i64, out: []?[]const u8) void {
+    for (out, 0..) |*o, k| {
+        o.* = if (m[2 * k] < 0 or m[2 * k + 1] < 0) null else input[@intCast(m[2 * k])..@intCast(m[2 * k + 1])];
+    }
+}
 
 const Extracted = struct { name: []const u8, num: i64, rest: []const u8, ok: bool };
 
@@ -784,11 +927,164 @@ pub fn compilePOSIX(gpa: std.mem.Allocator, expr: []const u8) ParseError!Regexp 
     return compileInternal(gpa, expr, ast.POSIX, true);
 }
 
-/// Like `compile` but panics on a malformed pattern.
+/// Like `compile` but panics if the pattern cannot be compiled, with Go's
+/// message shape: ``regexp: Compile(`a(`): error parsing regexp: missing
+/// closing )``. Go also appends the offending fragment of the pattern
+/// (``: `a(` ``), which the Zig error set does not carry, so it is omitted.
+/// Running out of memory panics with `...: out of memory` instead.
 pub fn mustCompile(gpa: std.mem.Allocator, expr: []const u8) Regexp {
-    return compile(gpa, expr) catch |e| {
-        std.debug.panic("regexp: compile({s}): {s}", .{ expr, @errorName(e) });
+    return compile(gpa, expr) catch |e| compilePanic("Compile", expr, e);
+}
+
+/// Like `compilePOSIX` but panics if the pattern cannot be compiled (Go's
+/// `MustCompilePOSIX`); see `mustCompile` for the message.
+pub fn mustCompilePOSIX(gpa: std.mem.Allocator, expr: []const u8) Regexp {
+    return compilePOSIX(gpa, expr) catch |e| compilePanic("CompilePOSIX", expr, e);
+}
+
+fn compilePanic(func: []const u8, expr: []const u8, err: ParseError) noreturn {
+    std.debug.panic("{f}", .{CompileFailure{ .func = func, .expr = expr, .err = err }});
+}
+
+/// The `mustCompile` / `mustCompilePOSIX` panic message.
+const CompileFailure = struct {
+    func: []const u8,
+    expr: []const u8,
+    err: ParseError,
+
+    pub fn format(f: CompileFailure, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const what = if (f.err == error.OutOfMemory) "" else "error parsing regexp: ";
+        try w.print("regexp: {s}({f}): {s}{s}", .{ f.func, GoQuote{ .s = f.expr }, what, errorString(f.err) });
+    }
+};
+
+/// The message text of a compile error. For every parse error it is Go's
+/// `syntax.ErrorCode` string (e.g. `error.MissingParen` gives "missing
+/// closing )"); `error.OutOfMemory`, which has no Go counterpart, gives
+/// "out of memory".
+pub fn errorString(err: ParseError) []const u8 {
+    return switch (err) {
+        error.InvalidCharClass => "invalid character class",
+        error.InvalidCharRange => "invalid character class range",
+        error.InvalidEscape => "invalid escape sequence",
+        error.InvalidNamedCapture => "invalid named capture",
+        error.InvalidPerlOp => "invalid or unsupported Perl syntax",
+        error.InvalidRepeatOp => "invalid nested repetition operator",
+        error.InvalidRepeatSize => "invalid repeat count",
+        error.InvalidUTF8 => "invalid UTF-8",
+        error.MissingBracket => "missing closing ]",
+        error.MissingParen => "missing closing )",
+        error.MissingRepeatArgument => "missing argument to repetition operator",
+        error.TrailingBackslash => "trailing backslash at end of expression",
+        error.UnexpectedParen => "unexpected )",
+        error.NestingDepth => "expression nests too deeply",
+        error.TooLarge => "expression too large",
+        error.OutOfMemory => "out of memory",
     };
+}
+
+/// Formats a pattern the way Go's `regexp.quote` does: in backquotes when
+/// `strconv.CanBackquote` allows, otherwise double-quoted and escaped like
+/// `strconv.Quote`. Used only for panic messages, so non-ASCII runes count
+/// as printable except the C1 controls and U+FEFF, an approximation of
+/// Go's `strconv.IsPrint`.
+const GoQuote = struct {
+    s: []const u8,
+
+    pub fn format(q: GoQuote, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (canBackquote(q.s)) return w.print("`{s}`", .{q.s});
+        try w.writeByte('"');
+        var i: usize = 0;
+        while (i < q.s.len) {
+            const d = decodeRune(q.s[i..]);
+            const bytes = q.s[i .. i + d.width];
+            i += d.width;
+            const r = d.rune orelse {
+                try w.print("\\x{x:0>2}", .{bytes[0]});
+                continue;
+            };
+            switch (r) {
+                '"' => try w.writeAll("\\\""),
+                '\\' => try w.writeAll("\\\\"),
+                0x07 => try w.writeAll("\\a"),
+                0x08 => try w.writeAll("\\b"),
+                0x0C => try w.writeAll("\\f"),
+                '\n' => try w.writeAll("\\n"),
+                '\r' => try w.writeAll("\\r"),
+                '\t' => try w.writeAll("\\t"),
+                0x0B => try w.writeAll("\\v"),
+                0x00...0x06, 0x0E...0x1F, 0x7F => try w.print("\\x{x:0>2}", .{r}),
+                0x80...0x9F, 0xFEFF => try w.print("\\u{x:0>4}", .{r}),
+                else => try w.writeAll(bytes),
+            }
+        }
+        try w.writeByte('"');
+    }
+
+    /// Go's `strconv.CanBackquote`.
+    fn canBackquote(s: []const u8) bool {
+        var i: usize = 0;
+        while (i < s.len) {
+            const d = decodeRune(s[i..]);
+            i += d.width;
+            const r = d.rune orelse return false;
+            if (d.width > 1) {
+                if (r == 0xFEFF) return false;
+                continue;
+            }
+            if ((r < ' ' and r != '\t') or r == '`' or r == 0x7F) return false;
+        }
+        return true;
+    }
+
+    /// The UTF-8 rune at the start of `s`, or null (width 1) for an invalid
+    /// byte.
+    fn decodeRune(s: []const u8) struct { rune: ?u21, width: usize } {
+        const n = std.unicode.utf8ByteSequenceLength(s[0]) catch return .{ .rune = null, .width = 1 };
+        if (n > s.len) return .{ .rune = null, .width = 1 };
+        const r = std.unicode.utf8Decode(s[0..n]) catch return .{ .rune = null, .width = 1 };
+        return .{ .rune = r, .width = n };
+    }
+};
+
+/// Go's package-level `regexp.MatchString` / `Match`: compile `pattern`,
+/// report whether `input` contains a match, and free the compiled regexp.
+/// `gpa` backs both the compilation and the search. To match one pattern
+/// repeatedly, `compile` it once instead.
+pub fn match(gpa: std.mem.Allocator, pattern: []const u8, input: []const u8) ParseError!bool {
+    var re = try compile(gpa, pattern);
+    defer re.deinit();
+    return re.match(gpa, input);
+}
+
+fn expectCompileFailure(want: []const u8, func: []const u8, expr: []const u8, err: ParseError) !void {
+    var buf: [256]u8 = undefined;
+    const got = try std.fmt.bufPrint(&buf, "{f}", .{CompileFailure{ .func = func, .expr = expr, .err = err }});
+    try std.testing.expectEqualStrings(want, got);
+}
+
+test "mustCompile panic message follows Go" {
+    // Go: regexp: Compile(`a(`): error parsing regexp: missing closing ): `a(`
+    try expectCompileFailure("regexp: Compile(`a(`): error parsing regexp: missing closing )", "Compile", "a(", error.MissingParen);
+    // Go: regexp: Compile("a`("): error parsing regexp: missing closing ): `a`(`
+    try expectCompileFailure("regexp: Compile(\"a`(\"): error parsing regexp: missing closing )", "Compile", "a`(", error.MissingParen);
+    // Go's strconv.Quote of "\t\n\x00\xff\"\\".
+    try expectCompileFailure(
+        "regexp: CompilePOSIX(\"\\t\\n\\x00\\xff\\\"\\\\\"): error parsing regexp: invalid UTF-8",
+        "CompilePOSIX",
+        "\t\n\x00\xff\"\\",
+        error.InvalidUTF8,
+    );
+    // A tab alone still allows backquotes; non-ASCII stays verbatim.
+    try expectCompileFailure("regexp: Compile(`\té(`): error parsing regexp: missing closing )", "Compile", "\té(", error.MissingParen);
+    try expectCompileFailure("regexp: Compile(`x`): out of memory", "Compile", "x", error.OutOfMemory);
+}
+
+test "deinit poisons the Regexp against a second deinit" {
+    var re = try compile(std.testing.allocator, "a+b");
+    try std.testing.expect(!re.isDeinitialized());
+    re.deinit();
+    try std.testing.expect(re.isDeinitialized());
 }
 
 fn minInputLen(re: *const ast.Regexp) usize {
