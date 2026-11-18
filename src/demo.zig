@@ -10,7 +10,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    var args = std.process.Args.Iterator.init(init.args);
+    // initAllocator, unlike init, also compiles for WASI and Windows.
+    var args = try std.process.Args.Iterator.initAllocator(init.args, gpa);
     defer args.deinit();
     _ = args.next(); // skip argv0
     const pattern = args.next() orelse {
