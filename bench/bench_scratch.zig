@@ -1,86 +1,92 @@
-//! Micro-benchmark for the allocation-free `Scratch` reuse API. Per pattern it
-//! times `re.match` (which allocates a fresh Machine per call — the original
-//! behaviour) against `re.matchScratch` (reusing one caller-owned `Scratch`, so
-//! steady-state matching does zero heap allocation). Build/run optimized:
+//! Micro-benchmark for the allocation-free `Scratch` reuse API. Per case in
+//! `data/scratch.jsonl` it times `re.match` (which sets up engine storage
+//! per call) against `re.matchScratch` (reusing one caller-owned `Scratch`,
+//! so steady-state matching does zero heap allocation). The Go side is
+//! `tools/cmd/benchscratchgo`. Run `zig build bench-scratch` (ReleaseFast).
 //!
-//!   zig build bench-scratch
-//!
-//! A u64 sink derived from every match result is printed (and fed through
-//! `doNotOptimizeAway`) so the optimizer cannot hoist or drop the match calls.
-//! Output columns (TSV, to stderr):  name  alloc_ns  scratch_ns  speedup  sink
+//! Output (stdout, TSV):  name  engine  alloc_ns  scratch_ns  result
+//! `result` is one single match (1 or 0), comparable with the Go side.
 
 const std = @import("std");
-const regex = @import("regexp.zig");
+const regex = @import("regex");
 
+const cases_data = @embedFile("data/scratch.jsonl");
 const calibrate_ns: i128 = 200_000_000;
+
+const Case = struct { name: []const u8, p: []const u8, in: []const u8 };
 
 fn nowNs(io: std.Io) i128 {
     return std.Io.Timestamp.now(io, .awake).nanoseconds;
 }
 
-const Result = struct { ns: f64, sum: u64 };
-const Case = struct { name: []const u8, p: []const u8, in: []const u8 };
+fn fail(e: anyerror) noreturn {
+    std.debug.panic("benchmark operation failed: {s}", .{@errorName(e)});
+}
 
-/// Allocating path: each call builds and frees a temporary Machine (today's
-/// `re.match`).
-fn calAlloc(io: std.Io, re: *regex.Regexp, gpa: std.mem.Allocator, input: []const u8) Result {
+/// Doubles the iteration count until one batch exceeds the target and
+/// returns ns per call of `f(ctx)`.
+fn calibrate(io: std.Io, ctx: anytype, comptime f: fn (@TypeOf(ctx)) bool) f64 {
     var iters: u64 = 1;
     while (true) {
         const t0 = nowNs(io);
         var acc: u64 = 0;
         var i: u64 = 0;
-        while (i < iters) : (i += 1) acc +%= @intFromBool(re.match(gpa, input) catch false);
+        while (i < iters) : (i += 1) acc +%= @intFromBool(f(ctx));
         const ns = nowNs(io) - t0;
-        if (ns > calibrate_ns) {
-            std.mem.doNotOptimizeAway(acc);
-            return .{ .ns = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters)), .sum = acc };
-        }
+        std.mem.doNotOptimizeAway(acc);
+        if (ns > calibrate_ns) return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters));
         iters *= 2;
     }
 }
 
-/// Reuse path: one warmed `Scratch` shared across every call (zero allocation
-/// in steady state).
-fn calScratch(io: std.Io, re: *regex.Regexp, scratch: *regex.Scratch, input: []const u8) Result {
-    var iters: u64 = 1;
-    while (true) {
-        const t0 = nowNs(io);
-        var acc: u64 = 0;
-        var i: u64 = 0;
-        while (i < iters) : (i += 1) acc +%= @intFromBool(re.matchScratch(scratch, input) catch false);
-        const ns = nowNs(io) - t0;
-        if (ns > calibrate_ns) {
-            std.mem.doNotOptimizeAway(acc);
-            return .{ .ns = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters)), .sum = acc };
-        }
-        iters *= 2;
-    }
+const AllocCtx = struct { re: *const regex.Regexp, gpa: std.mem.Allocator, in: []const u8 };
+const ScratchCtx = struct { re: *const regex.Regexp, scratch: *regex.Scratch, in: []const u8 };
+
+fn matchAlloc(c: AllocCtx) bool {
+    return c.re.match(c.gpa, c.in) catch |e| fail(e);
+}
+
+fn matchScratch(c: ScratchCtx) bool {
+    return c.re.matchScratch(c.scratch, c.in) catch |e| fail(e);
+}
+
+/// The engine `matchScratch` runs (see bench.zig's `engineName`).
+fn engineName(re: *const regex.Regexp, input: []const u8) []const u8 {
+    if (re.literal) return "literal";
+    if (re.onepass != null) return "one-pass";
+    const ninst = re.prog.insts.len;
+    const bt = regex.syntax.backtrack;
+    const bitstate = ninst <= bt.max_backtrack_prog and input.len < bt.max_backtrack_vector / ninst;
+    if (re.prefix.len > 0) return if (bitstate) "bitstate+prefix" else "Pike VM+prefix";
+    if (re.first_bytes.len > 0) return if (bitstate) "bitstate+first-bytes" else "Pike VM+first-bytes";
+    return if (bitstate) "bitstate" else "Pike VM";
 }
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    const cases = [_]Case{
-        .{ .name = "literal-needle", .p = "needle", .in = "a haystack with a needle hidden somewhere near the end" },
-        .{ .name = "alternation", .p = "(foo|bar|baz)+", .in = "zz bar foo baz qux barbaz zz" },
-        .{ .name = "email-unanchored", .p = "[a-z]+@[a-z]+\\.[a-z]+", .in = "please contact us at user@example.com today" },
-        .{ .name = "charclass-plus", .p = "[0-9]+", .in = "order 12345 shipped on 2024" },
-        .{ .name = "anchored-onepass", .p = "\\A\\d+\\z", .in = "1234567890" }, // one-pass: expect ~unchanged
-    };
+    var buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
+    const out = &stdout.interface;
+    try out.print("name\tengine\talloc_ns\tscratch_ns\tresult\n", .{});
 
-    std.debug.print("name\talloc_ns\tscratch_ns\tspeedup\tsink\n", .{});
-    for (cases) |c| {
-        var re = try regex.compile(gpa, c.p);
+    var it = std.mem.tokenizeScalar(u8, cases_data, '\n');
+    while (it.next()) |line| {
+        const parsed = try std.json.parseFromSlice(Case, gpa, line, .{});
+        defer parsed.deinit();
+        const c = parsed.value;
+
+        var re = regex.compile(gpa, c.p) catch |e| std.debug.panic("{s}: compile: {s}", .{ c.name, @errorName(e) });
         defer re.deinit();
-
         var scratch = regex.Scratch.init(gpa);
         defer scratch.deinit();
-        _ = re.matchScratch(&scratch, c.in) catch false; // warm the scratch buffers
 
-        const a = calAlloc(io, &re, gpa, c.in);
-        const b = calScratch(io, &re, &scratch, c.in);
-        const speedup = a.ns / b.ns;
-        std.debug.print("{s}\t{d:.0}\t{d:.0}\t{d:.2}x\t{d}\n", .{ c.name, a.ns, b.ns, speedup, a.sum +% b.sum });
+        const result = matchScratch(.{ .re = &re, .scratch = &scratch, .in = c.in }); // also warms the scratch
+        if (matchAlloc(.{ .re = &re, .gpa = gpa, .in = c.in }) != result) std.debug.panic("{s}: match and matchScratch disagree", .{c.name});
+        const alloc_ns = calibrate(io, AllocCtx{ .re = &re, .gpa = gpa, .in = c.in }, matchAlloc);
+        const scratch_ns = calibrate(io, ScratchCtx{ .re = &re, .scratch = &scratch, .in = c.in }, matchScratch);
+        try out.print("{s}\t{s}\t{d:.1}\t{d:.1}\t{d}\n", .{ c.name, engineName(&re, c.in), alloc_ns, scratch_ns, @intFromBool(result) });
     }
+    try out.flush();
 }

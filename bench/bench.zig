@@ -1,20 +1,24 @@
-//! Zig-side benchmark harness: times this regexp port on the shared cases
-//! (src/bench.jsonl + corpus), using the same calibration methodology as the
-//! Go harness (tools/benchgo.go). Build optimized and run:
+//! Zig-side throughput benchmark: times this regexp port on the shared cases
+//! (`data/bench.jsonl` + corpus) with the same calibration as the Go harness
+//! (`tools/cmd/benchgo`). Run `zig build bench` (always ReleaseFast), or
+//! `tools/bench.sh` to run both sides and regenerate BENCHMARKS.md.
 //!
-//!   zig run -OReleaseFast src/bench.zig
+//! Per-iteration scratch uses an arena reset (retain_capacity), so allocation
+//! is a cheap bump, the analogue of Go's per-Regexp machine pool.
 //!
-//! Per-iteration scratch uses an arena reset (retain_capacity) so allocation
-//! cost is a cheap bump, isolating engine throughput (Go amortizes the same
-//! way via its machine sync.Pool). Output columns (TSV, to stderr):
-//!   name  compile_ns  op_ns  MB/s  checksum
+//! Output (stdout, TSV after a `# key=value` meta line):
+//!   name  op  engine  compile_ns  op_ns  mb_s  result
+//! `result` is the value of one single run of the operation (see `runOp`),
+//! computed exactly like the Go harness's, so the two can be cross-checked.
+//! `engine` is the engine the port's dispatch picks for this input.
 
 const std = @import("std");
-const regex = @import("regexp.zig");
+const builtin = @import("builtin");
+const regex = @import("regex");
 
-const cases_data = @embedFile("bench.jsonl");
-const corpus = @embedFile("bench_corpus.txt");
-const aaa = @embedFile("bench_aaa.txt");
+const cases_data = @embedFile("data/bench.jsonl");
+const corpus = @embedFile("data/bench_corpus.txt");
+const aaa = @embedFile("data/bench_aaa.txt");
 
 const Case = struct { name: []const u8, p: []const u8, op: []const u8, in: []const u8, lit: []const u8 };
 const Op = enum { match, find, findall, submatch };
@@ -29,63 +33,90 @@ fn nowNs(io: std.Io) i128 {
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
-    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer scratch.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
+    const out = &stdout.interface;
+    try out.print("# zig={s} target={s}-{s}\n", .{ builtin.zig_version_string, @tagName(builtin.cpu.arch), @tagName(builtin.os.tag) });
+    try out.print("name\top\tengine\tcompile_ns\top_ns\tmb_s\tresult\n", .{});
 
     var it = std.mem.tokenizeScalar(u8, cases_data, '\n');
     while (it.next()) |line| {
-        if (line.len == 0) continue;
         const parsed = try std.json.parseFromSlice(Case, gpa, line, .{});
         defer parsed.deinit();
         const c = parsed.value;
-        const input = if (c.lit.len > 0) c.lit else if (std.mem.eql(u8, c.in, "aaa")) aaa else corpus;
-        const op: Op = if (std.mem.eql(u8, c.op, "match")) .match else if (std.mem.eql(u8, c.op, "find")) .find else if (std.mem.eql(u8, c.op, "submatch")) .submatch else .findall;
+        const input = if (c.lit.len > 0) c.lit else if (std.mem.eql(u8, c.in, "aaa")) aaa else if (std.mem.eql(u8, c.in, "corpus")) corpus else std.debug.panic("{s}: unknown input {s}", .{ c.name, c.in });
+        const op = std.meta.stringToEnum(Op, c.op) orelse std.debug.panic("{s}: unknown op {s}", .{ c.name, c.op });
 
         const comp_ns = calibrateCompile(io, gpa, c.p);
 
-        var re = try regex.compile(gpa, c.p);
+        var re = regex.compile(gpa, c.p) catch |e| std.debug.panic("{s}: compile: {s}", .{ c.name, @errorName(e) });
         defer re.deinit();
 
-        const r = calibrate(io, &re, op, input, &scratch);
-        const mbps = @as(f64, @floatFromInt(input.len)) * 1000.0 / r.ns;
-        std.debug.print("{s}\t{d:.0}\t{d:.1}\t{d:.2}\t{d}\n", .{ c.name, comp_ns, r.ns, mbps, r.sum });
+        const result = runOp(&re, op, input, &arena);
+        const ns = calibrate(io, &re, op, input, &arena);
+        const mbps = @as(f64, @floatFromInt(input.len)) * 1000.0 / ns;
+        try out.print("{s}\t{s}\t{s}\t{d:.0}\t{d:.1}\t{d:.2}\t{d}\n", .{ c.name, c.op, engineName(&re, op, input), comp_ns, ns, mbps, result });
     }
+    try out.flush();
 }
 
-fn runOp(re: *regex.Regexp, op: Op, input: []const u8, scratch: *std.heap.ArenaAllocator) u64 {
-    _ = scratch.reset(.retain_capacity);
-    const a = scratch.allocator();
+/// The engine the port runs for one search of `input` (mirrors
+/// `Regexp.findAt` and `exec.executeReuse`), plus the scan accelerator.
+fn engineName(re: *const regex.Regexp, op: Op, input: []const u8) []const u8 {
+    const whole_match_only = op != .submatch;
+    if (re.literal and whole_match_only) return "literal";
+    if (re.onepass != null) return "one-pass";
+    const ninst = re.prog.insts.len;
+    const bt = regex.syntax.backtrack;
+    const bitstate = ninst <= bt.max_backtrack_prog and input.len < bt.max_backtrack_vector / ninst;
+    if (re.prefix.len > 0) return if (bitstate) "bitstate+prefix" else "Pike VM+prefix";
+    if (re.first_bytes.len > 0) return if (bitstate) "bitstate+first-bytes" else "Pike VM+first-bytes";
+    return if (bitstate) "bitstate" else "Pike VM";
+}
+
+/// One operation; its value derives from the full result and matches the
+/// Go harness's `runOp`. Any engine error aborts the benchmark.
+fn runOp(re: *regex.Regexp, op: Op, input: []const u8, arena: *std.heap.ArenaAllocator) u64 {
+    _ = arena.reset(.retain_capacity);
+    const a = arena.allocator();
     switch (op) {
-        .match => return @intFromBool(re.match(a, input) catch false),
+        .match => return @intFromBool(re.match(a, input) catch |e| fail(e)),
         .find => {
-            const m = re.findIndex(a, input) catch null;
-            return if (m) |x| @intCast(x.start + x.end) else 0;
+            const m = (re.findIndex(a, input) catch |e| fail(e)) orelse return 0;
+            return m.start + m.end + 1;
         },
         .findall => {
-            const x = re.findAllIndex(a, input, -1) catch null;
-            return if (x) |s| s.len else 0;
+            const all = (re.findAllIndex(a, input, -1) catch |e| fail(e)) orelse return 0;
+            var sum: u64 = 0;
+            for (all) |m| sum += m.start + m.end + 1;
+            return sum;
         },
         .submatch => {
-            const x = re.findSubmatchIndex(a, input) catch null;
-            return if (x) |s| s.len else 0;
+            const caps = (re.findSubmatchIndex(a, input) catch |e| fail(e)) orelse return 0;
+            var sum: u64 = 0;
+            for (caps) |x| sum +%= @bitCast(x + 1);
+            return sum;
         },
     }
 }
 
-const Result = struct { ns: f64, sum: u64 };
+fn fail(e: anyerror) noreturn {
+    std.debug.panic("benchmark operation failed: {s}", .{@errorName(e)});
+}
 
-fn calibrate(io: std.Io, re: *regex.Regexp, op: Op, input: []const u8, scratch: *std.heap.ArenaAllocator) Result {
+fn calibrate(io: std.Io, re: *regex.Regexp, op: Op, input: []const u8, arena: *std.heap.ArenaAllocator) f64 {
     var iters: u64 = 1;
     while (true) {
         const t0 = nowNs(io);
         var acc: u64 = 0;
         var i: u64 = 0;
-        while (i < iters) : (i += 1) acc +%= runOp(re, op, input, scratch);
+        while (i < iters) : (i += 1) acc +%= runOp(re, op, input, arena);
         const ns = nowNs(io) - t0;
-        if (ns > calibrate_ns) {
-            std.mem.doNotOptimizeAway(acc);
-            return .{ .ns = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters)), .sum = acc };
-        }
+        std.mem.doNotOptimizeAway(acc);
+        if (ns > calibrate_ns) return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters));
         iters *= 2;
     }
 }
@@ -97,15 +128,13 @@ fn calibrateCompile(io: std.Io, gpa: std.mem.Allocator, pattern: []const u8) f64
         var acc: u64 = 0;
         var i: u64 = 0;
         while (i < iters) : (i += 1) {
-            var re = regex.compile(gpa, pattern) catch unreachable;
+            var re = regex.compile(gpa, pattern) catch |e| fail(e);
             acc +%= re.numSubexp();
             re.deinit();
         }
         const ns = nowNs(io) - t0;
-        if (ns > compile_target_ns) {
-            std.mem.doNotOptimizeAway(acc);
-            return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters));
-        }
+        std.mem.doNotOptimizeAway(acc);
+        if (ns > compile_target_ns) return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters));
         iters *= 2;
     }
 }
