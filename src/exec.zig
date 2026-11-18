@@ -535,25 +535,32 @@ const Machine = struct {
         var nextq = &m.q1;
         var c = Cursor.at(input, pos);
         var flag: LazyFlag = if (pos == 0) LazyFlag.init(-1, c.r) else input.context(pos);
+        // Loop invariants, read once: the per-position checks below would
+        // otherwise reload them through `m.accel` at every input byte.
+        const accel = m.accel;
+        const prefix = accel.prefix;
+        const fbytes = &accel.first_bytes;
+        const has_first_bytes = fbytes.bytes.len > 0;
+        const start_anywhere = m.cond & prog.empty_begin_text == 0;
 
         while (true) {
             if (runq.n == 0) {
-                if (m.cond & prog.empty_begin_text != 0 and c.pos != 0) break; // anchored, past start
+                if (!start_anywhere and c.pos != 0) break; // anchored, past start
                 if (m.matched) break; // have match, done exploring
                 // Literal-prefix acceleration: every match must start with the
                 // prefix, so fast-forward to its next occurrence (memchr-class
                 // substring search) instead of stepping the NFA at every byte.
-                if (m.accel.prefix.len > 0 and c.r1 != m.accel.prefix_rune) {
-                    const adv = search.prefixIndexAnchored(input.s[c.pos..], m.accel.prefix, m.accel.prefix_anchor) orelse break;
+                if (prefix.len > 0 and c.r1 != accel.prefix_rune) {
+                    const adv = search.prefixIndexAnchored(input.s[c.pos..], prefix, accel.prefix_anchor) orelse break;
                     c = Cursor.at(input, c.pos + adv);
-                } else if (m.accel.first_bytes.bytes.len > 0 and !m.accel.first_bytes.containsRune(c.r)) {
+                } else if (has_first_bytes and !fbytes.containsRune(c.r)) {
                     // First-byte acceleration: no literal prefix, but every
                     // match starts with one of a few ASCII bytes (e.g. a
                     // case-insensitive literal or a small leading class), so
                     // scan ahead to the next candidate. Unlike the prefix
                     // path, the closure may pass zero-width assertions, so
                     // the boundary flag must be recomputed for the new pos.
-                    const adv = search.indexOfAnyByte(input.s[c.pos..], &m.accel.first_bytes) orelse break;
+                    const adv = search.indexOfAnyByte(input.s[c.pos..], fbytes) orelse break;
                     if (adv > 0) {
                         c = Cursor.at(input, c.pos + adv);
                         flag = input.context(c.pos);
@@ -565,7 +572,7 @@ const Machine = struct {
             // adds the start thread anyway and lets the `\A` assertion fail
             // in `add`; RE2's guard skips that dead closure walk without
             // changing any result.
-            if (!m.matched and (c.pos == 0 or m.cond & prog.empty_begin_text == 0)) {
+            if (!m.matched and (start_anywhere or c.pos == 0)) {
                 if (m.matchcap.len > 0) m.matchcap[0] = @intCast(c.pos);
                 _ = try m.add(runq, m.p.start, c.pos, m.matchcap, &flag, null);
             }

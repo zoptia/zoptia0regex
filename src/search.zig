@@ -165,13 +165,10 @@ fn indexAnchored(haystack: []const u8, needle: []const u8, anchor: usize, stats:
         ) orelse return null;
         const at = found - anchor;
         cost += candidate_cost;
-        // The anchor byte matched. Reject on the last and first bytes before
-        // comparing the whole needle: a periodic needle over a periodic
-        // haystack usually differs at an end (the audit's
-        // "Qbcdefgh"…"Qbcdefgi" needle differs only in its last byte).
-        if (haystack[at + last] == needle[last] and haystack[at] == needle[0] and
-            verify(haystack[at..][0..needle.len], needle, &cost))
-        {
+        // The anchor byte matched. Reject on the last byte before comparing
+        // the whole needle: a periodic needle over a periodic haystack often
+        // differs only at its end (like the audit's "Qbcdefgh"…"Qbcdefgi").
+        if (haystack[at + last] == needle[last] and verify(haystack[at..][0..needle.len], needle, &cost)) {
             return at;
         }
         start = at + 1;
@@ -187,6 +184,10 @@ fn indexAnchored(haystack: []const u8, needle: []const u8, anchor: usize, stats:
 /// Compare `hay` (as long as `needle`) to `needle` block by block, charging
 /// `cost` for every block compared.
 fn verify(hay: []const u8, needle: []const u8, cost: *usize) bool {
+    if (needle.len <= verify_block) { // the common case: one comparison
+        cost.* += needle.len;
+        return std.mem.eql(u8, hay, needle);
+    }
     var i: usize = 0;
     while (i < needle.len) {
         const end = @min(i + verify_block, needle.len);

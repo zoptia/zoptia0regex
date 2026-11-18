@@ -73,13 +73,13 @@ pub const Regexp = struct {
     /// byte offset `pos`, writing its submatch offsets into `caps` (whose
     /// length, 0 up to `padLen`, bounds how many are recorded; -1 when
     /// unset). Returns whether there was a match; `caps` is meaningful only
-    /// then. Engine storage is borrowed from `scratch`.
+    /// then. Engine storage comes from `storage`.
     ///
     /// Like Go it first rejects inputs shorter than any match. Then, a
     /// port-specific shortcut: a plain literal regexp (see `literal`) needs
     /// no engine when at most the whole-match slots are wanted — the match
     /// is the literal's next occurrence.
-    fn findAt(re: *const Regexp, scratch: *Scratch, input: []const u8, pos: usize, caps: []i64) ExecError!bool {
+    fn findAt(re: *const Regexp, storage: Storage, input: []const u8, pos: usize, caps: []i64) ExecError!bool {
         if (input.len < re.min_input_len) return false;
         if (caps.len <= 2 and re.literal and re.engine.mode == .auto) {
             const a = &re.engine.accel;
@@ -90,21 +90,27 @@ pub const Regexp = struct {
             }
             return true;
         }
-        return exec.executeReuse(scratch, &re.engine, .{ .s = input }, pos, caps);
+        switch (storage) {
+            .scratch => |scratch| return exec.executeReuse(scratch, &re.engine, .{ .s = input }, pos, caps),
+            .temporary => |allocator| {
+                var scratch = Scratch.init(allocator);
+                defer scratch.deinit();
+                return exec.executeReuse(&scratch, &re.engine, .{ .s = input }, pos, caps);
+            },
+        }
     }
 
-    /// `findAt` from the start of `input` with a temporary scratch: the
-    /// engine of the allocating API. The scratch allocates lazily, so the
-    /// literal and one-pass paths allocate nothing.
-    fn findOnce(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8, caps: []i64) ExecError!bool {
-        var scratch = Scratch.init(allocator);
-        defer scratch.deinit();
-        return re.findAt(&scratch, input, 0, caps);
-    }
+    /// Where `findAt` gets engine storage: a caller's `Scratch` (the
+    /// `*Scratch` API and the find-all loops), or a temporary one from an
+    /// allocator (the allocating API), set up only if an engine runs.
+    const Storage = union(enum) {
+        scratch: *Scratch,
+        temporary: std.mem.Allocator,
+    };
 
-    fn findIndexScratchImpl(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!?Match {
+    fn findIndexIn(re: *const Regexp, storage: Storage, input: []const u8) ExecError!?Match {
         var caps: [2]i64 = .{ -1, -1 };
-        if (!try re.findAt(scratch, input, 0, &caps)) return null;
+        if (!try re.findAt(storage, input, 0, &caps)) return null;
         return Match{ .start = @intCast(caps[0]), .end = @intCast(caps[1]) };
     }
 
@@ -149,7 +155,7 @@ pub const Regexp = struct {
 
     /// Reports whether `input` contains any match.
     pub fn match(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!bool {
-        return re.findOnce(allocator, input, &.{});
+        return re.findAt(.{ .temporary = allocator }, input, 0, &.{});
     }
 
     /// Alias of `match` (Go distinguishes `[]byte` and `string`; here both are
@@ -164,13 +170,13 @@ pub const Regexp = struct {
     /// warmed up, each call does zero heap allocation. Single-threaded: do not
     /// share one `Scratch` between concurrent matches.
     pub fn matchScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!bool {
-        return re.findAt(scratch, input, 0, &.{});
+        return re.findAt(.{ .scratch = scratch }, input, 0, &.{});
     }
 
     /// Like `findIndex`, but reuses a caller-owned `Scratch` instead of
     /// allocating per call. See `matchScratch` for the reuse contract.
     pub fn findIndexScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!?Match {
-        return re.findIndexScratchImpl(scratch, input);
+        return re.findIndexIn(.{ .scratch = scratch }, input);
     }
 
     /// Like `findSubmatchIndex`, but reuses a caller-owned `Scratch`. The
@@ -179,7 +185,7 @@ pub const Regexp = struct {
     /// there is no match.
     pub fn findSubmatchIndexScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!?[]i64 {
         const caps = try scratch.resultBuf(re.padLen());
-        if (!try re.findAt(scratch, input, 0, caps)) return null;
+        if (!try re.findAt(.{ .scratch = scratch }, input, 0, caps)) return null;
         return caps;
     }
 
@@ -187,9 +193,7 @@ pub const Regexp = struct {
 
     /// Leftmost match location, or null.
     pub fn findIndex(re: *const Regexp, allocator: std.mem.Allocator, input: []const u8) ExecError!?Match {
-        var scratch = Scratch.init(allocator);
-        defer scratch.deinit();
-        return re.findIndexScratchImpl(&scratch, input);
+        return re.findIndexIn(.{ .temporary = allocator }, input);
     }
 
     /// Text of the leftmost match (a sub-slice of `input`), or null.
@@ -207,7 +211,7 @@ pub const Regexp = struct {
         if (input.len < re.min_input_len) return null; // skip the allocation
         const caps = try allocator.alloc(i64, re.padLen());
         errdefer allocator.free(caps);
-        const matched = try re.findOnce(allocator, input, caps);
+        const matched = try re.findAt(.{ .temporary = allocator }, input, 0, caps);
         if (!matched) {
             allocator.free(caps);
             return null;
@@ -273,7 +277,7 @@ pub const Regexp = struct {
         pub fn next(it: *Matches) ExecError!?[]const i64 {
             const in = exec.Input{ .s = it.input };
             while (!it.done and it.pos <= it.input.len) {
-                const matched = try it.re.findAt(it.scratch(), it.input, it.pos, it.caps);
+                const matched = try it.re.findAt(.{ .scratch = it.scratch() }, it.input, it.pos, it.caps);
                 if (!matched) break;
                 var accept = true;
                 if (it.caps[1] == @as(i64, @intCast(it.pos))) {
@@ -465,7 +469,7 @@ pub const Regexp = struct {
         const in = exec.Input{ .s = src };
 
         while (search_pos <= end_pos) {
-            const matched = try re.findAt(&scratch, src, search_pos, caps);
+            const matched = try re.findAt(.{ .scratch = &scratch }, src, search_pos, caps);
             if (!matched) break;
             const a0: usize = @intCast(caps[0]);
             const a1: usize = @intCast(caps[1]);
