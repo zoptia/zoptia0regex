@@ -543,8 +543,8 @@ const Parser = struct {
                     // Start with the most complex regexp in cur[start..i].
                     var max = start;
                     for (start + 1..i) |j| {
-                        const a = @intFromEnum(cur[max].op);
-                        const b = @intFromEnum(cur[j].op);
+                        const a = @backingInt(cur[max].op);
+                        const b = @backingInt(cur[j].op);
                         if (a < b or (a == b and cur[max].runes.len < cur[j].runes.len)) max = j;
                     }
                     std.mem.swap(*Regexp, &cur[start], &cur[max]);
@@ -690,7 +690,7 @@ const Parser = struct {
             var re1 = items[n - 1];
             var re3 = items[n - 3];
             // Make re3 the more complex of the two.
-            if (@intFromEnum(re1.op) > @intFromEnum(re3.op)) {
+            if (@backingInt(re1.op) > @backingInt(re3.op)) {
                 std.mem.swap(*Regexp, &re1, &re3);
                 items[n - 3] = re3;
             }

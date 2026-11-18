@@ -61,8 +61,8 @@ fn inFirstBytes(set: []const u8, r: i32) bool {
 fn indexOfAnyByte(haystack: []const u8, set: []const u8) ?usize {
     std.debug.assert(set.len >= 1 and set.len <= max_first_bytes);
     if (set.len == 1) return std.mem.indexOfScalar(u8, haystack, set[0]);
-    const width = comptime std.simd.suggestVectorLength(u8) orelse
-        return std.mem.indexOfAny(u8, haystack, set);
+    const width = comptime (std.simd.suggestVectorLength(u8) orelse 0);
+    if (width == 0) return std.mem.indexOfAny(u8, haystack, set);
     const V = @Vector(width, u8);
     const Mask = @Int(.unsigned, width);
 

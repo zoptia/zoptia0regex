@@ -1,3 +1,12 @@
 .zig-cache/
 zig-out/
 *.o
+
+# editor / OS droppings
+*.swp
+.*.sw?
+*~
+.DS_Store
+
+# agent worktrees and local tool state
+.claude/

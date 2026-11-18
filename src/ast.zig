@@ -37,7 +37,7 @@ pub const Op = enum(u8) {
     vertical_bar = 129,
 
     pub inline fn isPseudo(op: Op) bool {
-        return @intFromEnum(op) >= 128;
+        return @backingInt(op) >= 128;
     }
 };
 
@@ -122,7 +122,7 @@ pub const Regexp = struct {
 };
 
 test "Op precedence ordering matches Go" {
-    try std.testing.expect(@intFromEnum(Op.literal) < @intFromEnum(Op.capture));
+    try std.testing.expect(@backingInt(Op.literal) < @backingInt(Op.capture));
     try std.testing.expect(!Op.alternate.isPseudo());
     try std.testing.expect(Op.left_paren.isPseudo());
     try std.testing.expect(Op.vertical_bar.isPseudo());
