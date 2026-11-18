@@ -11,12 +11,8 @@ harnesses and `tools/cmd/benchtable` rewrites the blocks between the
 `BEGIN GENERATED` / `END GENERATED` markers (here and in the README
 headline). Do not edit those blocks by hand; regenerate them.
 
-> **Placeholder numbers.** The blocks below come from a single trial run
-> on a busy machine, to show the format. Regenerate them on an idle
-> machine with `tools/bench.sh` before quoting them (and delete this note).
-
 <!-- BEGIN GENERATED: bench-headline -->
-Across 22 workloads the port's geometric-mean time is **0.44×** Go's (0.48× without the literal fast-path rows), and it compiles patterns in **0.73×** Go's time.
+Across 22 workloads the port's geometric-mean time is **0.44×** Go's (0.48× without the literal fast-path rows), and it compiles patterns in **0.74×** Go's time.
 <!-- END GENERATED: bench-headline -->
 
 ## Methodology
@@ -67,31 +63,31 @@ case) and run on the one-pass engine.
 <!-- BEGIN GENERATED: bench-results -->
 | case | op | engine (port) | Go ns/op | Zig ns/op | Zig/Go |
 |------|----|---------------|---------:|----------:|-------:|
-| literal_hit | find | literal | 203 | 8 | **0.04×** |
-| literal_miss | find | literal | 5,983 | 5,417 | **0.91×** |
-| alternation | findall | Pike VM+first-bytes | 9,034,418 | 2,725,030 | **0.30×** |
-| charclass_word | findall | Pike VM | 6,346,978 | 3,628,390 | **0.57×** |
-| perl_word | findall | Pike VM | 7,519,986 | 3,752,707 | **0.50×** |
-| digits | findall | Pike VM+first-bytes | 3,388,188 | 502,476 | **0.15×** |
-| date | findall | Pike VM+first-bytes | 3,411,797 | 577,091 | **0.17×** |
-| email | findall | Pike VM | 5,015,527 | 3,189,059 | **0.64×** |
-| email_submatch | submatch | Pike VM | 2,054 | 1,445 | **0.70×** |
-| anchored_multiline | findall | Pike VM | 2,011,558 | 1,409,707 | **0.70×** |
-| unicode_letters | findall | Pike VM | 7,820,995 | 3,745,495 | **0.48×** |
-| dotstar_greedy | find | Pike VM+prefix | 3,584 | 2,583 | **0.72×** |
-| redos_linear | match | bitstate+prefix | 7,871 | 8,942 | 1.14× |
-| nested_groups | findall | Pike VM | 8,620,578 | 5,300,848 | **0.61×** |
-| caseins_literal | findall | Pike VM+first-bytes | 3,628,082 | 457,482 | **0.13×** |
+| literal_hit | find | literal | 198 | 8 | **0.04×** |
+| literal_miss | find | literal | 6,035 | 5,577 | **0.92×** |
+| alternation | findall | Pike VM+first-bytes | 8,977,850 | 2,659,611 | **0.30×** |
+| charclass_word | findall | Pike VM | 6,224,552 | 3,627,919 | **0.58×** |
+| perl_word | findall | Pike VM | 6,786,731 | 3,970,472 | **0.59×** |
+| digits | findall | Pike VM+first-bytes | 3,465,626 | 497,261 | **0.14×** |
+| date | findall | Pike VM+first-bytes | 3,418,459 | 558,858 | **0.16×** |
+| email | findall | Pike VM | 5,033,952 | 3,326,184 | **0.66×** |
+| email_submatch | submatch | Pike VM | 2,041 | 1,450 | **0.71×** |
+| anchored_multiline | findall | Pike VM | 2,050,891 | 1,490,128 | **0.73×** |
+| unicode_letters | findall | Pike VM | 7,820,068 | 3,729,759 | **0.48×** |
+| dotstar_greedy | find | Pike VM+prefix | 3,736 | 2,574 | **0.69×** |
+| redos_linear | match | bitstate+prefix | 7,753 | 8,929 | 1.15× |
+| nested_groups | findall | Pike VM | 8,609,871 | 5,222,264 | **0.61×** |
+| caseins_literal | findall | Pike VM+first-bytes | 3,616,796 | 483,056 | **0.13×** |
 | anchored_caseins | match | one-pass | 66 | 41 | **0.62×** |
-| anchored_word | match | one-pass | 95 | 54 | **0.56×** |
-| anchored_date | match | one-pass | 55 | 36 | **0.64×** |
-| anchored_digits | match | one-pass | 89 | 50 | **0.56×** |
-| anchored_email | submatch | one-pass | 226 | 154 | **0.68×** |
-| keyword_list | findall | Pike VM+first-bytes | 11,153,177 | 3,910,409 | **0.35×** |
-| domain_allowlist | match | bitstate | 266 | 157 | **0.59×** |
+| anchored_word | match | one-pass | 94 | 55 | **0.58×** |
+| anchored_date | match | one-pass | 56 | 36 | **0.65×** |
+| anchored_digits | match | one-pass | 88 | 50 | **0.57×** |
+| anchored_email | submatch | one-pass | 222 | 156 | **0.70×** |
+| keyword_list | findall | Pike VM+first-bytes | 11,010,600 | 3,949,706 | **0.36×** |
+| domain_allowlist | match | bitstate | 257 | 154 | **0.60×** |
 | **geomean (22 cases)** | | | | | **0.44×** |
 | geomean without literal fast-path rows (20 cases) | | | | | **0.48×** |
-| **compile geomean** | | | | | **0.73×** |
+| **compile geomean** | | | | | **0.74×** |
 <!-- END GENERATED: bench-results -->
 
 ## Where the differences come from
@@ -147,11 +143,11 @@ engine; every other row runs the engine in its engine column.
 | case | engine (port) | Go `MatchString` ns | Zig `match` (alloc) ns | Zig `matchScratch` ns | scratch/Go |
 |------|---------------|-------------------:|----------------------:|---------------------:|-----------:|
 | literal | literal | 44 | 5 | 5 | **0.10×** |
-| prefix_digits | bitstate+prefix | 72 | 64 | 36 | **0.51×** |
-| alternation | bitstate+first-bytes | 88 | 63 | 34 | **0.38×** |
-| email_unanchored | bitstate | 382 | 345 | 265 | **0.69×** |
-| charclass_plus | bitstate+first-bytes | 88 | 60 | 33 | **0.37×** |
-| anchored_onepass | one-pass | 88 | 44 | 41 | **0.46×** |
+| prefix_digits | bitstate+prefix | 72 | 61 | 36 | **0.50×** |
+| alternation | bitstate+first-bytes | 87 | 70 | 34 | **0.39×** |
+| email_unanchored | bitstate | 400 | 361 | 268 | **0.67×** |
+| charclass_plus | bitstate+first-bytes | 87 | 68 | 33 | **0.38×** |
+| anchored_onepass | one-pass | 87 | 44 | 40 | **0.46×** |
 | **geomean** | | | | | **0.36×** |
 <!-- END GENERATED: scratch-results -->
 
