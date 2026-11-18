@@ -63,31 +63,6 @@ pub const Options = struct {
     require_all: bool,
 };
 
-/// Private stand-in for the library's public ParseError -> Go error text
-/// mapping (Go's `syntax.ErrorCode` strings, parse.go). Swap it for the
-/// public function once that lands. Null for errors Go cannot report
-/// (`OutOfMemory`), which always fail the comparison.
-pub fn privateGoErrorCode(err: regex.ParseError) ?[]const u8 {
-    return switch (err) {
-        error.InvalidCharClass => "invalid character class",
-        error.InvalidCharRange => "invalid character class range",
-        error.InvalidEscape => "invalid escape sequence",
-        error.InvalidNamedCapture => "invalid named capture",
-        error.InvalidPerlOp => "invalid or unsupported Perl syntax",
-        error.InvalidRepeatOp => "invalid nested repetition operator",
-        error.InvalidRepeatSize => "invalid repeat count",
-        error.InvalidUTF8 => "invalid UTF-8",
-        error.MissingBracket => "missing closing ]",
-        error.MissingParen => "missing closing )",
-        error.MissingRepeatArgument => "missing argument to repetition operator",
-        error.TrailingBackslash => "trailing backslash at end of expression",
-        error.UnexpectedParen => "unexpected )",
-        error.NestingDepth => "expression nests too deeply",
-        error.TooLarge => "expression too large",
-        error.OutOfMemory => null,
-    };
-}
-
 /// What a case can disagree on.
 const Kind = enum {
     compile_ok, // Go errored, the port compiled
@@ -250,8 +225,10 @@ fn checkCase(gpa: std.mem.Allocator, compiled: *Compiled, c: Case, require_all: 
     const re: *regex.Regexp = switch (compiled.result) {
         .err => |err| {
             if (c.err.len == 0) return .compile_err;
-            const code = privateGoErrorCode(err) orelse return error.UnmappedParseError;
-            return if (std.mem.eql(u8, code, c.err)) null else .err_code;
+            // Running out of memory is a harness failure, never "errored
+            // like Go"; every other error must carry Go's ErrorCode text.
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return if (std.mem.eql(u8, regex.errorString(err), c.err)) null else .err_code;
         },
         .ok => |*re| re,
     };

@@ -138,7 +138,8 @@ depth-first order and hence match priority.
 - Character-class rune lists are **sorted, merged `(lo,hi)` pairs**;
   `matchRunePos` binary-searches them. Don't produce unsorted classes.
 - Submatch results are padded to `2*(numSubexp+1)` (`padLen`), which can
-  exceed `prog.num_cap` when a group is compiled away (e.g. `(a){0}`).
+  exceed the capture slots the program actually uses when a group is
+  compiled away (e.g. `(a){0}`); the extra slots stay -1.
 - Range arithmetic near `0` and `max_rune` (0x10FFFF) must use a wider int
   (`u21` overflows on `hi+1`).
 - **Keep `Inst` at 32 bytes.** The per-pc ASCII membership bitmap

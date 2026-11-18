@@ -76,9 +76,27 @@ All notable changes to this project are documented here. The format is based on
 
 ### API
 
-<!-- Placeholder: public API additions and changes from the parallel API
-     work (replaceAllFunc, findAllSubmatch, mustCompilePOSIX, the public
-     ParseError → Go error-text mapping, doc comments) go here. -->
+- **`replaceAllFunc`**: append-style replacement callback
+  (`fn(ctx, allocator, *ArrayList(u8), match) ExecError!void`) that can
+  allocate and fail; a callback error frees the partial output.
+  `replaceAllStringFunc` stays, built on top of it, with its lifetime rule
+  documented.
+- **`findAllSubmatch`** / `freeAllSubmatch` (text variant of
+  `findAllSubmatchIndex`), **`mustCompilePOSIX`**, and a package-level
+  one-shot **`match(gpa, pattern, input)`** (Go's `regexp.MatchString`).
+- **`errorString(err)`** maps every `ParseError` to Go's `syntax.ErrorCode`
+  text; `mustCompile` now panics with Go's message shape
+  (``regexp: Compile(`a(`): error parsing regexp: missing closing )``) and
+  reports out-of-memory as such instead of as a pattern error.
+- **`expand` takes `[]const i64`**, so it composes with the `matches`
+  iterator (source-compatible for existing callers).
+- `literalPrefix` returns the named type **`LiteralPrefix`**.
+- `Regexp.deinit` poisons the value: a second `deinit` of the same variable
+  trips an assertion in safe builds. Copy, nested-`matchesScratch` and
+  `setLongest` threading rules are documented on the types and in
+  `docs/usage.md`.
+- Removed the never-read `Prog.num_cap` (visible only through
+  `syntax.prog`).
 
 ### Testing
 

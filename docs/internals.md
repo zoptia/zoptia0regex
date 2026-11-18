@@ -323,8 +323,8 @@ ones. The returned pair index also feeds the one-pass `Next` dispatch table.
 **Submatch results are padded to `2·(numSubexp+1)`.** Every submatch result
 has a `[start, end]` pair per group (group 0 is the whole match, `-1` for
 groups that did not participate). `padLen()` in `regexp.zig` computes it, and
-it can exceed the program's `num_cap` when a capturing group is compiled
-away (e.g. `(a){0}`) — the extra trailing slots stay `-1`, exactly like Go's
+it can exceed the capture slots the program actually uses when a capturing
+group is compiled away (e.g. `(a){0}`) — the extra trailing slots stay `-1`, exactly like Go's
 `pad`.
 
 **Range arithmetic near 0 and U+10FFFF uses a wider integer** (`u21`
