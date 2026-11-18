@@ -1,8 +1,10 @@
 //! zoptia0regex — a faithful Zig port of Go's `regexp` package (RE2 design).
 //!
-//! Pipeline: parse → simplify → compile → Pike VM, matching Go's leftmost-first
-//! (and optional POSIX leftmost-longest) semantics. See README.md for the
-//! supported feature set and the deliberately-deferred optimizations.
+//! Pipeline: parse → simplify → compile (→ one-pass program when the regexp
+//! qualifies), then match with one of three engines dispatched like Go's
+//! (one-pass, bitstate backtracker, Pike VM), with Go's leftmost-first (and
+//! optional POSIX leftmost-longest) semantics. See README.md for the
+//! supported feature set.
 
 const regexp = @import("regexp.zig");
 
@@ -25,6 +27,8 @@ pub const syntax = struct {
     pub const prog = @import("prog.zig");
     pub const compileProg = @import("compile.zig");
     pub const exec = @import("exec.zig");
+    pub const backtrack = @import("backtrack.zig");
+    pub const search = @import("search.zig");
     pub const onepass = @import("onepass.zig");
     pub const unicode = @import("unicode.zig");
 };
@@ -37,6 +41,8 @@ test {
     _ = @import("simplify.zig");
     _ = @import("compile.zig");
     _ = @import("exec.zig");
+    _ = @import("backtrack.zig");
+    _ = @import("search.zig");
     _ = @import("onepass.zig");
     _ = @import("regexp.zig");
     _ = @import("tests.zig");

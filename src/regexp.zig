@@ -14,6 +14,7 @@ const simplify = @import("simplify.zig");
 const compile_ = @import("compile.zig");
 const prog = @import("prog.zig");
 const exec = @import("exec.zig");
+const search = @import("search.zig");
 const unicode = @import("unicode.zig");
 const onepass = @import("onepass.zig");
 
@@ -121,7 +122,7 @@ pub const Regexp = struct {
     }
 
     fn literalIndex(re: *const Regexp, input: []const u8) ?Match {
-        const start = exec.prefixIndexAnchored(input, re.prefix, re.prefix_anchor) orelse return null;
+        const start = search.prefixIndexAnchored(input, re.prefix, re.prefix_anchor) orelse return null;
         return .{ .start = start, .end = start + re.prefix.len };
     }
 
@@ -684,15 +685,15 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
         .prefix = prefix_str,
         .prefix_complete = prefix_complete,
         .prefix_end = prefix_end,
-        .prefix_anchor = exec.prefixAnchor(prefix_str),
+        .prefix_anchor = search.prefixAnchor(prefix_str),
         .first_bytes = first_bytes,
         .onepass = op_prog,
     };
 }
 
-/// Max size of the accelerated first-byte set (the SIMD scan in exec.zig
+/// Max size of the accelerated first-byte set (the SIMD scan in search.zig
 /// handles up to this many bytes at flat cost; wider sets stop filtering).
-const max_first_bytes = exec.max_first_bytes;
+const max_first_bytes = search.max_first_bytes;
 
 /// The set of bytes that can begin a match, computed from the epsilon-closure
 /// of the program start. Returns null (no acceleration) when the pattern can
