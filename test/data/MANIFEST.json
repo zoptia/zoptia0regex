@@ -3,7 +3,7 @@
   "unicode_version": "17.0.0",
   "corpora": {
     "bytes": 10016,
-    "cases": 16280,
+    "cases": 16599,
     "fuzz": 13970,
     "longest": 19545
   }
