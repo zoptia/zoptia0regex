@@ -399,6 +399,28 @@ fn replaceBuffer(comptime T: type, allocator: std.mem.Allocator, buffer: *[]T, n
     buffer.* = next;
 }
 
+/// Copy capture registers. There are few of them (2 in a find-all loop, 2
+/// per group otherwise) and the Pike VM copies them for every thread it
+/// starts, so a call into libc `memcpy` costs more than the copy itself.
+inline fn copyCaps(dst: []i64, src: []const i64) void {
+    std.debug.assert(dst.len == src.len);
+    if (dst.len == 2) {
+        dst[0] = src[0];
+        dst[1] = src[1];
+        return;
+    }
+    if (dst.len > 16) {
+        @memcpy(dst, src);
+        return;
+    }
+    var k: usize = 0;
+    while (k + 2 <= dst.len) : (k += 2) {
+        const pair: @Vector(2, i64) = src[k..][0..2].*;
+        dst[k..][0..2].* = pair;
+    }
+    if (k < dst.len) dst[k] = src[k];
+}
+
 const Machine = struct {
     scratch: *Scratch,
     p: *const Prog,
@@ -523,7 +545,7 @@ const Machine = struct {
                             th = try m.alloc(pc);
                         }
                         if (cap.len > 0 and th.cap.ptr != cap.ptr) {
-                            @memcpy(th.cap, cap);
+                            copyCaps(th.cap, cap);
                         }
                         q.dense[j].t = th;
                         t = null;
@@ -563,7 +585,7 @@ const Machine = struct {
                 .match => {
                     if (t.cap.len > 0 and (!longest or !m.matched or m.matchcap[1] < @as(i64, @intCast(pos)))) {
                         t.cap[1] = @intCast(pos);
-                        @memcpy(m.matchcap, t.cap);
+                        copyCaps(m.matchcap, t.cap);
                     }
                     if (!longest) {
                         // First-match mode: cut off all lower-priority threads.
@@ -749,7 +771,7 @@ pub fn executeReuse(scratch: *Scratch, e: *const Engine, input: Input, pos: usiz
 fn pike(scratch: *Scratch, e: *const Engine, input: Input, pos: usize, caps: []i64) !bool {
     var m = try Machine.init(scratch, e, caps.len);
     if (!try m.run(input, pos)) return false;
-    @memcpy(caps, m.matchcap);
+    copyCaps(caps, m.matchcap);
     return true;
 }
 
@@ -782,6 +804,17 @@ fn exerciseScratchGrowth(allocator: std.mem.Allocator) !void {
     scratch.releaseIterBuf(a.slot);
     const c = try scratch.acquireIterBuf(6); // grows the free 2-slot buffer
     scratch.releaseIterBuf(c.slot);
+}
+
+test "copyCaps copies every length" {
+    var src: [19]i64 = undefined;
+    for (&src, 0..) |*x, k| x.* = @as(i64, @intCast(k)) - 3;
+    for (0..src.len + 1) |n| {
+        var dst: [19]i64 = @splat(99);
+        copyCaps(dst[0..n], src[0..n]);
+        try std.testing.expectEqualSlices(i64, src[0..n], dst[0..n]);
+        for (dst[n..]) |x| try std.testing.expectEqual(@as(i64, 99), x);
+    }
 }
 
 test "iterator buffers are never shared while checked out" {
