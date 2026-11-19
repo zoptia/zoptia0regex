@@ -280,6 +280,15 @@ pub const Scratch = struct {
         if (self.work.len > 0) a.free(self.work);
         if (self.visited.len > 0) a.free(self.visited);
         if (self.result.len > 0) a.free(self.result);
+        // Kept off the path of the temporary scratches the allocating API
+        // creates per search, which never hand out iterator buffers.
+        if (self.iter_bufs.capacity > 0) self.freeIterBufs();
+        self.* = undefined;
+    }
+
+    fn freeIterBufs(self: *Scratch) void {
+        @branchHint(.cold);
+        const a = self.allocator;
         for (self.iter_bufs.items) |e| {
             // Every matchesScratch iterator must be deinit'ed before its
             // scratch: a live one would go on reading the buffer freed here.
@@ -289,7 +298,6 @@ pub const Scratch = struct {
             if (e.buf.len > 0) a.free(e.buf);
         }
         self.iter_bufs.deinit(a);
-        self.* = undefined;
     }
 
     /// Grow the Pike-VM buffers to fit `ninst` instructions and `ncap` capture
