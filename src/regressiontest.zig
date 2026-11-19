@@ -12,7 +12,7 @@ test "regression: compiled capture names own their source" {
     @memset(pattern, 'x');
     try std.testing.expectEqualStrings("name", re.subexpNames()[1]);
     try std.testing.expectEqual(@as(?usize, 1), re.subexpIndex("name"));
-    const replaced = try re.replaceAllString(ta, "a", "${name}");
+    const replaced = try re.replaceAll(ta, "a", "${name}");
     defer ta.free(replaced);
     try std.testing.expectEqualStrings("a", replaced);
 }

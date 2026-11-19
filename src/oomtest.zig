@@ -73,15 +73,10 @@ fn upper(_: void, al: std.mem.Allocator, out: *std.ArrayList(u8), m: []const u8)
     try out.appendSlice(al, tmp);
 }
 
-fn star(_: void, m: []const u8) []const u8 {
-    return if (m.len > 1) "**" else "*";
-}
-
 /// Every allocating result method of `Regexp`, plus the package-level
 /// helpers, on one input.
 fn allApis(allocator: std.mem.Allocator, re: *const regex.Regexp, input: []const u8) !void {
     _ = try re.match(allocator, input);
-    _ = try re.matchString(allocator, input);
     _ = try re.find(allocator, input);
     _ = try re.findIndex(allocator, input);
 
@@ -99,14 +94,12 @@ fn allApis(allocator: std.mem.Allocator, re: *const regex.Regexp, input: []const
     const all_sub = try re.findAllSubmatch(allocator, input, -1);
     defer if (all_sub) |x| regex.Regexp.freeAllSubmatch(allocator, x);
 
-    const repl = try re.replaceAllString(allocator, input, "${word}:$2/$$");
+    const repl = try re.replaceAll(allocator, input, "${word}:$2/$$");
     defer allocator.free(repl);
-    const literal = try re.replaceAllLiteralString(allocator, input, "$1");
+    const literal = try re.replaceAllLiteral(allocator, input, "$1");
     defer allocator.free(literal);
     const func = try re.replaceAllFunc(allocator, input, {}, upper);
     defer allocator.free(func);
-    const string_func = try re.replaceAllStringFunc(allocator, input, {}, star);
-    defer allocator.free(string_func);
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);

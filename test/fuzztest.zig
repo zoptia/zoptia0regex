@@ -2,7 +2,7 @@
 //! `tools/cmd/genfuzz`): grammar-generated patterns (plus an alternation
 //! stream, a stream on inputs with NULs and malformed UTF-8, and a stream of
 //! patterns with spliced-in syntax errors). Every accepted pattern's cases
-//! also check the find-all family, `replaceAllString` and `split` (see
+//! also check the find-all family, `replaceAll` and `split` (see
 //! `difftest_common.zig`).
 //!
 //! Run on its own:  zig build difftest-fuzz

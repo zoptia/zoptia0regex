@@ -17,7 +17,7 @@
 //! - `findSubmatchIndex`, `match`, `findIndex` and their `Scratch` variants;
 //! - when the case carries the find-all family (`n`): `findAllSubmatchIndex`,
 //!   `findAllIndex` and the `matchesScratch` iterator with limit `n`,
-//!   `replaceAllString` with template `t`, and `split` with limit `n`.
+//!   `replaceAll` with template `t`, and `split` with limit `n`.
 //!
 //! The corpus must end with its `{"count":N}` trailer, and N must equal
 //! both the number of cases read and the count in `data/MANIFEST.json`, so a
@@ -329,7 +329,7 @@ fn checkAll(gpa: std.mem.Allocator, re: *regex.Regexp, scratch: *regex.Scratch, 
         if (k != (if (c.all) |a| a.len else 0)) return .matches_scratch;
     }
     {
-        const got = try re.replaceAllString(gpa, c.i, c.t);
+        const got = try re.replaceAll(gpa, c.i, c.t);
         defer gpa.free(got);
         if (!std.mem.eql(u8, c.repl, got)) return .repl;
     }

@@ -3,7 +3,7 @@
 //! (Go's `Longest()`, isolating the semantics from POSIX syntax), and POSIX
 //! ERE patterns through `compilePOSIX` on inputs with NULs and malformed
 //! UTF-8. Every accepted pattern's cases also check the find-all family,
-//! `replaceAllString` and `split` (see `difftest_common.zig`).
+//! `replaceAll` and `split` (see `difftest_common.zig`).
 //!
 //! Run on its own:  zig build difftest-longest
 

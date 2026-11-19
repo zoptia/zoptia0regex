@@ -105,7 +105,7 @@ test "find all" {
 test "replace all with expansion" {
     var re = try regex.compile(ta, "(\\w+)@(\\w+)");
     defer re.deinit();
-    const out = try re.replaceAllString(ta, "me@here you@there", "$2.$1");
+    const out = try re.replaceAll(ta, "me@here you@there", "$2.$1");
     defer ta.free(out);
     try std.testing.expectEqualStrings("here.me there.you", out);
 }
@@ -113,7 +113,7 @@ test "replace all with expansion" {
 test "replace literal" {
     var re = try regex.compile(ta, "\\s+");
     defer re.deinit();
-    const out = try re.replaceAllLiteralString(ta, "a  b   c", "-");
+    const out = try re.replaceAllLiteral(ta, "a  b   c", "-");
     defer ta.free(out);
     try std.testing.expectEqualStrings("a-b-c", out);
 }
@@ -324,14 +324,14 @@ test "unicode names in replacement templates match Go" {
     var re = try regex.compile(ta, "(a)");
     defer re.deinit();
     // "café" is all Unicode letters -> a (missing) group name -> expands empty.
-    const a = try re.replaceAllString(ta, "a", "[$café]");
+    const a = try re.replaceAll(ta, "a", "[$café]");
     defer ta.free(a);
     try std.testing.expectEqualStrings("[]", a);
-    const b = try re.replaceAllString(ta, "a", "x${café}y");
+    const b = try re.replaceAll(ta, "a", "x${café}y");
     defer ta.free(b);
     try std.testing.expectEqualStrings("xy", b);
     // "$1é" -> the name is "1é" (digit+letter), not group 1.
-    const c = try re.replaceAllString(ta, "a", "$1é");
+    const c = try re.replaceAll(ta, "a", "$1é");
     defer ta.free(c);
     try std.testing.expectEqualStrings("", c);
 }
@@ -465,17 +465,29 @@ test "one-pass literal-prefix skip" {
     try std.testing.expect(!try re.match(ta, "foobar"));
 }
 
-test "replace func" {
-    var re = try regex.compile(ta, "\\d+");
+test "deprecated aliases keep compiling and behave like the canonical names" {
+    var re = try regex.compile(ta, "(\\d)(\\d*)");
     defer re.deinit();
+    // matchString → match.
+    try std.testing.expect(try re.matchString(ta, "a1"));
+    try std.testing.expect(!try re.matchString(ta, "ab"));
+    // replaceAllString → replaceAll (Go: ReplaceAllString("a1b22", "<$2$1>")).
+    const a = try re.replaceAllString(ta, "a1b22", "<$2$1>");
+    defer ta.free(a);
+    try std.testing.expectEqualStrings("a<1>b<22>", a);
+    // replaceAllLiteralString → replaceAllLiteral.
+    const b = try re.replaceAllLiteralString(ta, "a1b22", "$1");
+    defer ta.free(b);
+    try std.testing.expectEqualStrings("a$1b$1", b);
+    // replaceAllStringFunc → replaceAllFunc.
     const Ctx = struct {};
-    const out = try re.replaceAllStringFunc(ta, "a1b22", Ctx{}, struct {
+    const c = try re.replaceAllStringFunc(ta, "a1b22", Ctx{}, struct {
         fn f(_: Ctx, m: []const u8) []const u8 {
             return if (m.len > 1) "[BIG]" else "[d]";
         }
     }.f);
-    defer ta.free(out);
-    try std.testing.expectEqualStrings("a[d]b[BIG]", out);
+    defer ta.free(c);
+    try std.testing.expectEqualStrings("a[d]b[BIG]", c);
 }
 
 test "replaceAllFunc appends allocated replacement text" {

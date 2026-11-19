@@ -233,8 +233,8 @@ pub const Regexp = struct {
         return re.findAt(.{ .temporary = allocator }, input, 0, &.{});
     }
 
-    /// Alias of `match` (Go distinguishes `[]byte` and `string`; here both are
-    /// `[]const u8`).
+    /// Deprecated: use `match`. (Go's `MatchString`; Go distinguishes
+    /// `[]byte` and `string`, here both are `[]const u8`.)
     pub fn matchString(re: *const Regexp, allocator: std.mem.Allocator, s: []const u8) ExecError!bool {
         return re.match(allocator, s);
     }
@@ -540,8 +540,9 @@ pub const Regexp = struct {
     // --- replace ---
 
     /// Replace every match with `repl`, expanding `$1` / `${name}` references
-    /// (see `expand`). Caller owns the result.
-    pub fn replaceAllString(re: *const Regexp, allocator: std.mem.Allocator, src: []const u8, repl: []const u8) ExecError![]u8 {
+    /// (see `expand`). Caller owns the result. Go's `ReplaceAll` /
+    /// `ReplaceAllString`.
+    pub fn replaceAll(re: *const Regexp, allocator: std.mem.Allocator, src: []const u8, repl: []const u8) ExecError![]u8 {
         const ncap: usize = if (std.mem.indexOfScalar(u8, repl, '$') != null) re.padLen() else 2;
         const Ctx = struct { re: *const Regexp, repl: []const u8 };
         return re.replaceAllCore(allocator, src, ncap, Ctx{ .re = re, .repl = repl }, struct {
@@ -551,8 +552,19 @@ pub const Regexp = struct {
         }.f);
     }
 
-    /// Replace every match with `repl` literally (no `$` expansion).
+    /// Deprecated: use `replaceAll`.
+    pub fn replaceAllString(re: *const Regexp, allocator: std.mem.Allocator, src: []const u8, repl: []const u8) ExecError![]u8 {
+        return re.replaceAll(allocator, src, repl);
+    }
+
+    /// Deprecated: use `replaceAllLiteral`.
     pub fn replaceAllLiteralString(re: *const Regexp, allocator: std.mem.Allocator, src: []const u8, repl: []const u8) ExecError![]u8 {
+        return re.replaceAllLiteral(allocator, src, repl);
+    }
+
+    /// Replace every match with `repl` literally (no `$` expansion). Caller
+    /// owns the result. Go's `ReplaceAllLiteral` / `ReplaceAllLiteralString`.
+    pub fn replaceAllLiteral(re: *const Regexp, allocator: std.mem.Allocator, src: []const u8, repl: []const u8) ExecError![]u8 {
         const Ctx = struct { repl: []const u8 };
         return re.replaceAllCore(allocator, src, 2, Ctx{ .repl = repl }, struct {
             fn f(ctx: Ctx, al: std.mem.Allocator, buf: *std.ArrayList(u8), m: []const i64, source: []const u8) ExecError!void {
@@ -586,8 +598,11 @@ pub const Regexp = struct {
         }.f);
     }
 
+    /// Deprecated: use `replaceAllFunc`, whose callback appends the
+    /// replacement and may allocate and fail.
+    ///
     /// Replace every match with the slice `func` returns for the matched
-    /// text. Kept for compatibility; prefer `replaceAllFunc`.
+    /// text.
     ///
     /// Lifetime rule: the returned slice is copied into the output as soon
     /// as `func` returns, so it only has to stay valid until then. But
