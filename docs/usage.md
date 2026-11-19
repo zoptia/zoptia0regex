@@ -131,8 +131,10 @@ pub const ExecError = std.mem.Allocator.Error;
 |---|---|
 | `compile` | Compile with Perl (leftmost-first) semantics. |
 | `compilePOSIX` | Compile with POSIX ERE syntax and leftmost-longest semantics. |
-| `mustCompile` | Like `compile`, but panics if the pattern cannot be compiled. |
-| `mustCompilePOSIX` | Like `compilePOSIX`, but panics if the pattern cannot be compiled. |
+| `compileDiagnostic` | `compile` that also fills a `Diagnostic` (Go's `*syntax.Error`) on failure. |
+| `compilePOSIXDiagnostic` | `compilePOSIX` with a `Diagnostic`. |
+| `mustCompile` | Like `compile`, but panics with Go's `MustCompile` message if the pattern cannot be compiled. |
+| `mustCompilePOSIX` | Like `compilePOSIX`, but panics with Go's `MustCompilePOSIX` message. |
 | `errorString` | Go's `syntax.ErrorCode` text for a `ParseError` (e.g. `"missing closing )"`). |
 | `Regexp.setLongest` | Switch an existing `Regexp` to leftmost-longest matching for future searches (Go's `Longest`). |
 | `Regexp.deinit` | Free the `Regexp`. |
@@ -140,38 +142,77 @@ pub const ExecError = std.mem.Allocator.Error;
 ```zig
 pub fn compile(gpa: std.mem.Allocator, expr: []const u8) ParseError!Regexp
 pub fn compilePOSIX(gpa: std.mem.Allocator, expr: []const u8) ParseError!Regexp
+pub fn compileDiagnostic(gpa: std.mem.Allocator, expr: []const u8, diag: *Diagnostic) ParseError!Regexp
+pub fn compilePOSIXDiagnostic(gpa: std.mem.Allocator, expr: []const u8, diag: *Diagnostic) ParseError!Regexp
 pub fn mustCompile(gpa: std.mem.Allocator, expr: []const u8) Regexp
 pub fn mustCompilePOSIX(gpa: std.mem.Allocator, expr: []const u8) Regexp
 pub fn errorString(err: ParseError) []const u8
 pub fn Regexp.setLongest(re: *Regexp) void
 pub fn Regexp.deinit(re: *Regexp) void
+
+pub const Diagnostic = struct {
+    err: ?ParseError = null, // null after a successful compile
+    expr: []const u8 = "", // Go's syntax.Error.Expr
+    pub fn format(d: Diagnostic, w: *std.Io.Writer) std.Io.Writer.Error!void
+};
 ```
 
-The `gpa` passed to `compile`/`compilePOSIX`/`mustCompile*` backs the
-`Regexp`'s internal arena; the returned `Regexp` owns that memory until
-`deinit` (see §4). All the exec/result methods below take a *separate*
-allocator for scratch and results.
+The `gpa` passed to the compile functions backs the `Regexp`'s internal
+arena; the returned `Regexp` owns that memory until `deinit` (see §4). All
+the exec/result methods below take a *separate* allocator for scratch and
+results.
 
 `ParseError` has one member per Go `syntax.ErrorCode` (`MissingParen`,
 `InvalidRepeatOp`, …, `NestingDepth`, `TooLarge`) plus `OutOfMemory`;
 `errorString` returns Go's text for each (and `"out of memory"`).
-`mustCompile` panics with Go's message shape,
-``regexp: Compile(`a(`): error parsing regexp: missing closing )`` — Go also
-appends the offending fragment of the pattern, which the Zig error set does
-not carry. Running out of memory panics with `...: out of memory`.
+`mustCompile` / `mustCompilePOSIX` panic with Go's message byte for byte,
+including the fragment and Go's quoting of the pattern:
+``regexp: Compile(`a(`): error parsing regexp: missing closing ): `a(` ``.
+Running out of memory panics with ``regexp: Compile(`a(`): out of memory``.
+
+### Diagnostics
+
+A bare `ParseError` says what went wrong; Go's `*syntax.Error` also says
+*where*, in its `Expr` field. `compileDiagnostic` (and
+`compilePOSIXDiagnostic`) fill a caller-provided `Diagnostic` with both:
+
+```zig
+var diag: regex.Diagnostic = .{};
+var re = regex.compileDiagnostic(gpa, "x[z-a]+", &diag) catch |err| {
+    // Prints: error parsing regexp: invalid character class range: `z-a`
+    std.debug.print("{f}\n", .{diag});
+    // diag.err == err == error.InvalidCharRange, diag.expr is "z-a".
+    return err;
+};
+defer re.deinit();
+```
+
+- `diag.expr` is exactly Go's `Error.Expr` for every error: the whole pattern
+  (missing or unexpected parenthesis, `expression too large`, `expression
+  nests too deeply`), the rest of the pattern from a bad byte (`invalid
+  UTF-8`), the escape (`\x{zz` → `` `\x{z` ``), the repetition operator
+  (`a**` → `` `**` ``, `x{2,1}` → `` `{2,1}` ``), the class range or name
+  (`z-a`, `[:foo:]`, `\p{Foo}`), the group opener (`(?P<x y>`, `(?z`), or
+  `""` for a trailing backslash.
+- **Lifetime:** `expr` is a sub-slice of the pattern you passed in — no copy,
+  nothing to free — so it is valid exactly as long as that pattern is.
+- `{f}` formats Go's `Error()` text, ``error parsing regexp: <code>:
+  `<expr>` ``; for `error.OutOfMemory` (no Go counterpart, empty `expr`) it
+  prints `out of memory`, and after a successful compile (`err == null`)
+  nothing.
+- The success path allocates nothing extra, and `compile` / `compilePOSIX`
+  are unchanged (they simply do not report the fragment).
 
 ### Boolean match
 
 | Function / method | Description |
 |---|---|
 | `match` (package level) | Go's `regexp.MatchString(pattern, s)`: compile, match once, free. |
-| `Regexp.match` | Reports whether `input` contains any match. |
-| `Regexp.matchString` | Alias of `match` (Go splits `[]byte`/`string`; here both are `[]const u8`). |
+| `Regexp.match` | Reports whether `input` contains any match (Go's `Match` / `MatchString`). |
 
 ```zig
 pub fn match(gpa: std.mem.Allocator, pattern: []const u8, input: []const u8) ParseError!bool
 pub fn Regexp.match(re: *const Regexp, allocator, input: []const u8) ExecError!bool
-pub fn Regexp.matchString(re: *const Regexp, allocator, s: []const u8) ExecError!bool
 ```
 
 None allocate anything for the caller to free. The package-level `match`
@@ -271,14 +312,13 @@ while (try it.next()) |m| {
 
 | Method | Description |
 |---|---|
-| `replaceAllString` | Replace every match with `repl`, expanding `$1` / `${name}` references (see `expand`). |
-| `replaceAllLiteralString` | Replace every match with `repl` literally (no `$` expansion). |
+| `replaceAll` | Replace every match with `repl`, expanding `$1` / `${name}` references (see `expand`). Go's `ReplaceAll` / `ReplaceAllString`. |
+| `replaceAllLiteral` | Replace every match with `repl` literally (no `$` expansion). Go's `ReplaceAllLiteral` / `ReplaceAllLiteralString`. |
 | `replaceAllFunc` | Replace every match with whatever a callback appends to the output (Go's `ReplaceAllFunc`). |
-| `replaceAllStringFunc` | Replace every match with the slice a callback returns. Kept for compatibility; prefer `replaceAllFunc`. |
 
 ```zig
-pub fn Regexp.replaceAllString(re: *const Regexp, allocator, src: []const u8, repl: []const u8) ExecError![]u8
-pub fn Regexp.replaceAllLiteralString(re: *const Regexp, allocator, src: []const u8, repl: []const u8) ExecError![]u8
+pub fn Regexp.replaceAll(re: *const Regexp, allocator, src: []const u8, repl: []const u8) ExecError![]u8
+pub fn Regexp.replaceAllLiteral(re: *const Regexp, allocator, src: []const u8, repl: []const u8) ExecError![]u8
 pub fn Regexp.replaceAllFunc(
     re: *const Regexp,
     allocator: std.mem.Allocator,
@@ -286,18 +326,18 @@ pub fn Regexp.replaceAllFunc(
     ctx: anytype,
     comptime func: fn (@TypeOf(ctx), std.mem.Allocator, *std.ArrayList(u8), []const u8) ExecError!void,
 ) ExecError![]u8
-pub fn Regexp.replaceAllStringFunc(
-    re: *const Regexp,
-    allocator: std.mem.Allocator,
-    src: []const u8,
-    ctx: anytype,
-    comptime func: fn (@TypeOf(ctx), []const u8) []const u8,
-) ExecError![]u8
 ```
 
-All four return a freshly allocated `[]u8` the caller owns (free with
+All three return a freshly allocated `[]u8` the caller owns (free with
 `allocator.free`). `ctx` is passed through to the callback so it can carry
 state.
+
+```zig
+var re = try regex.compile(gpa, "(\\w+)@(\\w+)");
+defer re.deinit();
+const out = try re.replaceAll(gpa, "me@here you@there", "$2.$1");
+defer gpa.free(out); // "here.me there.you"
+```
 
 `replaceAllFunc`'s callback gets the allocator, the output buffer and the
 matched text; it appends the replacement itself and may allocate (and free)
@@ -316,21 +356,11 @@ const out = try re.replaceAllFunc(gpa, src, {}, Upper.f);
 defer gpa.free(out);
 ```
 
-`replaceAllStringFunc`'s callback returns a slice that is copied into the
-output immediately, so it only has to stay valid until the callback returns.
-But the callback cannot fail and gets no allocator, and the library never
-frees what it returns: return a literal, a sub-slice of the match, or memory
-`ctx` owns. For text built per match, use `replaceAllFunc`.
-
-```zig
-const Mask = struct {
-    fn f(_: @This(), m: []const u8) []const u8 {
-        return if (m.len > 3) "****" else "*";
-    }
-};
-const masked = try re.replaceAllStringFunc(gpa, src, Mask{}, Mask.f);
-defer gpa.free(masked);
-```
+The deprecated `replaceAllStringFunc` (see "Deprecated names" below) takes a
+callback that *returns* the replacement slice, copied into the output
+immediately. The callback cannot fail and gets no allocator, and the library
+never frees what it returns: return a literal, a sub-slice of the match, or
+memory `ctx` owns. Prefer `replaceAllFunc`.
 
 ### Expand
 
@@ -413,6 +443,26 @@ The fields of `Regexp` and `Regexp.Matches` are public only for tests and the
 low-level `syntax` namespace; they are internal. Use the methods above and
 never write the fields.
 
+### Naming rule and deprecated names
+
+Go's `String` suffix tells a `string` method from its `[]byte` sibling
+(`ReplaceAll` / `ReplaceAllString`). Here both take `[]const u8`, so the
+canonical names carry no `String` suffix and follow Go's byte-variant names
+in lowerCamelCase. Variants that take an extra argument name it as a suffix
+(`findIndexScratch`, `matchesScratch`, `compileDiagnostic`). The old names
+below still compile, as thin aliases, and will be removed in a future
+release:
+
+| Deprecated | Use instead |
+|---|---|
+| `Regexp.matchString` | `Regexp.match` |
+| `Regexp.replaceAllString` | `Regexp.replaceAll` |
+| `Regexp.replaceAllLiteralString` | `Regexp.replaceAllLiteral` |
+| `Regexp.replaceAllStringFunc` | `Regexp.replaceAllFunc` (its callback appends the replacement and may allocate and fail) |
+
+Zig 0.17 has no way to make a declaration warn on use without breaking the
+build, so the deprecation is in the doc comments only.
+
 ---
 
 ### Allocation-free matching (`Scratch`)
@@ -426,8 +476,8 @@ pooled `*machine`:
 |---|---|---|
 | `matchScratch` | `match` reusing a caller-owned `Scratch`. | `false` |
 | `findIndexScratch` | `findIndex` reusing a caller-owned `Scratch`. | `null` |
-| `findSubmatchIndexScratch` | `findSubmatchIndex` reusing a caller-owned `Scratch`. **The returned slice is borrowed from the scratch** — valid only until the next call that reuses it; copy it to keep it, and do *not* free it. | `null` |
-| `matchesScratch` | `matches` iterator borrowing engine buffers *and* the yielded offsets from the `Scratch`: repeated scans allocate nothing once warm. Valid until the next call that reuses the scratch; `deinit` frees nothing. | `next()` → `null` |
+| `findSubmatchIndexScratch` | `findSubmatchIndex` reusing a caller-owned `Scratch`. **The returned slice is borrowed from the scratch** — valid until the next `findSubmatchIndexScratch` on it; copy it to keep it longer, and do *not* free it. | `null` |
+| `matchesScratch` | `matches` iterator borrowing the engine buffers and an offsets buffer of its own from the `Scratch`: repeated (and nested) scans allocate nothing once warm. **Always `deinit` it**, before the scratch; that hands the offsets buffer back. | `next()` → `null` |
 
 ```zig
 pub fn Regexp.matchScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!bool
@@ -446,17 +496,39 @@ for (lines) |line| {
 ```
 
 A `Scratch` may be reused across different `Regexp`s (its buffers regrow as
-needed), but it serves **one match at a time**:
+needed). The rules:
 
-- It carries no synchronisation: never share one `Scratch` between concurrent
-  matches.
-- **No nested iteration on one `Scratch`.** Every result it hands out — the
-  `findSubmatchIndexScratch` slice and the offsets a `matchesScratch` iterator
-  yields — lives in one shared buffer. Starting a second `matchesScratch` (or
-  any other `*Scratch` call) on the same scratch while an outer
-  `matchesScratch` loop is still running overwrites, and may reallocate, the
-  outer loop's offsets. Give the inner loop its own `Scratch`, or use
-  `matches`, which owns its buffers.
+- **One thread at a time.** It carries no synchronisation: never share one
+  `Scratch` between threads.
+- **Nesting and interleaving are fine on that thread.** The engine buffers
+  are only in use during a single search; each `matchesScratch` iterator
+  checks out an offsets buffer of its own (reused from the scratch's pool
+  once warm); and the `findSubmatchIndexScratch` result lives in a separate
+  buffer. So an inner `matchesScratch` loop, or any other `*Scratch` call,
+  inside an outer `matchesScratch` loop on the same scratch leaves the outer
+  iterator's offsets intact:
+
+  ```zig
+  var scratch = regex.Scratch.init(gpa);
+  defer scratch.deinit();
+  var outer = try words.matchesScratch(&scratch, text, -1);
+  defer outer.deinit();
+  while (try outer.next()) |w| {
+      var inner = try digits.matchesScratch(&scratch, text, -1);
+      defer inner.deinit();
+      while (try inner.next()) |d| {
+          // w is still this word's offsets here.
+          _ = d;
+      }
+      _ = w;
+  }
+  ```
+
+- **Every iterator must be `deinit`ed, before its `Scratch`.** In safe
+  builds, `Scratch.deinit` panics if an iterator still holds a buffer, and
+  `next()` or `deinit()` on an already `deinit`ed iterator trips an
+  assertion. Using an iterator after its scratch was freed cannot be
+  detected — don't.
 
 ---
 
@@ -506,6 +578,11 @@ The split is deliberate and consistent:
   - `matches` returns an iterator that owns its buffers — free with
     `deinit`; the offsets `next()` yields are borrowed and overwritten by the
     next call.
+  - `matchesScratch` returns an iterator that borrows its buffers from the
+    `Scratch` — it, too, must be `deinit`ed (which returns the buffers to the
+    scratch), before the scratch is.
+  - A `Diagnostic`'s `expr` is a sub-slice of the pattern passed to
+    `compileDiagnostic`; nothing to free.
 
 - **`Scratch` owns its buffers.** The `*Scratch` variants borrow all working
   memory (and, for `findSubmatchIndexScratch` / `matchesScratch`, the result
@@ -527,7 +604,8 @@ full differential suite, and every allocating API is swept with
 - `setLongest` is the one method that mutates a `Regexp`. Call it right after
   `compile`, before the regexp is shared — never while another thread may be
   matching with it.
-- A `Scratch` and a `Matches` iterator belong to one thread at a time.
+- A `Scratch` and a `Matches` iterator belong to one thread at a time (on
+  that thread, several iterators may share one `Scratch`).
 
 ---
 
@@ -575,7 +653,8 @@ intentional differences are:
 - **`[]const u8` inputs only.** Go has parallel `[]byte` and `string` method
   pairs (`Match`/`MatchString`, `FindAllSubmatch`/`FindAllStringSubmatch`,
   etc.). Here every input is `[]const u8`, so the pairs collapse to a single
-  method; `matchString` is kept as an alias of `match` for familiarity.
+  method named after Go's `[]byte` variant (`match`, `replaceAll`); the old
+  `String`-suffixed names remain as deprecated aliases (§3).
 - **No `io.RuneReader` methods.** `MatchReader`, `FindReaderIndex` and
   `FindReaderSubmatchIndex` (and the package-level `MatchReader`) are not
   provided.
@@ -589,8 +668,9 @@ intentional differences are:
   `compile` it again.
 - **`Longest()` is `setLongest()`**, and the package-level `MatchString` is
   `match(gpa, pattern, s)`.
-- **Errors are an error set**, not `*syntax.Error`: the offending fragment of
-  the pattern is not reported. `errorString` gives Go's `ErrorCode` text.
+- **Errors are an error set**, not `*syntax.Error`. `errorString` gives Go's
+  `ErrorCode` text; `compileDiagnostic` additionally reports Go's
+  `Error.Expr` fragment and formats Go's `Error()` text (§3 "Diagnostics").
 
 ### Credits & license
 

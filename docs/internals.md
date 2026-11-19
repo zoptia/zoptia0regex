@@ -160,7 +160,7 @@ comment of every file names its origin; the table collects them:
 | `root.zig`          | (the package entry point / re-exports)     | Public namespace |
 
 `src/` also holds the unit tests (`tests.zig`, `regressiontest.zig`,
-`oomtest.zig`, `limitstest.zig`, `enginetest.zig`) and the generated data
+`oomtest.zig`, `limitstest.zig`, `enginetest.zig`, `scratchtest.zig`) and the generated data
 files (`fold_table.zig`, `unicode_tables.zig`, section 6). The differential
 drivers and their corpora live in `test/` (section 5), the benchmarks in
 `bench/`; neither ships with the package.
@@ -201,7 +201,13 @@ engine or "no one-pass" on the same regexps and requires identical results,
 so engine coverage does not depend on the dispatch heuristics. Engine
 storage comes from a `Scratch`: the caller's (the `*Scratch` API and the
 find-all loops) or a temporary one that the allocating API sets up only when
-an engine actually runs.
+an engine actually runs. The engine buffers (Pike queues, thread pool,
+`add_stack`, bitstate bitmap and job stack) are only live during one
+search, so searches may interleave on one `Scratch`; results that outlive
+a call get their own buffers — `Scratch.result` for
+`findSubmatchIndexScratch`, and one pooled `iter_bufs` entry per live
+`matchesScratch` iterator, checked out on creation and returned by
+`Matches.deinit` — so nested iteration over one `Scratch` is safe.
 
 **(1) One-pass** (`doOnePass` in `exec.zig`, built by `onepass.zig`). Some
 *anchored* regexps can be proven at compile time to be unambiguous: at every
@@ -356,12 +362,14 @@ The port's central claim is *result-identical to Go*, and that claim is
    `difftest_common.zig`) `@embedFile` a corpus, compile each pattern with
    this engine in the recorded mode (`compile`, `compile` + `setLongest`, or
    `compilePOSIX`), and require: the same compile outcome and error code
-   (an `OutOfMemory` is a failure, never "the same as Go"); the same `ni`,
+   (an `OutOfMemory` is a failure, never "the same as Go"), and for an
+   error the same `Error.Expr` fragment (`compileDiagnostic`) and the same
+   `MustCompile` panic message; the same `ni`,
    which is mandatory, so the AST and program shape are Go's and not just
    the results; the same literal prefix and complete flag; the same leftmost
    match through `findSubmatchIndex`, `match`, `findIndex` and their
    `Scratch` variants; and, where recorded, the same `findAllSubmatchIndex`,
-   `findAllIndex`, `matchesScratch` iteration, `replaceAllString` and
+   `findAllIndex`, `matchesScratch` iteration, `replaceAll` and
    `split`. A missing trailer or a count that disagrees with the manifest
    fails the run.
 3. **Under a leak-checking allocator.** Every case runs on
@@ -369,7 +377,7 @@ The port's central claim is *result-identical to Go*, and that claim is
 
 | Corpus          | Driver            | Generator              | What it exercises |
 |-----------------|-------------------|------------------------|-------------------|
-| `cases.jsonl`   | `difftest.zig`    | `tools/cmd/gencases`   | Curated patterns × curated inputs; Go's `invalidRegexps` / `onlyPerl` / `onlyPOSIX` parser lists and `badRe` in both syntaxes; the parser's size, height and factor-recursion boundaries |
+| `cases.jsonl`   | `difftest.zig`    | `tools/cmd/gencases`   | Curated patterns × curated inputs; Go's `invalidRegexps` / `onlyPerl` / `onlyPOSIX` parser lists, `badRe` and patterns for every parse error site, in both syntaxes; the parser's size, height and factor-recursion boundaries |
 | `fuzz.jsonl`    | `fuzztest.zig`    | `tools/cmd/genfuzz`    | Random Perl-syntax patterns, an alternation stream for `factor`, a stream on inputs with NULs and malformed UTF-8, and patterns with spliced-in syntax errors; find-all family |
 | `longest.jsonl` | `longesttest.zig` | `tools/cmd/genlongest` | Random patterns under `Longest()`, and random POSIX ERE patterns through `CompilePOSIX`; find-all family |
 | `bytes.jsonl`   | `bytestest.zig`   | `tools/cmd/genbytes`   | Malformed UTF-8 and NULs in Perl / `Longest()` / `CompilePOSIX` modes, bounded `FindAll`/`Split`, `$` templates, depth limits, surrogates in literal prefixes |

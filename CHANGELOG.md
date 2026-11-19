@@ -4,6 +4,58 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] — 2026-11-19
+
+### Fixed
+
+- **Use-after-free in nested `matchesScratch` iteration.** A
+  `matchesScratch` iterator took its offsets buffer from the same single
+  `Scratch` buffer that `findSubmatchIndexScratch` returns. Two live
+  iterators on one `Scratch` (a nested loop), or a
+  `findSubmatchIndexScratch` call inside an iterator loop, shared that
+  buffer, and an inner call that needed more capture slots reallocated it,
+  so the outer iterator read and wrote freed memory. Each iterator now
+  checks out an offsets buffer of its own from a small pool in the
+  `Scratch` (reused once big enough, so warm loops — nested ones included —
+  still allocate nothing) and `Matches.deinit` returns it.
+  `findSubmatchIndexScratch` keeps its own buffer, valid until the next
+  `findSubmatchIndexScratch`. Nested iteration and interleaved `*Scratch`
+  calls on one `Scratch` are now supported.
+
+### Added
+
+- **Compile diagnostics.** `compileDiagnostic` / `compilePOSIXDiagnostic`
+  fill a `Diagnostic` with the error and Go's `syntax.Error.Expr` — the
+  offending fragment, a sub-slice of the caller's pattern (no allocation) —
+  for every parse error site; `{f}` on it prints Go's `Error()` text.
+  `compile` / `compilePOSIX` are unchanged.
+- The differential corpora record `Error.Expr` and the `MustCompile` panic
+  message for every error case (`ee`/`eeh`, `msg`/`msgh`), and the drivers
+  compare both in all four corpora; `cases.jsonl` gains patterns that reach
+  every reachable error site of Go's `parse.go` in both syntaxes
+  (16,280 → 16,599 cases).
+- `unicode.isPrint` (Go's `unicode.IsPrint`).
+
+### Changed
+
+- **`matchesScratch` iterators must be `deinit`ed**, like `matches`
+  iterators, before their `Scratch` (`deinit` used to be optional and free
+  nothing). Safe builds panic in `Scratch.deinit` when an iterator is still
+  live, and `next()` / `deinit()` after `deinit` trip an assertion.
+- **`mustCompile` / `mustCompilePOSIX` panic with Go's message byte for
+  byte**, now including the fragment
+  (``regexp: Compile(`a(`): error parsing regexp: missing closing ): `a(` ``)
+  and `strconv.Quote`'s exact escapes for non-printable runes.
+- **Canonical names drop Go's `String` suffix** (both Go variants take
+  `[]const u8` here): `replaceAll`, `replaceAllLiteral`.
+
+### Deprecated
+
+- `Regexp.replaceAllString` → `replaceAll`,
+  `Regexp.replaceAllLiteralString` → `replaceAllLiteral`,
+  `Regexp.matchString` → `match`, `Regexp.replaceAllStringFunc` →
+  `replaceAllFunc`. They remain as thin aliases and keep compiling.
+
 ## [0.7.0] — 2026-11-17
 
 ### Toolchain

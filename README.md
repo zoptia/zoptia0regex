@@ -40,7 +40,8 @@ Not "inspired by." **Proven identical.**
   JS, and Python runs in linear time here. Parser resource limits (program
   size, nesting depth, rune budget) are Go's, exactly.
 - ✅ **Proven identical to Go.** The differential suite replays Go's
-  recorded results — compile errors and their error codes, compiled program
+  recorded results — compile errors with their error codes, offending
+  fragments and `MustCompile` messages, compiled program
   size, literal prefixes, matches, find-all, replace and split — and
   requires the port to agree on every case. **Zero mismatches. Zero leaks.**
 - 🌍 **Unicode-correct.** `(?i)` case folding uses tables generated directly
@@ -92,7 +93,11 @@ For the full design walkthrough, see **[docs/internals.md](docs/internals.md)**.
 - ⚖️ Two match modes: leftmost-first (Go default) and POSIX leftmost-longest.
 - 🛡️ Linear-time guarantee — immune to ReDoS.
 - ⚡ Allocation-free hot loops: reuse a `Scratch` across matches
-  (`matchScratch`) for zero-allocation steady state, like Go's machine pool.
+  (`matchScratch`, nested `matchesScratch` loops) for zero-allocation
+  steady state, like Go's machine pool.
+- 🩺 Go's compile diagnostics: `compileDiagnostic` reports the offending
+  fragment (`syntax.Error.Expr`), and `mustCompile` panics with Go's exact
+  message.
 - 🌍 Full-Unicode case folding via Go-derived tables (Unicode 17.0, in step
   with Go 1.27).
 - 🚫 Same intentional limits as RE2/Go: **no backreferences, no `\C`**.
@@ -132,18 +137,19 @@ Go and Unicode versions and each corpus's case count.
 
 | Corpus | What it holds |
 |---|---|
-| Curated (`cases.jsonl`) | Hand-picked patterns × hand-picked inputs across every feature; Go's own invalid / Perl-only / POSIX-only parser test lists in both syntaxes; the parser's size, nesting and factor-recursion limits |
+| Curated (`cases.jsonl`) | Hand-picked patterns × hand-picked inputs across every feature; Go's own invalid / Perl-only / POSIX-only parser test lists and a pattern set reaching every parse error site, in both syntaxes; the parser's size, nesting and factor-recursion limits |
 | Random (`fuzz.jsonl`) | Grammar-generated Perl-syntax patterns, an alternation stream for Go's factoring, inputs with NULs and malformed UTF-8, and patterns with spliced-in syntax errors |
 | Leftmost-longest (`longest.jsonl`) | Random patterns under `setLongest()`, and random POSIX ERE patterns through `compilePOSIX` |
 | Byte-level (`bytes.jsonl`) | Malformed UTF-8 and NUL inputs in Perl, longest and POSIX modes, bounded `findAll`/`split` limits, `$` templates, depth limits, surrogate code points in literal prefixes |
 
 For **every** case the port must match Go's compile outcome (and for a
-failure, Go's error code), Go's compiled program size (`ni`, so the AST and
+failure, Go's error code, its `Error.Expr` fragment and the `MustCompile`
+panic message), Go's compiled program size (`ni`, so the AST and
 program shape are Go's, not just the results) and `LiteralPrefix()`, and
 then `FindSubmatchIndex` / `Match` / `FindIndex` and their `Scratch`
 variants. The random, longest and byte-level corpora additionally check
 `FindAllSubmatchIndex` / `FindAllIndex` / the `matches` iterator,
-`ReplaceAllString` and `Split`. A truncated corpus or a stale count fails,
+`ReplaceAll` and `Split`. A truncated corpus or a stale count fails,
 and everything runs under `std.testing.allocator`, so a leak fails too.
 
 ```sh

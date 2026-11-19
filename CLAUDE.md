@@ -34,7 +34,7 @@ port-to-Go file map:
 ## Layout
 
 - `src/` — the library and its unit tests (`tests.zig`, `regressiontest.zig`,
-  `oomtest.zig`, `limitstest.zig`, `enginetest.zig`). The only directory the
+  `oomtest.zig`, `limitstest.zig`, `enginetest.zig`, `scratchtest.zig`). The only directory the
   package ships (`build.zig.zon` `.paths`).
 - `test/` — differential drivers, one per corpus, all running
   `test/difftest_common.zig`; corpora and `MANIFEST.json` in `test/data/`.
@@ -160,22 +160,39 @@ result methods take an `allocator` for transient engine storage and (where
 they return owned memory) the result, which the caller frees. The tests and
 drivers run under `std.testing.allocator`, so any leak fails the build.
 
+**Scratch result buffers:** a `Scratch`'s engine buffers are used only
+within one search, so calls may interleave on one thread. Results that
+outlive a call each have their own storage: `findSubmatchIndexScratch`
+returns `Scratch.result`, and every `matchesScratch` iterator checks out a
+buffer from the `Scratch.iter_bufs` pool (`acquireIterBuf`; reused when big
+enough, so warm loops allocate nothing) that `Matches.deinit` hands back
+(`releaseIterBuf`, never allocates). Never let two live results share a
+buffer again: nested iteration over one `Scratch` is supported
+(`src/scratchtest.zig`). Every iterator must be `deinit`ed before its
+`Scratch` (safe builds panic in `Scratch.deinit` otherwise).
+
 ## Differential testing
 
 `tools/cmd/gen{cases,fuzz,longest,bytes}` record Go's behaviour into
 `test/data/*.jsonl` (format documented in `tools/internal/corpus`). For
 **every** case the drivers check: compile outcome and Go's
-`syntax.ErrorCode` text (OOM always fails), `ni` (Go's instruction count of
+`syntax.ErrorCode` text (OOM always fails); for an error case also Go's
+`syntax.Error.Expr` against `Diagnostic.expr` (`ee`, or `eeh` length+hash
+when long) and Go's `MustCompile`/`MustCompilePOSIX` panic message against
+`CompileFailure` (`msg`/`msgh`); `ni` (Go's instruction count of
 `syntax.Compile(syntax.Parse(p, flags).Simplify())` — mandatory, so a
 parser/simplifier/compiler change that alters program shape fails even when
 results agree), `literalPrefix()` (bytes + complete flag), and the leftmost
 match via `findSubmatchIndex` / `match` / `findIndex` / Scratch variants;
 the fuzz, longest and bytes corpora also check `findAllSubmatchIndex`,
-`findAllIndex`, `matchesScratch`, `replaceAllString` and `split`. Each
+`findAllIndex`, `matchesScratch`, `replaceAll` and `split`. Each
 corpus ends with a `{"count":N}` trailer that must match the case count and
-`test/data/MANIFEST.json`. The Zig-side error-code table is
-`test/difftest_common.zig:privateGoErrorCode`. Never type expectations by
-hand: change a generator and run `tools/regen.sh`.
+`test/data/MANIFEST.json`. The Zig-side error-code table is the public
+`regex.errorString` (`src/regexp.zig`). The parser records the fragment at
+each error site via `Parser.fail` (`src/parse.zig`); `gencases`'s
+`errorSites` list reaches every reachable `&Error{...}` site of Go's
+`parse.go` in both syntaxes. Never type expectations by hand: change a
+generator and run `tools/regen.sh`.
 
 **Generated, never hand-edited:** `src/fold_table.zig`,
 `src/unicode_tables.zig`, everything in `test/data/` and `bench/data/`, and
