@@ -38,10 +38,14 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
-- **`matchesScratch` iterators must be `deinit`ed**, like `matches`
-  iterators, before their `Scratch` (`deinit` used to be optional and free
-  nothing). Safe builds panic in `Scratch.deinit` when an iterator is still
-  live, and `next()` / `deinit()` after `deinit` trip an assertion.
+- **`matchesScratch` iterators hold a pooled buffer.** It goes back to the
+  `Scratch` when the iterator is exhausted (`next()` returns null) or
+  `deinit`ed, so loops that run to completion without `deinit` — the
+  contract documented before 0.8.0 — keep working and do not grow the pool.
+  An iterator abandoned mid-way must be `deinit`ed, before its `Scratch`;
+  otherwise its buffer stays checked out until `Scratch.deinit`, which
+  panics in Debug builds to flag it. `next()` / `deinit()` after `deinit`
+  trip an assertion in safe builds.
 - **`mustCompile` / `mustCompilePOSIX` panic with Go's message byte for
   byte**, now including the fragment
   (``regexp: Compile(`a(`): error parsing regexp: missing closing ): `a(` ``)

@@ -160,3 +160,30 @@ test "nested matchesScratch allocates nothing once warm" {
         try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     }
 }
+
+test "a matchesScratch loop run to exhaustion without deinit returns its buffer" {
+    // The contract documented before 0.8.0: `deinit` was optional. Such
+    // loops must neither grow the buffer pool nor trip `Scratch.deinit`.
+    var re = try regex.compile(ta, "(a)(b)?");
+    defer re.deinit();
+    var scratch = regex.Scratch.init(ta);
+    defer scratch.deinit();
+    for (0..200) |_| {
+        var it = try re.matchesScratch(&scratch, "ab a ab", -1);
+        var n: usize = 0;
+        while (try it.next()) |_| n += 1;
+        try std.testing.expectEqual(@as(usize, 3), n);
+        try std.testing.expect((try it.next()) == null); // stays exhausted
+    }
+    try std.testing.expectEqual(@as(usize, 1), scratch.iter_bufs.items.len);
+
+    // An explicit deinit after exhaustion is still fine (no double release),
+    // and so is an early break followed by deinit.
+    var done = try re.matchesScratch(&scratch, "ab", -1);
+    while (try done.next()) |_| {}
+    done.deinit();
+    var early = try re.matchesScratch(&scratch, "ab ab ab", -1);
+    _ = (try early.next()).?;
+    early.deinit();
+    try std.testing.expectEqual(@as(usize, 1), scratch.iter_bufs.items.len);
+}

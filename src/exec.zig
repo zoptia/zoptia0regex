@@ -14,6 +14,7 @@
 //! `longest = true` switches to POSIX leftmost-longest.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const prog = @import("prog.zig");
 const unicode = @import("unicode.zig");
 const onepass = @import("onepass.zig");
@@ -290,10 +291,13 @@ pub const Scratch = struct {
         @branchHint(.cold);
         const a = self.allocator;
         for (self.iter_bufs.items) |e| {
-            // Every matchesScratch iterator must be deinit'ed before its
-            // scratch: a live one would go on reading the buffer freed here.
-            if (std.debug.runtime_safety and e.in_use) {
-                std.debug.panic("Scratch.deinit: a matchesScratch iterator borrowing this scratch was not deinit'ed", .{});
+            // A buffer still checked out belongs to an iterator that was
+            // abandoned mid-way without `deinit`. That is harmless unless
+            // the iterator is used again (it would read the buffer freed
+            // here), so flag it in Debug builds only: it is a lint, not a
+            // safety check worth aborting a ReleaseSafe program for.
+            if (builtin.mode == .debug and e.in_use) {
+                std.debug.panic("Scratch.deinit: a matchesScratch iterator borrowing this scratch was abandoned before exhaustion without deinit", .{});
             }
             if (e.buf.len > 0) a.free(e.buf);
         }

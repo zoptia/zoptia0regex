@@ -331,7 +331,9 @@ pub const Regexp = struct {
         /// iterator buffer number `buf_slot`, checked out for this
         /// iterator alone (see `Scratch.acquireIterBuf`).
         caps: []i64,
-        buf_slot: u32 = 0,
+        /// The checked-out buffer of a `matchesScratch` iterator; null once
+        /// it has gone back to the pool (exhaustion or `deinit`).
+        buf_slot: ?u32 = null,
         pos: usize = 0,
         prev_match_end: i64 = -1,
         remaining: i64, // matches still to yield; < 0 means unlimited
@@ -343,8 +345,8 @@ pub const Regexp = struct {
         /// further `next` or `deinit` trips an assertion in safe builds.
         pub fn deinit(it: *Matches) void {
             std.debug.assert(!it.isDeinitialized()); // used after deinit
-            if (it.borrowed) |s| {
-                s.releaseIterBuf(it.buf_slot);
+            if (it.borrowed != null) {
+                it.releaseBorrowed();
             } else {
                 it.own.allocator.free(it.caps);
                 it.own.deinit();
@@ -362,11 +364,25 @@ pub const Regexp = struct {
             return it.borrowed orelse &it.own;
         }
 
+        /// Hand a `matchesScratch` iterator's buffer back to its scratch,
+        /// once. Runs when the iterator is exhausted, so a loop that runs to
+        /// completion needs no `deinit` to keep the pool from growing (the
+        /// contract `matchesScratch` documented before 0.8.0).
+        fn releaseBorrowed(it: *Matches) void {
+            if (it.buf_slot) |slot| {
+                it.borrowed.?.releaseIterBuf(slot);
+                it.buf_slot = null;
+                it.caps = &.{};
+            }
+        }
+
         /// The next match's submatch byte offsets, or null when exhausted.
-        /// The slice is owned by the iterator and overwritten by the next
-        /// call; copy it to keep it. Other searches in between, including
-        /// another iterator or `findSubmatchIndexScratch` on the same
-        /// `Scratch`, leave it intact.
+        /// The slice is owned by the iterator and valid only until the next
+        /// call to `next` (which overwrites it, or, on returning null,
+        /// gives a `matchesScratch` buffer back to its scratch); copy it to
+        /// keep it. Other searches in between, including another iterator
+        /// or `findSubmatchIndexScratch` on the same `Scratch`, leave it
+        /// intact.
         pub fn next(it: *Matches) ExecError!?[]const i64 {
             std.debug.assert(!it.isDeinitialized()); // used after deinit
             const in = exec.Input{ .s = it.input };
@@ -392,6 +408,7 @@ pub const Regexp = struct {
                 }
             }
             it.done = true;
+            if (it.borrowed != null) it.releaseBorrowed();
             return null;
         }
     };

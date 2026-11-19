@@ -524,11 +524,14 @@ needed). The rules:
   }
   ```
 
-- **Every iterator must be `deinit`ed, before its `Scratch`.** In safe
-  builds, `Scratch.deinit` panics if an iterator still holds a buffer, and
+- **`deinit` every iterator, before its `Scratch`.** A `matchesScratch`
+  iterator's offsets buffer goes back to the scratch when the iterator is
+  exhausted (`next()` returned `null`) or `deinit`ed; one abandoned mid-way
+  (an early `break`) without `deinit` keeps its buffer checked out until the
+  scratch is freed, and Debug builds panic in `Scratch.deinit` to flag it.
   `next()` or `deinit()` on an already `deinit`ed iterator trips an
-  assertion. Using an iterator after its scratch was freed cannot be
-  detected — don't.
+  assertion in safe builds. Using an iterator after its scratch was freed
+  cannot be detected — don't.
 
 ---
 

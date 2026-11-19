@@ -168,8 +168,11 @@ buffer from the `Scratch.iter_bufs` pool (`acquireIterBuf`; reused when big
 enough, so warm loops allocate nothing) that `Matches.deinit` hands back
 (`releaseIterBuf`, never allocates). Never let two live results share a
 buffer again: nested iteration over one `Scratch` is supported
-(`src/scratchtest.zig`). Every iterator must be `deinit`ed before its
-`Scratch` (safe builds panic in `Scratch.deinit` otherwise).
+(`src/scratchtest.zig`). The buffer also returns on exhaustion (`next()`
+→ null), so run-to-completion loops without `deinit` — the pre-0.8.0
+contract — do not grow the pool; an iterator abandoned mid-way must be
+`deinit`ed before its `Scratch` (Debug builds panic in `Scratch.deinit`
+otherwise).
 
 ## Differential testing
 
