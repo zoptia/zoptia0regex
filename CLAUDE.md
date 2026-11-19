@@ -93,7 +93,8 @@ literal fast path, then `exec.executeReuse`, which dispatches exactly like Go
 `Accel`); its `mode` field is a test hook used by `enginetest.zig` to force
 each engine on the same regexps. Engine storage is a `Scratch` (the
 caller's, or a temporary one the allocating API creates only when an engine
-runs).
+runs; that one draws its first 2 KB from the stack through
+`std.heap.BufferFirstAllocator`, so short searches skip the allocator).
 
 **Scan acceleration** (`exec.Accel`, `search.zig`): a literal prefix
 searched by `prefixIndexAnchored` — anchored on the prefix's rarest byte

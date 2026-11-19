@@ -166,12 +166,21 @@ pub const Regexp = struct {
         switch (storage) {
             .scratch => |scratch| return exec.executeReuse(scratch, &re.engine, .{ .s = input }, pos, caps),
             .temporary => |allocator| {
-                var scratch = Scratch.init(allocator);
+                // A search over a short input needs little engine storage
+                // (a bitstate bitmap, a few jobs or threads): serve it from
+                // the stack and touch `allocator` only when that runs out.
+                var stack_buf: [temp_scratch_stack_bytes]u8 align(@alignOf(usize)) = undefined;
+                var stack_first = std.heap.BufferFirstAllocator.init(&stack_buf, allocator);
+                var scratch = Scratch.init(stack_first.allocator());
                 defer scratch.deinit();
                 return exec.executeReuse(&scratch, &re.engine, .{ .s = input }, pos, caps);
             },
         }
     }
+
+    /// Stack bytes a single allocating search offers its temporary
+    /// `Scratch` before falling back to the caller's allocator.
+    const temp_scratch_stack_bytes = 2048;
 
     /// Where `findAt` gets engine storage: a caller's `Scratch` (the
     /// `*Scratch` API and the find-all loops), or a temporary one from an

@@ -201,7 +201,10 @@ engine or "no one-pass" on the same regexps and requires identical results,
 so engine coverage does not depend on the dispatch heuristics. Engine
 storage comes from a `Scratch`: the caller's (the `*Scratch` API and the
 find-all loops) or a temporary one that the allocating API sets up only when
-an engine actually runs. The engine buffers (Pike queues, thread pool,
+an engine actually runs. The temporary one takes its first 2 KB from a stack
+buffer (`std.heap.BufferFirstAllocator`) and falls back to the caller's
+allocator beyond that, so a search over a short input usually allocates
+nothing. The engine buffers (Pike queues, thread pool,
 `add_stack`, bitstate bitmap and job stack) are only live during one
 search, so searches may interleave on one `Scratch`; results that outlive
 a call get their own buffers — `Scratch.result` for
