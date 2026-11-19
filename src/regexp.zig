@@ -15,8 +15,8 @@
 //!   one shared `Regexp`, as long as each call has its own allocator or
 //!   `Scratch`. `setLongest` mutates the `Regexp`: call it before sharing,
 //!   never while another thread is matching.
-//! - A `Scratch` serves one match at a time; see `matchesScratch` for the
-//!   nested-iteration rule.
+//! - A `Scratch` serves one thread at a time; on that thread searches,
+//!   including nested `matchesScratch` loops, may share it (see `Scratch`).
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -40,13 +40,14 @@ pub const Match = struct { start: usize, end: usize };
 /// `matchesScratch`). Allocate once, reuse across many matches, even on
 /// different compiled `Regexp`s. See `exec.Scratch`.
 ///
-/// One `Scratch` serves one match at a time: it carries no synchronisation,
-/// and every result it hands out (the `findSubmatchIndexScratch` slice, the
-/// offsets a `matchesScratch` iterator yields) lives in a single shared
-/// buffer that the next call reusing the `Scratch` overwrites or even
-/// reallocates. In particular two live `matchesScratch` iterators on one
-/// `Scratch` (nested iteration) clobber each other; give each its own
-/// `Scratch`, or use `matches`.
+/// A `Scratch` carries no synchronisation: use it from one thread at a
+/// time. On that thread, calls may interleave freely: the engine buffers
+/// are only in use during a single search, every `matchesScratch` iterator
+/// checks out an offsets buffer of its own (returned by its `deinit`), and
+/// the `findSubmatchIndexScratch` result lives in a further buffer that
+/// only the next `findSubmatchIndexScratch` call overwrites. So nested
+/// `matchesScratch` loops over one `Scratch` are fine. Every iterator must
+/// be `deinit`ed before the `Scratch` is.
 pub const Scratch = exec.Scratch;
 
 /// What `Regexp.literalPrefix` returns: a literal every match must begin
@@ -56,6 +57,11 @@ pub const LiteralPrefix = struct { prefix: []const u8, complete: bool };
 /// Stand-in arena `deinit` leaves behind so that a second `deinit` of the
 /// same variable trips an assertion in safe builds. Never dereferenced.
 var deinitialized_arena: std.heap.ArenaAllocator = undefined;
+
+/// Stand-in regexp `Matches.deinit` leaves behind, so that using an
+/// iterator after its `deinit` trips an assertion in safe builds. Never
+/// dereferenced.
+var deinitialized_regexp: Regexp = undefined;
 
 /// A compiled regular expression, Go's `*regexp.Regexp`.
 ///
@@ -249,9 +255,10 @@ pub const Regexp = struct {
     }
 
     /// Like `findSubmatchIndex`, but reuses a caller-owned `Scratch`. The
-    /// returned slice is owned by `scratch` and valid only until the next call
-    /// that reuses it — copy it if you need to keep it. Do NOT free it. Null if
-    /// there is no match.
+    /// returned slice is owned by `scratch` and valid until the next
+    /// `findSubmatchIndexScratch` on it (or its `deinit`) — copy it if you
+    /// need to keep it longer. Other `*Scratch` calls and `matchesScratch`
+    /// iterators do not touch it. Do NOT free it. Null if there is no match.
     pub fn findSubmatchIndexScratch(re: *const Regexp, scratch: *Scratch, input: []const u8) ExecError!?[]i64 {
         const caps = try scratch.resultBuf(re.padLen());
         if (!try re.findAt(.{ .scratch = scratch }, input, 0, caps)) return null;
@@ -306,11 +313,12 @@ pub const Regexp = struct {
     /// an empty match abutting the previous match is skipped. The engine
     /// scratch is allocated once and reused for every match, so a long scan
     /// allocates nothing per match. Build one with `Regexp.matches` (owns its
-    /// buffers; call `deinit`) or `Regexp.matchesScratch` (borrows them).
+    /// buffers) or `Regexp.matchesScratch` (borrows them from a `Scratch`);
+    /// either way, call `deinit` exactly once.
     ///
     /// Do not copy a `Matches` and keep using both copies: they share the
-    /// offsets buffer and, for `matches`, either copy's `deinit` frees it.
-    /// All fields are internal.
+    /// offsets buffer, and either copy's `deinit` releases it. All fields
+    /// are internal.
     pub const Matches = struct {
         re: *const Regexp,
         input: []const u8,
@@ -318,20 +326,36 @@ pub const Regexp = struct {
         /// `borrowed` is set (`matchesScratch`).
         own: Scratch,
         borrowed: ?*Scratch = null,
+        /// The offsets the iterator yields. Owned by the iterator for
+        /// `matches`; for `matchesScratch` it is the `borrowed` scratch's
+        /// iterator buffer number `buf_slot`, checked out for this
+        /// iterator alone (see `Scratch.acquireIterBuf`).
         caps: []i64,
+        buf_slot: u32 = 0,
         pos: usize = 0,
         prev_match_end: i64 = -1,
         remaining: i64, // matches still to yield; < 0 means unlimited
         done: bool = false,
 
-        /// Frees what the iterator owns. For `matchesScratch` iterators this
-        /// is a no-op: every buffer belongs to the caller's `Scratch`.
+        /// Frees what the iterator owns, or hands a `matchesScratch`
+        /// iterator's offsets buffer back to its `Scratch` for reuse. The
+        /// iterator, and every slice it yielded, is unusable afterwards; a
+        /// further `next` or `deinit` trips an assertion in safe builds.
         pub fn deinit(it: *Matches) void {
-            if (it.borrowed == null) {
+            std.debug.assert(!it.isDeinitialized()); // used after deinit
+            if (it.borrowed) |s| {
+                s.releaseIterBuf(it.buf_slot);
+            } else {
                 it.own.allocator.free(it.caps);
                 it.own.deinit();
             }
             it.* = undefined;
+            it.re = &deinitialized_regexp;
+        }
+
+        /// Whether `deinit` has run on this variable (the poison it leaves).
+        fn isDeinitialized(it: *const Matches) bool {
+            return it.re == &deinitialized_regexp;
         }
 
         fn scratch(it: *Matches) *Scratch {
@@ -340,8 +364,11 @@ pub const Regexp = struct {
 
         /// The next match's submatch byte offsets, or null when exhausted.
         /// The slice is owned by the iterator and overwritten by the next
-        /// call; copy it to keep it.
+        /// call; copy it to keep it. Other searches in between, including
+        /// another iterator or `findSubmatchIndexScratch` on the same
+        /// `Scratch`, leave it intact.
         pub fn next(it: *Matches) ExecError!?[]const i64 {
+            std.debug.assert(!it.isDeinitialized()); // used after deinit
             const in = exec.Input{ .s = it.input };
             while (!it.done and it.pos <= it.input.len) {
                 const matched = try it.re.findAt(.{ .scratch = it.scratch() }, it.input, it.pos, it.caps);
@@ -390,25 +417,25 @@ pub const Regexp = struct {
         };
     }
 
-    /// Like `matches`, but borrows all storage — engine buffers and the
-    /// yielded offsets — from a caller-owned `Scratch`, so a warmed-up loop
-    /// of scans allocates nothing. The iterator and the slices it yields are
-    /// valid until the next call that reuses `scratch` (including another
-    /// `findSubmatchIndexScratch`); `deinit` is optional and frees nothing.
+    /// Like `matches`, but borrows all storage from a caller-owned
+    /// `Scratch`: the engine buffers, and an offsets buffer the scratch
+    /// checks out for this iterator alone and takes back on `deinit`. A
+    /// warmed-up loop of scans therefore allocates nothing, nested loops
+    /// included. Always `deinit` the iterator, before `scratch` itself.
     ///
-    /// No nesting on one `Scratch`: a second `matchesScratch` (or any other
-    /// `*Scratch` call) on the same `scratch` while this iterator is still
-    /// in use shares, and may reallocate, the buffer its offsets live in, so
-    /// the outer loop reads clobbered or freed results. Give an inner loop
-    /// its own `Scratch`, or use `matches`.
+    /// Nesting is supported: several live iterators (over the same or
+    /// different regexps) and other `*Scratch` calls may share one
+    /// `scratch`, interleaved freely on one thread; each iterator's
+    /// yielded slice stays valid until its own next `next` or `deinit`.
     pub fn matchesScratch(re: *const Regexp, scratch: *Scratch, input: []const u8, n: i64) ExecError!Matches {
-        const caps = try scratch.resultBuf(re.padLen());
+        const b = try scratch.acquireIterBuf(re.padLen());
         return .{
             .re = re,
             .input = input,
             .own = undefined,
             .borrowed = scratch,
-            .caps = caps,
+            .caps = b.buf,
+            .buf_slot = b.slot,
             .remaining = n,
             .done = n == 0,
         };
@@ -1085,6 +1112,20 @@ test "deinit poisons the Regexp against a second deinit" {
     try std.testing.expect(!re.isDeinitialized());
     re.deinit();
     try std.testing.expect(re.isDeinitialized());
+}
+
+test "Matches.deinit poisons the iterator against reuse" {
+    var re = try compile(std.testing.allocator, "a");
+    defer re.deinit();
+    var scratch = Scratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    var it = try re.matchesScratch(&scratch, "aa", -1);
+    try std.testing.expect(!it.isDeinitialized());
+    it.deinit();
+    try std.testing.expect(it.isDeinitialized());
+    var own = try re.matches(std.testing.allocator, "aa", -1);
+    own.deinit();
+    try std.testing.expect(own.isDeinitialized());
 }
 
 fn minInputLen(re: *const ast.Regexp) usize {

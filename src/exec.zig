@@ -244,6 +244,20 @@ pub const Scratch = struct {
     // --- borrowed result buffer for findSubmatchIndexScratch ---
     result: []i64 = &.{},
 
+    // --- per-iterator result buffers for matchesScratch ---
+    /// Every capture buffer this scratch has handed to a `matchesScratch`
+    /// iterator, checked out or free. An iterator owns its entry from
+    /// `acquireIterBuf` until `releaseIterBuf`, so two live iterators (or
+    /// an iterator and `findSubmatchIndexScratch`, which uses `result`)
+    /// never share storage. Entries are reused, never shrunk: a warmed-up
+    /// loop, nested or not, allocates nothing.
+    iter_bufs: std.ArrayList(IterBuf) = .empty,
+
+    pub const IterBuf = struct {
+        buf: []i64,
+        in_use: bool,
+    };
+
     pub fn init(allocator: std.mem.Allocator) Scratch {
         return .{ .allocator = allocator };
     }
@@ -266,6 +280,15 @@ pub const Scratch = struct {
         if (self.work.len > 0) a.free(self.work);
         if (self.visited.len > 0) a.free(self.visited);
         if (self.result.len > 0) a.free(self.result);
+        for (self.iter_bufs.items) |e| {
+            // Every matchesScratch iterator must be deinit'ed before its
+            // scratch: a live one would go on reading the buffer freed here.
+            if (std.debug.runtime_safety and e.in_use) {
+                std.debug.panic("Scratch.deinit: a matchesScratch iterator borrowing this scratch was not deinit'ed", .{});
+            }
+            if (e.buf.len > 0) a.free(e.buf);
+        }
+        self.iter_bufs.deinit(a);
         self.* = undefined;
     }
 
@@ -322,6 +345,38 @@ pub const Scratch = struct {
             try replaceBuffer(i64, self.allocator, &self.result, n);
         }
         return self.result[0..n];
+    }
+
+    /// Check out a capture buffer of length `n` for one `matchesScratch`
+    /// iterator; it stays the iterator's alone until `releaseIterBuf(slot)`.
+    /// Prefers a free buffer that is already big enough, else grows a free
+    /// one, else adds a new one. On failure nothing is checked out.
+    pub fn acquireIterBuf(self: *Scratch, n: usize) !struct { slot: u32, buf: []i64 } {
+        var free_slot: ?usize = null;
+        for (self.iter_bufs.items, 0..) |*e, k| {
+            if (e.in_use) continue;
+            if (e.buf.len >= n) {
+                e.in_use = true;
+                return .{ .slot = @intCast(k), .buf = e.buf[0..n] };
+            }
+            if (free_slot == null) free_slot = k;
+        }
+        const k = free_slot orelse blk: {
+            try self.iter_bufs.append(self.allocator, .{ .buf = &.{}, .in_use = false });
+            break :blk self.iter_bufs.items.len - 1;
+        };
+        const e = &self.iter_bufs.items[k];
+        try replaceBuffer(i64, self.allocator, &e.buf, n);
+        e.in_use = true;
+        return .{ .slot = @intCast(k), .buf = e.buf[0..n] };
+    }
+
+    /// Return the buffer `acquireIterBuf` checked out as `slot`. Never
+    /// allocates, so an iterator's `deinit` cannot fail.
+    pub fn releaseIterBuf(self: *Scratch, slot: u32) void {
+        const e = &self.iter_bufs.items[slot];
+        std.debug.assert(e.in_use); // released twice
+        e.in_use = false;
     }
 };
 
@@ -706,6 +761,32 @@ fn exerciseScratchGrowth(allocator: std.mem.Allocator) !void {
     _ = try scratch.bitBufs(6, 32);
     _ = try scratch.resultBuf(2);
     _ = try scratch.resultBuf(8);
+    const a = try scratch.acquireIterBuf(2);
+    const b = acquired: {
+        errdefer scratch.releaseIterBuf(a.slot);
+        break :acquired try scratch.acquireIterBuf(8);
+    };
+    defer scratch.releaseIterBuf(b.slot);
+    scratch.releaseIterBuf(a.slot);
+    const c = try scratch.acquireIterBuf(6); // grows the free 2-slot buffer
+    scratch.releaseIterBuf(c.slot);
+}
+
+test "iterator buffers are never shared while checked out" {
+    var scratch = Scratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    const a = try scratch.acquireIterBuf(4);
+    const b = try scratch.acquireIterBuf(4);
+    try std.testing.expect(a.slot != b.slot);
+    try std.testing.expect(a.buf.ptr != b.buf.ptr);
+    try std.testing.expect(a.buf.ptr != (try scratch.resultBuf(4)).ptr);
+    scratch.releaseIterBuf(a.slot);
+    // A free buffer that is big enough is reused as is.
+    const c = try scratch.acquireIterBuf(2);
+    try std.testing.expectEqual(a.slot, c.slot);
+    try std.testing.expectEqual(a.buf.ptr, c.buf.ptr);
+    scratch.releaseIterBuf(b.slot);
+    scratch.releaseIterBuf(c.slot);
 }
 
 test "scratch growth cleans up after every allocation failure" {

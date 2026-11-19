@@ -98,6 +98,7 @@ fn allApis(allocator: std.mem.Allocator, re: *const regex.Regexp, input: []const
     _ = try re.findIndexScratch(&scratch, input);
     _ = try re.findSubmatchIndexScratch(&scratch, input);
     var sit = try re.matchesScratch(&scratch, input, -1);
+    defer sit.deinit();
     while (try sit.next()) |_| {}
 
     const quoted = try regex.quoteMeta(allocator, "a+b[0]");
@@ -120,6 +121,33 @@ test "OOM: every result API, on every engine" {
     var posix = try regex.compilePOSIX(ta, "([a-z]+)([0-9]+)|bb");
     defer posix.deinit();
     try checkAllocationFailures(allApis, .{ &posix, "a1 bb22 a333" });
+}
+
+/// Two live `matchesScratch` iterators on one scratch, plus `*Scratch`
+/// calls inside the inner loop.
+fn nestedScratchIterators(allocator: std.mem.Allocator, outer: *const regex.Regexp, inner: *const regex.Regexp, input: []const u8) !void {
+    var scratch = regex.Scratch.init(allocator);
+    defer scratch.deinit();
+    var it = try outer.matchesScratch(&scratch, input, -1);
+    defer it.deinit();
+    while (try it.next()) |_| {
+        var in = try inner.matchesScratch(&scratch, input, -1);
+        defer in.deinit();
+        while (try in.next()) |_| {
+            _ = try outer.findSubmatchIndexScratch(&scratch, input);
+            _ = try inner.findIndexScratch(&scratch, input);
+        }
+    }
+}
+
+test "OOM: nested matchesScratch iterators on one scratch" {
+    var a = try regex.compile(ta, "(?P<word>[a-z]+)([0-9]+)");
+    defer a.deinit();
+    var b = try regex.compile(ta, "(a)(b)?(c)?(d)?(e)?(f)?(g)?(h)?(i)?(j)?(k)?(l)?(m)?(n)?(o)?(p)?(q)?");
+    defer b.deinit();
+    try checkAllocationFailures(nestedScratchIterators, .{ &a, &b, "a1 bb22 a333" });
+    try checkAllocationFailures(nestedScratchIterators, .{ &b, &a, "a1 bb22 a333" });
+    try checkAllocationFailures(nestedScratchIterators, .{ &a, &a, "a1 bb22 a333" });
 }
 
 fn pikeApis(allocator: std.mem.Allocator, re: *const regex.Regexp, input: []const u8) !void {

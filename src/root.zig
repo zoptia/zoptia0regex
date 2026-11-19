@@ -56,4 +56,5 @@ test {
     _ = @import("regressiontest.zig");
     _ = @import("limitstest.zig");
     _ = @import("enginetest.zig");
+    _ = @import("scratchtest.zig");
 }
