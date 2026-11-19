@@ -58,13 +58,33 @@ pub const ParseError = error{
 
 /// Parse `pattern` under `flags` and return the AST root.
 pub fn parse(arena: std.mem.Allocator, pattern: []const u8, flags: Flags) ParseError!*Regexp {
-    if (flags & ast.Literal != 0) {
-        // Trivial parser for a literal string (Go's literalRegexp).
-        try checkUTF8(pattern);
-        return literalRegexp(arena, pattern, flags);
-    }
+    return parseDiagnostic(arena, pattern, flags, null);
+}
 
-    var p = Parser{ .al = arena, .flags = flags };
+/// `parse`, and on a parse error also store Go's `syntax.Error.Expr` for
+/// it in `err_expr`: the offending fragment, a sub-slice of `pattern` (or
+/// "" where Go reports an empty one, for a trailing backslash). It is left
+/// unchanged on success and on `error.OutOfMemory`.
+pub fn parseDiagnostic(arena: std.mem.Allocator, pattern: []const u8, flags: Flags, err_expr: ?*[]const u8) ParseError!*Regexp {
+    var p = Parser{ .al = arena, .flags = flags, .whole = pattern };
+    return parseInto(&p, pattern) catch |err| {
+        if (err_expr) |out| switch (err) {
+            error.OutOfMemory => {},
+            // Go's parse recovers its ErrLarge / ErrNestingDepth panics
+            // into an Error whose Expr is the whole pattern.
+            error.TooLarge, error.NestingDepth => out.* = pattern,
+            else => out.* = p.err_expr,
+        };
+        return err;
+    };
+}
+
+fn parseInto(p: *Parser, pattern: []const u8) ParseError!*Regexp {
+    if (p.flags & ast.Literal != 0) {
+        // Trivial parser for a literal string (Go's literalRegexp).
+        try p.checkUTF8(pattern);
+        return literalRegexp(p, pattern);
+    }
 
     var lastRepeat: []const u8 = "";
     var t = pattern;
@@ -116,7 +136,7 @@ pub fn parse(arena: std.mem.Allocator, pattern: []const u8, flags: Flags) ParseE
                     '+' => .plus,
                     else => .quest,
                 };
-                t = try p.repeat(o, 0, 0, t[1..], lastRepeat);
+                t = try p.repeat(o, 0, 0, before, t[1..], lastRepeat);
                 repeat = before;
             },
             '{' => {
@@ -128,9 +148,9 @@ pub fn parse(arena: std.mem.Allocator, pattern: []const u8, flags: Flags) ParseE
                     t = t[1..];
                 } else {
                     if (pr.min < 0 or pr.min > 1000 or pr.max > 1000 or (pr.max >= 0 and pr.min > pr.max)) {
-                        return error.InvalidRepeatSize;
+                        return p.fail(error.InvalidRepeatSize, before[0 .. before.len - pr.rest.len]);
                     }
-                    t = try p.repeat(.repeat, pr.min, pr.max, pr.rest, lastRepeat);
+                    t = try p.repeat(.repeat, pr.min, pr.max, before, pr.rest, lastRepeat);
                     repeat = before;
                 }
             },
@@ -138,7 +158,7 @@ pub fn parse(arena: std.mem.Allocator, pattern: []const u8, flags: Flags) ParseE
                 t = try p.parseBackslashAtom(t);
             },
             else => {
-                const nr = try nextRune(t);
+                const nr = try p.nextRune(t);
                 try p.literal(nr.r);
                 t = nr.rest;
             },
@@ -148,20 +168,21 @@ pub fn parse(arena: std.mem.Allocator, pattern: []const u8, flags: Flags) ParseE
     return try p.finish();
 }
 
-/// One OpLiteral node holding every rune of `s`, without case folding; the
-/// empty string yields a zero-rune literal (Go's `literalRegexp`).
-fn literalRegexp(al: std.mem.Allocator, s: []const u8, flags: Flags) ParseError!*Regexp {
-    const n = std.unicode.utf8CountCodepoints(s) catch return error.InvalidUTF8;
-    const runes = try al.alloc(u21, n);
+/// One OpLiteral node holding every rune of `s` (already checked to be
+/// valid UTF-8), without case folding; the empty string yields a zero-rune
+/// literal (Go's `literalRegexp`).
+fn literalRegexp(p: *Parser, s: []const u8) ParseError!*Regexp {
+    const n = std.unicode.utf8CountCodepoints(s) catch return p.fail(error.InvalidUTF8, s);
+    const runes = try p.al.alloc(u21, n);
     var i: usize = 0;
     var t = s;
     while (t.len != 0) : (i += 1) {
-        const nr = try nextRune(t);
+        const nr = try p.nextRune(t);
         runes[i] = nr.r;
         t = nr.rest;
     }
-    const re = try al.create(Regexp);
-    re.* = .{ .op = .literal, .flags = flags, .runes = runes };
+    const re = try p.al.create(Regexp);
+    re.* = .{ .op = .literal, .flags = p.flags, .runes = runes };
     return re;
 }
 
@@ -225,6 +246,35 @@ const Parser = struct {
     height_tracking: bool = false, // Go's p.height != nil
     factor_frames: std.ArrayList(FactorFrame) = .empty,
     size_frames: std.ArrayList(SizeFrame) = .empty,
+    /// The whole pattern (Go's `p.wholeRegexp`).
+    whole: []const u8 = "",
+    /// Go's `Error.Expr` for the error being returned; set by `fail`.
+    err_expr: []const u8 = "",
+
+    /// Record Go's `Error.Expr` for `err` and return `err`.
+    fn fail(p: *Parser, err: ParseError, expr: []const u8) ParseError {
+        p.err_expr = expr;
+        return err;
+    }
+
+    /// Go's `nextRune`: decode the rune at the start of `s`. Like Go's
+    /// decoder, the empty string decodes to U+FFFD (with no error).
+    fn nextRune(p: *Parser, s: []const u8) ParseError!RuneRest {
+        if (s.len == 0) return .{ .r = 0xFFFD, .rest = s };
+        const n = std.unicode.utf8ByteSequenceLength(s[0]) catch return p.fail(error.InvalidUTF8, s);
+        if (n > s.len) return p.fail(error.InvalidUTF8, s);
+        const r = std.unicode.utf8Decode(s[0..n]) catch return p.fail(error.InvalidUTF8, s);
+        return .{ .r = r, .rest = s[n..] };
+    }
+
+    /// Go's `checkUTF8`; the error's fragment starts at the first bad byte.
+    fn checkUTF8(p: *Parser, s0: []const u8) ParseError!void {
+        var s = s0;
+        while (s.len != 0) {
+            const nr = try p.nextRune(s);
+            s = nr.rest;
+        }
+    }
 
     fn newRegexp(p: *Parser, o: Op) !*Regexp {
         if (p.free) |n| {
@@ -467,16 +517,16 @@ const Parser = struct {
         try p.concat();
         if (try p.swapVerticalBar()) _ = p.stack.pop();
         try p.alternate();
-        if (p.stack.items.len != 1) return error.MissingParen;
+        if (p.stack.items.len != 1) return p.fail(error.MissingParen, p.whole);
         return p.stack.items[0];
     }
 
     // --- repetition ---
 
-    // Go's repeat additionally takes `before` to slice the pattern text into
-    // its positional error messages; this port's errors carry no position, so
-    // the parameter is dropped.
-    fn repeat(p: *Parser, o: Op, min: i32, max: i32, after0: []const u8, lastRepeat: []const u8) ![]const u8 {
+    /// Go's `repeat`: `before` is the pattern suffix starting at the
+    /// repetition operator, `after0` the suffix following it; the error
+    /// fragments are the text between them.
+    fn repeat(p: *Parser, o: Op, min: i32, max: i32, before: []const u8, after0: []const u8, lastRepeat: []const u8) ![]const u8 {
         var after = after0;
         var flags = p.flags;
         if (p.flags & ast.PerlX != 0) {
@@ -486,13 +536,14 @@ const Parser = struct {
             }
             if (lastRepeat.len != 0) {
                 // a** is an error in Perl (no stacked repetition operators).
-                return error.InvalidRepeatOp;
+                return p.fail(error.InvalidRepeatOp, lastRepeat[0 .. lastRepeat.len - after.len]);
             }
         }
+        const op_text = before[0 .. before.len - after.len];
         const n = p.stack.items.len;
-        if (n == 0) return error.MissingRepeatArgument;
+        if (n == 0) return p.fail(error.MissingRepeatArgument, op_text);
         const sub = p.stack.items[n - 1];
-        if (sub.op.isPseudo()) return error.MissingRepeatArgument;
+        if (sub.op.isPseudo()) return p.fail(error.MissingRepeatArgument, op_text);
 
         const re = try p.newRegexp(o);
         re.min = min;
@@ -503,7 +554,7 @@ const Parser = struct {
         try p.checkLimits(re);
 
         if (o == .repeat and (min >= 2 or max >= 2) and !repeatIsValid(re, 1000)) {
-            return error.InvalidRepeatSize;
+            return p.fail(error.InvalidRepeatSize, op_text);
         }
         return after;
     }
@@ -1003,11 +1054,11 @@ const Parser = struct {
         try p.alternate();
 
         const n = p.stack.items.len;
-        if (n < 2) return error.UnexpectedParen;
+        if (n < 2) return p.fail(error.UnexpectedParen, p.whole);
         const re1 = p.stack.items[n - 1];
         const re2 = p.stack.items[n - 2];
         p.stack.shrinkRetainingCapacity(n - 2);
-        if (re2.op != .left_paren) return error.UnexpectedParen;
+        if (re2.op != .left_paren) return p.fail(error.UnexpectedParen, p.whole);
 
         p.flags = re2.flags; // restore flags at time of paren
         if (re2.cap == 0) {
@@ -1030,12 +1081,12 @@ const Parser = struct {
             const exprStart: usize = if (startsWithName) 3 else 4;
             const end = std.mem.indexOfScalar(u8, t0, '>') orelse {
                 // Go reports invalid UTF-8 before the missing-'>' error.
-                try checkUTF8(t0);
-                return error.InvalidNamedCapture;
+                try p.checkUTF8(t0);
+                return p.fail(error.InvalidNamedCapture, s);
             };
             const name = t0[exprStart..end];
-            try checkUTF8(name);
-            if (!isValidCaptureName(name)) return error.InvalidNamedCapture;
+            try p.checkUTF8(name);
+            if (!isValidCaptureName(name)) return p.fail(error.InvalidNamedCapture, t0[0 .. end + 1]);
             p.num_cap += 1;
             const re = try p.op(.left_paren);
             re.cap = p.num_cap;
@@ -1049,7 +1100,7 @@ const Parser = struct {
         var sign: i32 = 1;
         var sawFlag = false;
         while (t.len != 0) {
-            const nr = try nextRune(t);
+            const nr = try p.nextRune(t);
             const c = nr.r;
             t = nr.rest;
             switch (c) {
@@ -1070,14 +1121,14 @@ const Parser = struct {
                     sawFlag = true;
                 },
                 '-' => {
-                    if (sign < 0) return error.InvalidPerlOp;
+                    if (sign < 0) return p.fail(error.InvalidPerlOp, s[0 .. s.len - t.len]);
                     sign = -1;
                     flags = ~flags;
                     sawFlag = false;
                 },
                 ':', ')' => {
                     if (sign < 0) {
-                        if (!sawFlag) return error.InvalidPerlOp;
+                        if (!sawFlag) return p.fail(error.InvalidPerlOp, s[0 .. s.len - t.len]);
                         flags = ~flags;
                     }
                     if (c == ':') {
@@ -1086,10 +1137,10 @@ const Parser = struct {
                     p.flags = flags;
                     return t;
                 },
-                else => return error.InvalidPerlOp,
+                else => return p.fail(error.InvalidPerlOp, s[0 .. s.len - t.len]),
             }
         }
-        return error.InvalidPerlOp;
+        return p.fail(error.InvalidPerlOp, s[0 .. s.len - t.len]);
     }
 
     // --- escapes ---
@@ -1110,7 +1161,7 @@ const Parser = struct {
                     _ = try p.op(.no_word_boundary);
                     return t[2..];
                 },
-                'C' => return error.InvalidEscape, // any byte: unsupported
+                'C' => return p.fail(error.InvalidEscape, t[0..2]), // any byte: unsupported
                 'Q' => {
                     var lit = t[2..];
                     var rest: []const u8 = "";
@@ -1119,7 +1170,7 @@ const Parser = struct {
                         lit = lit[0..idx];
                     }
                     while (lit.len != 0) {
-                        const nr = try nextRune(lit);
+                        const nr = try p.nextRune(lit);
                         try p.literal(nr.r);
                         lit = nr.rest;
                     }
@@ -1162,10 +1213,9 @@ const Parser = struct {
     // --- escapes ---
 
     fn parseEscape(p: *Parser, s: []const u8) !RuneRest {
-        _ = p;
         var t = s[1..]; // skip backslash
-        if (t.len == 0) return error.TrailingBackslash;
-        const nr = try nextRune(t);
+        if (t.len == 0) return p.fail(error.TrailingBackslash, "");
+        const nr = try p.nextRune(t);
         const c = nr.r;
         t = nr.rest;
         switch (c) {
@@ -1174,7 +1224,7 @@ const Parser = struct {
                 if (c != '0') {
                     // A single non-zero digit is a backreference; unsupported
                     // unless followed by another octal digit.
-                    if (t.len == 0 or t[0] < '0' or t[0] > '7') return error.InvalidEscape;
+                    if (t.len == 0 or t[0] < '0' or t[0] > '7') return p.fail(error.InvalidEscape, s[0 .. s.len - t.len]);
                 }
                 var r: u21 = @intCast(c - '0');
                 var i: usize = 1;
@@ -1187,33 +1237,33 @@ const Parser = struct {
             },
             // Hexadecimal escapes.
             'x' => {
-                if (t.len == 0) return error.InvalidEscape;
-                const nr2 = try nextRune(t);
+                if (t.len == 0) return p.fail(error.InvalidEscape, s[0 .. s.len - t.len]);
+                const nr2 = try p.nextRune(t);
                 const c2 = nr2.r;
                 t = nr2.rest;
                 if (c2 == '{') {
                     var acc: u32 = 0;
                     var nhex: usize = 0;
                     while (true) {
-                        if (t.len == 0) return error.InvalidEscape;
-                        const e = try nextRune(t);
+                        if (t.len == 0) return p.fail(error.InvalidEscape, s[0 .. s.len - t.len]);
+                        const e = try p.nextRune(t);
                         t = e.rest;
                         if (e.r == '}') break;
                         const v = unhex(e.r);
-                        if (v < 0) return error.InvalidEscape;
+                        if (v < 0) return p.fail(error.InvalidEscape, s[0 .. s.len - t.len]);
                         acc = acc * 16 + @as(u32, @intCast(v));
-                        if (acc > max_rune) return error.InvalidEscape;
+                        if (acc > max_rune) return p.fail(error.InvalidEscape, s[0 .. s.len - t.len]);
                         nhex += 1;
                     }
-                    if (nhex == 0) return error.InvalidEscape;
+                    if (nhex == 0) return p.fail(error.InvalidEscape, s[0 .. s.len - t.len]);
                     return .{ .r = @intCast(acc), .rest = t };
                 }
                 // Two hex digits.
                 const x = unhex(c2);
-                const e3 = try nextRune(t);
+                const e3 = try p.nextRune(t);
                 t = e3.rest;
                 const y = unhex(e3.r);
-                if (x < 0 or y < 0) return error.InvalidEscape;
+                if (x < 0 or y < 0) return p.fail(error.InvalidEscape, s[0 .. s.len - t.len]);
                 return .{ .r = @intCast(x * 16 + y), .rest = t };
             },
             // C escapes (no \b here — that is the word boundary in Perl mode).
@@ -1228,18 +1278,20 @@ const Parser = struct {
                     // Escaped non-word ASCII characters are themselves.
                     return .{ .r = c, .rest = t };
                 }
-                return error.InvalidEscape;
+                return p.fail(error.InvalidEscape, s[0 .. s.len - t.len]);
             },
         }
     }
 
     // --- character classes ---
 
-    fn parseClassChar(p: *Parser, s: []const u8) !RuneRest {
-        if (s.len == 0) return error.MissingBracket;
+    /// `whole_class` is the class text from its `[` on (Go's `wholeClass`),
+    /// the fragment reported for a missing `]`.
+    fn parseClassChar(p: *Parser, s: []const u8, whole_class: []const u8) !RuneRest {
+        if (s.len == 0) return p.fail(error.MissingBracket, whole_class);
         // Allow regular escape sequences inside a class.
         if (s[0] == '\\') return p.parseEscape(s);
-        return nextRune(s);
+        return p.nextRune(s);
     }
 
     fn parseClass(p: *Parser, s: []const u8) ![]const u8 {
@@ -1262,7 +1314,7 @@ const Parser = struct {
         while (t.len == 0 or t[0] != ']' or first) {
             // POSIX: '-' is only allowed unescaped as first or last in class.
             if (t.len > 0 and t[0] == '-' and (p.flags & ast.PerlX == 0) and !first and (t.len == 1 or t[1] != ']')) {
-                return error.InvalidCharRange;
+                return p.fail(error.InvalidCharRange, t[0 .. 1 + runeWidth(t[1..])]);
             }
             first = false;
 
@@ -1285,16 +1337,17 @@ const Parser = struct {
             }
 
             // Single character or range.
-            const lc = try p.parseClassChar(t);
+            const rng = t;
+            const lc = try p.parseClassChar(t, s);
             const lo = lc.r;
             t = lc.rest;
             var hi = lo;
             if (t.len >= 2 and t[0] == '-' and t[1] != ']') {
                 t = t[1..];
-                const hc = try p.parseClassChar(t);
+                const hc = try p.parseClassChar(t, s);
                 hi = hc.r;
                 t = hc.rest;
-                if (hi < lo) return error.InvalidCharRange;
+                if (hi < lo) return p.fail(error.InvalidCharRange, rng[0 .. rng.len - t.len]);
             }
             if (p.flags & ast.FoldCase == 0) {
                 try appendRange(p.al, &class, lo, hi);
@@ -1317,7 +1370,7 @@ const Parser = struct {
         const i = idx + 2;
         const name = s[0 .. i + 2];
         const rest = s[i + 2 ..];
-        const g = posixGroup(name) orelse return error.InvalidCharRange;
+        const g = posixGroup(name) orelse return p.fail(error.InvalidCharRange, name);
         try p.appendGroup(class, g);
         return rest;
     }
@@ -1334,27 +1387,29 @@ const Parser = struct {
 
         var sign: i32 = if (s[1] == 'P') -1 else 1;
         var t = s[2..];
-        const nr = try nextRune(t);
+        const nr = try p.nextRune(t);
         const c = nr.r;
         t = nr.rest;
         var name: []const u8 = undefined;
+        var seq: []const u8 = undefined; // the whole \p... sequence
         if (c != '{') {
-            const seq = s[0 .. s.len - t.len];
+            seq = s[0 .. s.len - t.len];
             name = seq[2..];
         } else {
             const end = std.mem.indexOfScalar(u8, s, '}') orelse {
-                try checkUTF8(s);
-                return error.InvalidCharRange;
+                try p.checkUTF8(s);
+                return p.fail(error.InvalidCharRange, s);
             };
+            seq = s[0 .. end + 1];
             t = s[end + 1 ..];
             name = s[3..end];
-            try checkUTF8(name);
+            try p.checkUTF8(name);
         }
         if (name.len > 0 and name[0] == '^') {
             sign = -sign;
             name = name[1..];
         }
-        const tr = (try unicode.unicodeTable(p.al, name)) orelse return error.InvalidCharRange;
+        const tr = (try unicode.unicodeTable(p.al, name)) orelse return p.fail(error.InvalidCharRange, seq);
         if (tr.sign < 0) sign = -sign;
 
         if (p.flags & ast.FoldCase == 0 or tr.fold == null) {
@@ -1634,20 +1689,14 @@ fn repeatIsValid(re: *const Regexp, n: i32) bool {
 
 // --- small scanning helpers ---
 
-fn nextRune(s: []const u8) ParseError!RuneRest {
-    if (s.len == 0) return .{ .r = 0xFFFD, .rest = s };
-    const n = std.unicode.utf8ByteSequenceLength(s[0]) catch return error.InvalidUTF8;
-    if (n > s.len) return error.InvalidUTF8;
-    const r = std.unicode.utf8Decode(s[0..n]) catch return error.InvalidUTF8;
-    return .{ .r = r, .rest = s[n..] };
-}
-
-fn checkUTF8(s0: []const u8) ParseError!void {
-    var s = s0;
-    while (s.len != 0) {
-        const nr = try nextRune(s);
-        s = nr.rest;
-    }
+/// The `size` Go's `utf8.DecodeRuneInString(s)` reports: 0 for "", 1 for
+/// an invalid or truncated sequence, else the encoded rune's length.
+fn runeWidth(s: []const u8) usize {
+    if (s.len == 0) return 0;
+    const n = std.unicode.utf8ByteSequenceLength(s[0]) catch return 1;
+    if (n > s.len) return 1;
+    _ = std.unicode.utf8Decode(s[0..n]) catch return 1;
+    return n;
 }
 
 fn isalnum(c: u21) bool {

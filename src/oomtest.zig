@@ -42,6 +42,31 @@ test "OOM: compilation" {
     }
 }
 
+/// `compileDiagnostic` on a pattern that fails to parse after allocating:
+/// every allocation failure reports OutOfMemory (with no fragment), and
+/// the parse error itself its fragment; nothing leaks either way.
+fn compileDiagnosticFails(allocator: std.mem.Allocator, pattern: []const u8, want: regex.ParseError, frag: []const u8) !void {
+    var diag: regex.Diagnostic = .{};
+    if (regex.compileDiagnostic(allocator, pattern, &diag)) |compiled| {
+        var re = compiled;
+        re.deinit();
+        return error.TestUnexpectedSuccess;
+    } else |err| {
+        try std.testing.expectEqual(err, diag.err.?);
+        if (err == error.OutOfMemory) {
+            try std.testing.expectEqualStrings("", diag.expr);
+            return error.OutOfMemory;
+        }
+        try std.testing.expectEqual(want, err);
+        try std.testing.expectEqualStrings(frag, diag.expr);
+    }
+}
+
+test "OOM: compileDiagnostic" {
+    try checkAllocationFailures(compileDiagnosticFails, .{ "(a|b)[c-d]+[z-a]", error.InvalidCharRange, "z-a" });
+    try checkAllocationFailures(compileDiagnosticFails, .{ "(?i)\\p{Lu}(x", error.MissingParen, "(?i)\\p{Lu}(x" });
+}
+
 fn upper(_: void, al: std.mem.Allocator, out: *std.ArrayList(u8), m: []const u8) regex.ExecError!void {
     const tmp = try std.ascii.allocUpperString(al, m);
     defer al.free(tmp);

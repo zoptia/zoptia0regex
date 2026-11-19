@@ -158,6 +158,16 @@ fn inRanges(r: u21, ranges: []const URange) bool {
     return false;
 }
 
+/// Go's `unicode.IsPrint` (and `strconv.IsPrint`): letters, marks,
+/// numbers, punctuation, symbols (categories L, M, N, P, S) and U+0020.
+pub fn isPrint(r: u21) bool {
+    if (r < 0x80) return r >= 0x20 and r < 0x7F;
+    inline for (.{ "L", "M", "N", "P", "S" }) |cat| {
+        if (inRanges(r, comptime classRanges(cat))) return true;
+    }
+    return false;
+}
+
 /// Reports whether r is a Unicode letter (category L) or decimal digit (Nd),
 /// matching `unicode.IsLetter(r) || unicode.IsDigit(r)` used by Go's `extract`
 /// for `$name` / `${name}` template parsing.

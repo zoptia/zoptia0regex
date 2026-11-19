@@ -8,10 +8,16 @@
 //	mode  omitted for Perl (regexp.Compile), "longest" (Compile + Longest)
 //	      or "posix" (CompilePOSIX)
 //	err   Go's syntax.ErrorCode text when compilation fails, else omitted
+//	ee    the failing compile's syntax.Error.Expr (the offending fragment
+//	      of p), omitted when empty or longer than MaxInline
+//	eeh   for a longer fragment instead of ee: its "LEN:HEX" hash (see lph)
+//	msg   the failing compile's MustCompile (MustCompilePOSIX for the
+//	      posix mode) panic message, omitted when longer than MaxInline
+//	msgh  for a longer message instead of msg: its "LEN:HEX" hash
 //	ni    len(prog.Inst) of syntax.Compile(syntax.Parse(p, flags).Simplify()),
 //	      flags being syntax.Perl or syntax.POSIX as the mode compiles with
 //	lp    LiteralPrefix() prefix, omitted when empty or longer than
-//	      MaxInlinePrefix
+//	      MaxInline
 //	lph   for longer prefixes instead of lp: the prefix's length and
 //	      64-bit FNV-1a hash, as "LEN:HEX" (a limit pattern's prefix can
 //	      be megabytes)
@@ -27,7 +33,7 @@
 //	repl  ReplaceAllString(i, t)
 //	split Split(i, n)
 //
-// Byte strings (p, lp, i, t, repl, split elements) are JSON strings when they
+// Byte strings (p, ee, msg, lp, i, t, repl, split elements) are JSON strings when they
 // are valid UTF-8 and arrays of byte values otherwise, so malformed UTF-8
 // survives the round trip. The last line of every corpus is a trailer
 // {"count":N} giving the number of case lines before it; the Zig drivers
@@ -44,6 +50,7 @@ import (
 	"regexp"
 	"regexp/syntax"
 	"slices"
+	"strings"
 	"unicode/utf8"
 
 	"zoptia0regex/tools/internal/gen"
@@ -53,8 +60,20 @@ import (
 // port's src/limitstest.zig, which builds them at run time.
 const MaxPatternLen = 16 << 10
 
-// MaxInlinePrefix is the longest literal prefix recorded verbatim.
-const MaxInlinePrefix = 1024
+// MaxInline is the longest literal prefix, error fragment or panic message
+// recorded verbatim; longer ones are recorded as a length and hash.
+const MaxInline = 1024
+
+// inlineOrHash returns s for a verbatim field when it is at most MaxInline
+// bytes long, and otherwise its "LEN:HEX" length and FNV-1a-64 hash.
+func inlineOrHash(s string) (Bytes, string) {
+	if len(s) <= MaxInline {
+		return Bytes(s), ""
+	}
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return "", fmt.Sprintf("%d:%016x", len(s), h.Sum64())
+}
 
 // Bytes is a byte string that marshals as a JSON string when it is valid
 // UTF-8 and as an array of byte values otherwise.
@@ -120,6 +139,10 @@ type Case struct {
 	P    Bytes  `json:"p"`
 	Mode Mode   `json:"mode,omitempty"`
 	Err  string `json:"err,omitempty"`
+	EE   Bytes  `json:"ee,omitempty"`
+	EEH  string `json:"eeh,omitempty"`
+	Msg  Bytes  `json:"msg,omitempty"`
+	MsgH string `json:"msgh,omitempty"`
 	NI   int    `json:"ni,omitempty"`
 	LP   Bytes  `json:"lp,omitempty"`
 	LPH  string `json:"lph,omitempty"`
@@ -145,19 +168,41 @@ type Compiled struct {
 	Mode Mode
 	Re   *regexp.Regexp // nil when compilation failed
 	Err  string         // syntax.ErrorCode text, or "" on success
+	EE   string         // syntax.Error.Expr of a failed compile
+	Msg  string         // MustCompile / MustCompilePOSIX panic message
 	NI   int
 	LP   string
 	LPC  bool
 }
 
-// ErrorCode returns the syntax.ErrorCode text of a compile error, aborting
-// the generator if err is not a *syntax.Error.
-func ErrorCode(err error) string {
+// SyntaxError returns the *syntax.Error of a compile error, aborting the
+// generator if err is not one.
+func SyntaxError(err error) *syntax.Error {
 	var se *syntax.Error
 	if !errors.As(err, &se) {
 		gen.Fatalf("unexpected non-syntax error %T: %v", err, err)
 	}
-	return string(se.Code)
+	return se
+}
+
+// mustPanic returns the value MustCompile (or MustCompilePOSIX) panics with
+// for p, or "" when it does not panic.
+func mustPanic(p string, mode Mode) (msg string) {
+	defer func() {
+		if r := recover(); r != nil {
+			s, ok := r.(string)
+			if !ok {
+				gen.Fatalf("%q: MustCompile panicked with %T", p, r)
+			}
+			msg = s
+		}
+	}()
+	if mode == POSIX {
+		regexp.MustCompilePOSIX(p)
+	} else {
+		regexp.MustCompile(p)
+	}
+	return ""
 }
 
 // Compile compiles p in mode the way the regexp package does and records
@@ -183,9 +228,18 @@ func Compile(p string, mode Mode) *Compiled {
 	}
 	sre, perr := syntax.Parse(p, flags)
 	if err != nil {
-		c.Err = ErrorCode(err)
-		if perr == nil || ErrorCode(perr) != c.Err {
-			gen.Fatalf("%q (%v): regexp error %q, syntax.Parse error %v", p, mode, c.Err, perr)
+		se := SyntaxError(err)
+		c.Err, c.EE = string(se.Code), se.Expr
+		if perr == nil || *SyntaxError(perr) != *se {
+			gen.Fatalf("%q (%v): regexp error %v, syntax.Parse error %v", p, mode, err, perr)
+		}
+		// The drivers rebuild Error() from the code and fragment.
+		if want := "error parsing regexp: " + c.Err + ": `" + c.EE + "`"; err.Error() != want {
+			gen.Fatalf("%q: Error() %q is not %q", p, err.Error(), want)
+		}
+		c.Msg = mustPanic(p, mode)
+		if !strings.HasSuffix(c.Msg, "): "+err.Error()) {
+			gen.Fatalf("%q: MustCompile panic %q does not end in the error", p, c.Msg)
 		}
 		return c
 	}
@@ -210,14 +264,10 @@ func Compile(p string, mode Mode) *Compiled {
 // to compile it records the error with an empty input.
 func (c *Compiled) Case(input string) Case {
 	out := Case{P: Bytes(c.P), Mode: c.Mode, Err: c.Err, NI: c.NI, LPC: c.LPC}
-	if len(c.LP) > MaxInlinePrefix {
-		h := fnv.New64a()
-		h.Write([]byte(c.LP))
-		out.LPH = fmt.Sprintf("%d:%016x", len(c.LP), h.Sum64())
-	} else {
-		out.LP = Bytes(c.LP)
-	}
+	out.LP, out.LPH = inlineOrHash(c.LP)
 	if c.Re == nil {
+		out.EE, out.EEH = inlineOrHash(c.EE)
+		out.Msg, out.MsgH = inlineOrHash(c.Msg)
 		return out
 	}
 	out.I = Bytes(input)

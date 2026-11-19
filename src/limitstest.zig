@@ -61,11 +61,23 @@ fn expectOk(parts: []const Part, mode: Mode, ni: usize) !void {
 fn expectErr(parts: []const Part, mode: Mode, want: parse.ParseError) !void {
     const pattern = try build(parts);
     defer ta.free(pattern);
-    if (compileMode(pattern, mode)) |compiled| {
+    var diag: regex.Diagnostic = .{};
+    const result = switch (mode) {
+        .perl => regex.compileDiagnostic(ta, pattern, &diag),
+        .posix => regex.compilePOSIXDiagnostic(ta, pattern, &diag),
+    };
+    if (result) |compiled| {
         var re = compiled;
         re.deinit();
         return error.TestExpectedError;
     } else |err| try std.testing.expectEqual(want, err);
+    try std.testing.expectEqual(@as(?parse.ParseError, want), diag.err);
+    if (want == error.TooLarge or want == error.NestingDepth) {
+        // Go recovers these from a panic with Expr set to the whole
+        // pattern (the caller's bytes, not a copy).
+        try std.testing.expectEqual(pattern.ptr, diag.expr.ptr);
+        try std.testing.expectEqual(pattern.len, diag.expr.len);
+    }
 }
 
 /// Parse only (Perl flags); for accepted patterns too large to compile

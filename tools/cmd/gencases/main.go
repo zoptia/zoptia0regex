@@ -1,7 +1,8 @@
 // Command gencases generates test/data/cases.jsonl, the curated
 // differential corpus: hand-picked patterns run on hand-picked inputs, Go's
-// own invalid / Perl-only / POSIX-only parser test lists in both syntaxes,
-// and the parser resource-limit boundaries. Run via tools/regen.sh.
+// own invalid / Perl-only / POSIX-only parser test lists and patterns for
+// every parse error site, in both syntaxes, and the parser resource-limit
+// boundaries. Run via tools/regen.sh.
 package main
 
 import (
@@ -182,6 +183,64 @@ var onlyPOSIX = []string{
 // rune-budget pattern.
 var badRe = []string{`*`, `+`, `?`, `(abc`, `abc)`, `x[a-z`, `[z-a]`, `abc\`, `a**`, `a*+`, `\x`}
 
+// errorSites hit every &Error{...} construction in Go 1.27.1's
+// regexp/syntax/parse.go (and the recovered ErrLarge / ErrNestingDepth
+// panics, via limitPatterns) at least once, in both syntaxes where
+// reachable, so the drivers compare Go's Error.Expr fragment for each. The
+// comments name the parse.go function and the fragment Go reports.
+var errorSites = []string{
+	// repeat: ErrInvalidRepeatOp, lastRepeat up to the end of this operator
+	// (Perl only; POSIX accepts stacked operators).
+	`a**`, `a*?*`, `a**?`, `a{2}{3}`, `a+{2}?`, `x*?+`,
+	// repeat: ErrMissingRepeatArgument, empty stack; the operator.
+	`*`, `*?`, `{2}`, `{2,3}?`, `(?i)+`,
+	// repeat: ErrMissingRepeatArgument, pseudo-op on top; the operator.
+	`(*)`, `a|*`, `(?:+`, `x|{2}`, `(??)`,
+	// repeat: ErrInvalidRepeatSize from repeatIsValid; the operator.
+	`(a{500}){3}`, `(?:(?:a{10}){10}){11}`, `((a{2}){2}){1000}`,
+	// parse: ErrInvalidRepeatSize from the bounds check; the {...} text.
+	`a{1001}`, `a{2,1}`, `a{1000,1001}`, `a{1,100000000}`, `a{100000000}`,
+	// parse: \C (Perl); the two bytes. POSIX reports the escape instead.
+	`\C`, `a\Cb`,
+	// parse: \Q...\E body with invalid UTF-8 (nextRune); from the bad byte.
+	"\\Q\xff\\E", "\\Qab\xffc",
+	// parse: ErrMissingParen; the whole pattern.
+	`(`, `a(b`, `((a)`, `(?:a`, `(?i:a`,
+	// parsePerlFlags: ErrInvalidNamedCapture without '>'; from "(?" on.
+	`x(?P<name`, `(?<n`, "(?P<a\xffb",
+	// parsePerlFlags: ErrInvalidNamedCapture, bad name; "(?P<name>".
+	`(?P<x y>a)`, `(?<>a)`, `(?P<1-2>a)`, "(?P<\xff>a)", `x(?<a!>)`,
+	// parsePerlFlags: ErrInvalidPerlOp; from "(?" up to the bad rune.
+	`(?z)`, `(?i-)`, `(?--i)`, `(?i`, `(?`, `(?-)`, `(?i-s`, `(?P=name)`,
+	`(?P>x)`, `(?#comment)`, "(?i\xff)", "(?\xff)",
+	// parseRightParen: ErrUnexpectedParen; the whole pattern.
+	`)`, `a)`, `(a))`, `a|b)`, `(?i))`, `x(?:a)|b)`,
+	// parseEscape: ErrTrailingBackslash; the empty string.
+	`\`, `abc\`, `[a\`, `[a-\`,
+	// parseEscape: invalid UTF-8 after the backslash (nextRune).
+	"\\\xff", "\\x\xff", "\\x{\xff}", "\\x1\xff", "[\\\xff]", "\\x{1\xff",
+	// parseEscape: ErrInvalidEscape; the escape up to where it went wrong.
+	`\8`, `\1`, `\9`, `\x`, `\xz`, `\x1`, `\xg1`, `\x{`, `\x{}`, `\x{zz}`,
+	`\x{110000}`, `\x{1`, `\q`, `\é`, `[\8]`, `[a-\q]`, `\Z`, `a\8b`,
+	// parseClassChar: ErrMissingBracket; the class from its '['.
+	`[`, `[a`, `x[a-z`, `[^`, `[]`, `[^]`, `[a-`, `[\d`, `[[:alpha:]`,
+	// parseNamedClass: ErrInvalidCharRange; the "[:name:]" text.
+	`[[:foo:]]`, `[[:^foo:]]`, `x[[:wor:]]`,
+	// parseUnicodeClass: unterminated \p{; from the backslash on (after a
+	// checkUTF8 of that text).
+	`\p{L`, `[\p{L`, "\\p{L\xff", `\P{`,
+	// parseUnicodeClass: invalid UTF-8 in the name or after \p.
+	"\\p{\xff}", "\\p\xff",
+	// parseUnicodeClass: unknown table; the \p sequence.
+	`\pX`, `\p{Foo}`, `[\PZ]`, `\p{^}`, `\p`, `[\p]`, `\p{}`,
+	// parseClass: POSIX '-' after a range; '-' and the next rune.
+	`[a-b-c]`, `[a-b-`, `[a-b-日]`, "[a-b-\xff]",
+	// parseClass: reversed range; lo-hi as written.
+	`[z-a]`, `[a-\x00]`, `[\x{10}-\x{5}]`, `x[b-a]y`, `[\d-a-\x01]`,
+	// checkUTF8 / nextRune elsewhere; from the bad byte.
+	"\xff", "a\xff", "a\xe6\x97", "\xed\xa0\x80", "[\xff]", "[a-\xff]", "a\xffb(",
+}
+
 // parserInputs are run on every valid pattern of the parser lists.
 var parserInputs = []string{"", "a", "aa", "abc", "x", "xxxx", "*+?{[", `\E`}
 
@@ -238,6 +297,7 @@ func main() {
 	parserLists = append(parserLists, onlyPerl...)
 	parserLists = append(parserLists, onlyPOSIX...)
 	parserLists = append(parserLists, badRe...)
+	parserLists = append(parserLists, errorSites...)
 	for _, p := range parserLists {
 		for _, mode := range []corpus.Mode{corpus.Perl, corpus.POSIX} {
 			c := corpus.Compile(p, mode)

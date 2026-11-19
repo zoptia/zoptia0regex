@@ -7,7 +7,10 @@
 //! with the port in the same mode and requires, exactly as Go recorded:
 //!
 //! - the compile outcome, and for a failure Go's `syntax.ErrorCode` text
-//!   (an `OutOfMemory` is never "the same error as Go" and fails the run);
+//!   (an `OutOfMemory` is never "the same error as Go" and fails the run),
+//!   Go's `syntax.Error.Expr` fragment against `Diagnostic.expr`, and Go's
+//!   `MustCompile` / `MustCompilePOSIX` panic message (which embeds
+//!   `Error()`) against the port's `CompileFailure` text;
 //! - `ni`, the compiled program's instruction count (AST and program shape),
 //!   mandatory for every accepted pattern;
 //! - `literalPrefix()` (prefix bytes and the complete flag);
@@ -31,6 +34,12 @@ pub const Case = struct {
     p: []const u8,
     mode: Mode = .perl,
     err: []const u8 = "",
+    /// Go's `Error.Expr`, or "LEN:HEX" in `eeh` when long (see `lph`).
+    ee: []const u8 = "",
+    eeh: []const u8 = "",
+    /// Go's `MustCompile` panic message, or "LEN:HEX" in `msgh` when long.
+    msg: []const u8 = "",
+    msgh: []const u8 = "",
     ni: usize = 0,
     lp: []const u8 = "",
     /// "LEN:HEX" length and FNV-1a-64 of a literal prefix too long for `lp`.
@@ -68,6 +77,8 @@ const Kind = enum {
     compile_ok, // Go errored, the port compiled
     compile_err, // Go compiled, the port errored
     err_code,
+    err_expr,
+    err_msg,
     ni_missing,
     ni,
     literal_prefix,
@@ -87,15 +98,17 @@ const Kind = enum {
 const Compiled = struct {
     pattern: []u8,
     mode: Mode,
-    result: union(enum) { ok: regex.Regexp, err: regex.ParseError },
+    /// On failure, the diagnostic, whose `expr` points into `pattern`.
+    result: union(enum) { ok: regex.Regexp, err: regex.Diagnostic },
     scratch: regex.Scratch,
 
     fn init(gpa: std.mem.Allocator, pattern: []const u8, mode: Mode) !Compiled {
         const owned = try gpa.dupe(u8, pattern);
         errdefer gpa.free(owned);
+        var diag: regex.Diagnostic = .{};
         const compiled = switch (mode) {
-            .perl, .longest => regex.compile(gpa, owned),
-            .posix => regex.compilePOSIX(gpa, owned),
+            .perl, .longest => regex.compileDiagnostic(gpa, owned, &diag),
+            .posix => regex.compilePOSIXDiagnostic(gpa, owned, &diag),
         };
         var c: Compiled = .{
             .pattern = owned,
@@ -108,9 +121,21 @@ const Compiled = struct {
             if (mode == .longest) c.result.ok.setLongest();
         } else |err| {
             if (err == error.OutOfMemory) return err;
-            c.result = .{ .err = err };
+            std.debug.assert(diag.err.? == err);
+            c.result = .{ .err = diag };
         }
         return c;
+    }
+
+    /// The port's `mustCompile` / `mustCompilePOSIX` panic message for a
+    /// failed compile. Caller frees.
+    fn panicMessage(c: *const Compiled, gpa: std.mem.Allocator) ![]u8 {
+        const failure: regex.CompileFailure = .{
+            .func = if (c.mode == .posix) "CompilePOSIX" else "Compile",
+            .expr = c.pattern,
+            .diag = c.result.err,
+        };
+        return std.fmt.allocPrint(gpa, "{f}", .{failure});
     }
 
     fn deinit(c: *Compiled, gpa: std.mem.Allocator) void {
@@ -195,12 +220,13 @@ fn report(kind: Kind, c: Case) void {
     const max = 120;
     const p = c.p[0..@min(c.p.len, max)];
     const ellipsis = if (c.p.len > max) "..." else "";
-    std.debug.print("MISMATCH[{s}] mode={s} /{f}{s}/ input=\"{f}\"\n   go: err=\"{s}\" ni={d} lp=\"{f}\" lpc={} m={?any}\n", .{
-        @tagName(kind),         @tagName(c.mode),
-        std.zig.fmtString(p),   ellipsis,
-        std.zig.fmtString(c.i), c.err,
-        c.ni,                   std.zig.fmtString(c.lp[0..@min(c.lp.len, max)]),
-        c.lpc,                  c.m,
+    std.debug.print("MISMATCH[{s}] mode={s} /{f}{s}/ input=\"{f}\"\n   go: err=\"{s}\" ee=\"{f}\" ni={d} lp=\"{f}\" lpc={} m={?any}\n", .{
+        @tagName(kind),                                  @tagName(c.mode),
+        std.zig.fmtString(p),                            ellipsis,
+        std.zig.fmtString(c.i),                          c.err,
+        std.zig.fmtString(c.ee[0..@min(c.ee.len, max)]), c.ni,
+        std.zig.fmtString(c.lp[0..@min(c.lp.len, max)]), c.lpc,
+        c.m,
     });
 }
 
@@ -209,26 +235,33 @@ fn eqOptInts(want: ?[]const i64, got: ?[]const i64) bool {
     return std.mem.eql(i64, want.?, got.?);
 }
 
-/// Compares the port's literal prefix with the recorded one (verbatim, or
-/// by length and FNV-1a-64 for long prefixes).
-fn eqPrefix(c: Case, prefix: []const u8) !bool {
-    if (c.lph.len == 0) return std.mem.eql(u8, c.lp, prefix);
-    const colon = std.mem.indexOfScalar(u8, c.lph, ':') orelse return error.BadLiteralPrefixHash;
-    const len = try std.fmt.parseInt(usize, c.lph[0..colon], 10);
-    const hash = try std.fmt.parseInt(u64, c.lph[colon + 1 ..], 16);
-    return prefix.len == len and std.hash.Fnv1a_64.hash(prefix) == hash;
+/// Compares a byte string with a recorded field: verbatim (`want`), or,
+/// when `want_hash` is set, by its "LEN:HEX" length and FNV-1a-64 hash
+/// (the generators' form for long values).
+fn eqRecorded(want: []const u8, want_hash: []const u8, got: []const u8) !bool {
+    if (want_hash.len == 0) return std.mem.eql(u8, want, got);
+    const colon = std.mem.indexOfScalar(u8, want_hash, ':') orelse return error.BadRecordedHash;
+    const len = try std.fmt.parseInt(usize, want_hash[0..colon], 10);
+    const hash = try std.fmt.parseInt(u64, want_hash[colon + 1 ..], 16);
+    return got.len == len and std.hash.Fnv1a_64.hash(got) == hash;
 }
 
 /// Returns the first disagreement with Go, or null when the case passes.
 /// Allocation failures propagate and fail the run.
 fn checkCase(gpa: std.mem.Allocator, compiled: *Compiled, c: Case, require_all: bool) !?Kind {
     const re: *regex.Regexp = switch (compiled.result) {
-        .err => |err| {
+        .err => |diag| {
             if (c.err.len == 0) return .compile_err;
             // Running out of memory is a harness failure, never "errored
-            // like Go"; every other error must carry Go's ErrorCode text.
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            return if (std.mem.eql(u8, regex.errorString(err), c.err)) null else .err_code;
+            // like Go" (Compiled.init propagates it); every other error must
+            // carry Go's ErrorCode text, Error.Expr and MustCompile message.
+            if (!std.mem.eql(u8, regex.errorString(diag.err.?), c.err)) return .err_code;
+            if (!try eqRecorded(c.ee, c.eeh, diag.expr)) return .err_expr;
+            const msg = try compiled.panicMessage(gpa);
+            defer gpa.free(msg);
+            if (c.msg.len == 0 and c.msgh.len == 0) return .err_msg; // not recorded
+            if (!try eqRecorded(c.msg, c.msgh, msg)) return .err_msg;
+            return null;
         },
         .ok => |*re| re,
     };
@@ -240,7 +273,7 @@ fn checkCase(gpa: std.mem.Allocator, compiled: *Compiled, c: Case, require_all: 
     if (re.prog.insts.len != c.ni) return .ni;
 
     const lp = re.literalPrefix();
-    if (!try eqPrefix(c, lp.prefix) or lp.complete != c.lpc) return .literal_prefix;
+    if (!try eqRecorded(c.lp, c.lph, lp.prefix) or lp.complete != c.lpc) return .literal_prefix;
 
     {
         const got = try re.findSubmatchIndex(gpa, c.i);

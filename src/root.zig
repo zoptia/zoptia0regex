@@ -15,8 +15,14 @@ pub const ParseError = regexp.ParseError;
 pub const ExecError = regexp.ExecError;
 pub const LiteralPrefix = regexp.LiteralPrefix;
 
+pub const Diagnostic = regexp.Diagnostic;
+pub const CompileFailure = regexp.CompileFailure;
+
 pub const compile = regexp.compile;
 pub const compilePOSIX = regexp.compilePOSIX;
+/// `compile` that also reports Go's offending fragment (`Diagnostic`).
+pub const compileDiagnostic = regexp.compileDiagnostic;
+pub const compilePOSIXDiagnostic = regexp.compilePOSIXDiagnostic;
 pub const mustCompile = regexp.mustCompile;
 pub const mustCompilePOSIX = regexp.mustCompilePOSIX;
 /// Go's package-level `regexp.MatchString`: compile, match once, free.

@@ -791,7 +791,27 @@ fn isLetterDigitUnderscore(r: u21) bool {
 
 // --- compilation ---
 
-fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, longest: bool) ParseError!Regexp {
+fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, longest: bool, diag: ?*Diagnostic) ParseError!Regexp {
+    if (diag) |d| d.* = .{};
+    var frag: ?[]const u8 = null;
+    return build(gpa, expr, mode, longest, &frag) catch |err| {
+        if (diag) |d| d.* = .{
+            .err = err,
+            .expr = switch (err) {
+                error.OutOfMemory => "",
+                // The parser's limit errors carry the whole pattern; so do
+                // the port-only guards in compile.zig, which Go lacks.
+                error.TooLarge, error.NestingDepth => frag orelse expr,
+                else => frag.?,
+            },
+        };
+        return err;
+    };
+}
+
+/// `compileInternal` proper. On a parse error, sets `frag` to Go's
+/// `Error.Expr` as a sub-slice of `expr`.
+fn build(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, longest: bool, frag: *?[]const u8) ParseError!Regexp {
     const arena = try gpa.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(gpa);
     errdefer {
@@ -801,7 +821,13 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
     const al = arena.allocator();
 
     const expr_owned = try al.dupe(u8, expr);
-    const re_ast = try parse.parse(al, expr_owned, mode);
+    var owned_frag: []const u8 = "";
+    const re_ast = parse.parseDiagnostic(al, expr_owned, mode, &owned_frag) catch |err| {
+        // The parser reports a sub-slice of the arena copy it parsed; map
+        // it back onto the caller's `expr`.
+        frag.* = callerSlice(expr, expr_owned, owned_frag);
+        return err;
+    };
     const max_cap = re_ast.maxCap();
 
     const names = try al.alloc([]const u8, @intCast(max_cap + 1));
@@ -865,6 +891,15 @@ fn compileInternal(gpa: std.mem.Allocator, expr: []const u8, mode: ast.Flags, lo
             },
         },
     };
+}
+
+/// The part of `expr` that `frag`, a sub-slice of `copy` (an identical copy
+/// of `expr`), covers; "" stays "".
+fn callerSlice(expr: []const u8, copy: []const u8, frag: []const u8) []const u8 {
+    if (frag.len == 0) return "";
+    const off = @intFromPtr(frag.ptr) - @intFromPtr(copy.ptr);
+    std.debug.assert(off + frag.len <= copy.len and copy.len == expr.len);
+    return expr[off..][0..frag.len];
 }
 
 /// Max size of the accelerated first-byte set (the SIMD scan in search.zig
@@ -946,42 +981,87 @@ fn firstBytes(gpa: std.mem.Allocator, al: std.mem.Allocator, p: *const prog.Prog
 
 /// Compile `expr` with Perl (leftmost-first) semantics.
 pub fn compile(gpa: std.mem.Allocator, expr: []const u8) ParseError!Regexp {
-    return compileInternal(gpa, expr, ast.Perl, false);
+    return compileInternal(gpa, expr, ast.Perl, false, null);
 }
 
 /// Compile `expr` with POSIX ERE syntax and leftmost-longest semantics.
 pub fn compilePOSIX(gpa: std.mem.Allocator, expr: []const u8) ParseError!Regexp {
-    return compileInternal(gpa, expr, ast.POSIX, true);
+    return compileInternal(gpa, expr, ast.POSIX, true, null);
 }
 
+/// Like `compile`, and on failure also describes the error in `diag` the
+/// way Go's `*syntax.Error` does (see `Diagnostic`). `diag` is reset on
+/// success. Allocates nothing beyond what `compile` does.
+pub fn compileDiagnostic(gpa: std.mem.Allocator, expr: []const u8, diag: *Diagnostic) ParseError!Regexp {
+    return compileInternal(gpa, expr, ast.Perl, false, diag);
+}
+
+/// `compilePOSIX` with a `Diagnostic`; see `compileDiagnostic`.
+pub fn compilePOSIXDiagnostic(gpa: std.mem.Allocator, expr: []const u8, diag: *Diagnostic) ParseError!Regexp {
+    return compileInternal(gpa, expr, ast.POSIX, true, diag);
+}
+
+/// What a failed `compileDiagnostic` / `compilePOSIXDiagnostic` reports
+/// besides its error: Go's `*syntax.Error{Code, Expr}`.
+///
+/// `expr` is exactly Go's `Error.Expr`, the offending fragment of the
+/// pattern: the whole pattern (missing or unexpected parenthesis, and the
+/// size and nesting limits), the text from a bad byte to the end (invalid
+/// UTF-8), an escape sequence (`\x{zz`), a repetition operator (`**`,
+/// `{2,1}`), a class range or name (`z-a`, `[:foo:]`, `\p{Foo}`), a group
+/// opener (`(?P<x y>`, `(?z`), or "" (trailing backslash). It is a
+/// sub-slice of the pattern passed to the compile call (no copy, nothing to
+/// free), so it stays valid as long as that pattern does.
+pub const Diagnostic = struct {
+    /// The compile error, or null after a successful compile.
+    err: ?ParseError = null,
+    /// Go's `Error.Expr` (see above); "" on success and for
+    /// `error.OutOfMemory`, which has no Go counterpart.
+    expr: []const u8 = "",
+
+    /// Writes Go's `(*syntax.Error).Error()` text,
+    /// ``error parsing regexp: <code>: `<expr>` `` (code as in
+    /// `errorString`), with `expr`'s bytes verbatim like Go. Writes
+    /// "out of memory" for `error.OutOfMemory`, nothing after a success.
+    pub fn format(d: Diagnostic, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const err = d.err orelse return;
+        if (err == error.OutOfMemory) return w.writeAll(errorString(err));
+        try w.print("error parsing regexp: {s}: `{s}`", .{ errorString(err), d.expr });
+    }
+};
+
 /// Like `compile` but panics if the pattern cannot be compiled, with Go's
-/// message shape: ``regexp: Compile(`a(`): error parsing regexp: missing
-/// closing )``. Go also appends the offending fragment of the pattern
-/// (``: `a(` ``), which the Zig error set does not carry, so it is omitted.
-/// Running out of memory panics with `...: out of memory` instead.
+/// `MustCompile` message, byte for byte:
+/// ``regexp: Compile(`a(`): error parsing regexp: missing closing ): `a(` ``
+/// (the pattern quoted like Go's `regexp.quote`). Running out of memory
+/// panics with ``regexp: Compile(`a(`): out of memory`` instead.
 pub fn mustCompile(gpa: std.mem.Allocator, expr: []const u8) Regexp {
-    return compile(gpa, expr) catch |e| compilePanic("Compile", expr, e);
+    var diag: Diagnostic = .{};
+    return compileDiagnostic(gpa, expr, &diag) catch compilePanic("Compile", expr, diag);
 }
 
 /// Like `compilePOSIX` but panics if the pattern cannot be compiled (Go's
 /// `MustCompilePOSIX`); see `mustCompile` for the message.
 pub fn mustCompilePOSIX(gpa: std.mem.Allocator, expr: []const u8) Regexp {
-    return compilePOSIX(gpa, expr) catch |e| compilePanic("CompilePOSIX", expr, e);
+    var diag: Diagnostic = .{};
+    return compilePOSIXDiagnostic(gpa, expr, &diag) catch compilePanic("CompilePOSIX", expr, diag);
 }
 
-fn compilePanic(func: []const u8, expr: []const u8, err: ParseError) noreturn {
-    std.debug.panic("{f}", .{CompileFailure{ .func = func, .expr = expr, .err = err }});
+fn compilePanic(func: []const u8, expr: []const u8, diag: Diagnostic) noreturn {
+    std.debug.panic("{f}", .{CompileFailure{ .func = func, .expr = expr, .diag = diag }});
 }
 
-/// The `mustCompile` / `mustCompilePOSIX` panic message.
-const CompileFailure = struct {
+/// The `mustCompile` / `mustCompilePOSIX` panic message,
+/// `"regexp: " + func + "(" + quote(expr) + "): " + err.Error()` in Go.
+/// Public so the differential drivers can compare it with Go's.
+pub const CompileFailure = struct {
+    /// "Compile" or "CompilePOSIX".
     func: []const u8,
     expr: []const u8,
-    err: ParseError,
+    diag: Diagnostic,
 
     pub fn format(f: CompileFailure, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        const what = if (f.err == error.OutOfMemory) "" else "error parsing regexp: ";
-        try w.print("regexp: {s}({f}): {s}{s}", .{ f.func, GoQuote{ .s = f.expr }, what, errorString(f.err) });
+        try w.print("regexp: {s}({f}): {f}", .{ f.func, GoQuote{ .s = f.expr }, f.diag });
     }
 };
 
@@ -1012,9 +1092,9 @@ pub fn errorString(err: ParseError) []const u8 {
 
 /// Formats a pattern the way Go's `regexp.quote` does: in backquotes when
 /// `strconv.CanBackquote` allows, otherwise double-quoted and escaped like
-/// `strconv.Quote`. Used only for panic messages, so non-ASCII runes count
-/// as printable except the C1 controls and U+FEFF, an approximation of
-/// Go's `strconv.IsPrint`.
+/// `strconv.Quote`: runes `unicode.isPrint` (Go's `strconv.IsPrint`)
+/// accepts verbatim, the others as `\a`..`\v`, `\xNN`, `\uNNNN` or
+/// `\UNNNNNNNN`, and invalid bytes as `\xNN`.
 const GoQuote = struct {
     s: []const u8,
 
@@ -1040,9 +1120,15 @@ const GoQuote = struct {
                 '\r' => try w.writeAll("\\r"),
                 '\t' => try w.writeAll("\\t"),
                 0x0B => try w.writeAll("\\v"),
-                0x00...0x06, 0x0E...0x1F, 0x7F => try w.print("\\x{x:0>2}", .{r}),
-                0x80...0x9F, 0xFEFF => try w.print("\\u{x:0>4}", .{r}),
-                else => try w.writeAll(bytes),
+                else => if (unicode.isPrint(r)) {
+                    try w.writeAll(bytes);
+                } else if (r < ' ' or r == 0x7F) {
+                    try w.print("\\x{x:0>2}", .{r});
+                } else if (r < 0x10000) {
+                    try w.print("\\u{x:0>4}", .{r});
+                } else {
+                    try w.print("\\U{x:0>8}", .{r});
+                },
             }
         }
         try w.writeByte('"');
@@ -1084,27 +1170,84 @@ pub fn match(gpa: std.mem.Allocator, pattern: []const u8, input: []const u8) Par
     return re.match(gpa, input);
 }
 
-fn expectCompileFailure(want: []const u8, func: []const u8, expr: []const u8, err: ParseError) !void {
-    var buf: [256]u8 = undefined;
-    const got = try std.fmt.bufPrint(&buf, "{f}", .{CompileFailure{ .func = func, .expr = expr, .err = err }});
+/// Compiles `expr` like `mustCompile` (func "Compile") or
+/// `mustCompilePOSIX`, expecting failure, and compares the panic message
+/// it would raise with `want`.
+fn expectCompileFailure(want: []const u8, func: []const u8, expr: []const u8) !void {
+    var diag: Diagnostic = .{};
+    const posix = std.mem.eql(u8, func, "CompilePOSIX");
+    const result = if (posix) compilePOSIXDiagnostic(std.testing.allocator, expr, &diag) else compileDiagnostic(std.testing.allocator, expr, &diag);
+    if (result) |re| {
+        var r = re;
+        r.deinit();
+        return error.TestUnexpectedSuccess;
+    } else |_| {}
+    var buf: [512]u8 = undefined;
+    const got = try std.fmt.bufPrint(&buf, "{f}", .{CompileFailure{ .func = func, .expr = expr, .diag = diag }});
     try std.testing.expectEqualStrings(want, got);
 }
 
-test "mustCompile panic message follows Go" {
-    // Go: regexp: Compile(`a(`): error parsing regexp: missing closing ): `a(`
-    try expectCompileFailure("regexp: Compile(`a(`): error parsing regexp: missing closing )", "Compile", "a(", error.MissingParen);
-    // Go: regexp: Compile("a`("): error parsing regexp: missing closing ): `a`(`
-    try expectCompileFailure("regexp: Compile(\"a`(\"): error parsing regexp: missing closing )", "Compile", "a`(", error.MissingParen);
-    // Go's strconv.Quote of "\t\n\x00\xff\"\\".
+test "mustCompile panic message is Go's, byte for byte" {
+    // Every expectation is Go 1.27.1's recovered MustCompile /
+    // MustCompilePOSIX panic value for the same pattern.
+    try expectCompileFailure("regexp: Compile(`a(`): error parsing regexp: missing closing ): `a(`", "Compile", "a(");
+    try expectCompileFailure("regexp: CompilePOSIX(`a(`): error parsing regexp: missing closing ): `a(`", "CompilePOSIX", "a(");
+    try expectCompileFailure("regexp: Compile(\"a`(\"): error parsing regexp: missing closing ): `a`(`", "Compile", "a`(");
     try expectCompileFailure(
-        "regexp: CompilePOSIX(\"\\t\\n\\x00\\xff\\\"\\\\\"): error parsing regexp: invalid UTF-8",
+        "regexp: CompilePOSIX(\"\\t\\n\\x00\\xff\\\"\\\\\"): error parsing regexp: invalid UTF-8: `\xff\"\\`",
         "CompilePOSIX",
         "\t\n\x00\xff\"\\",
-        error.InvalidUTF8,
     );
-    // A tab alone still allows backquotes; non-ASCII stays verbatim.
-    try expectCompileFailure("regexp: Compile(`\té(`): error parsing regexp: missing closing )", "Compile", "\té(", error.MissingParen);
-    try expectCompileFailure("regexp: Compile(`x`): out of memory", "Compile", "x", error.OutOfMemory);
+    // A tab alone still allows backquotes; printable non-ASCII stays verbatim.
+    try expectCompileFailure("regexp: Compile(`\té(`): error parsing regexp: missing closing ): `\té(`", "Compile", "\té(");
+    // strconv.Quote's \u / \U escapes for runes strconv.IsPrint rejects.
+    try expectCompileFailure(
+        "regexp: Compile(\"\\x01\\u00ad\\U000e0001\\u2028(\"): error parsing regexp: missing closing ): `\x01\u{ad}\u{e0001}\u{2028}(`",
+        "Compile",
+        "\x01\u{ad}\u{e0001}\u{2028}(",
+    );
+    try expectCompileFailure("regexp: Compile(\"\\ufeff(\"): error parsing regexp: missing closing ): `\u{feff}(`", "Compile", "\u{feff}(");
+    try expectCompileFailure("regexp: Compile(`x**`): error parsing regexp: invalid nested repetition operator: `**`", "Compile", "x**");
+    try expectCompileFailure("regexp: CompilePOSIX(`\\8`): error parsing regexp: invalid escape sequence: `\\8`", "CompilePOSIX", "\\8");
+    try expectCompileFailure("regexp: Compile(`[z-a]`): error parsing regexp: invalid character class range: `z-a`", "Compile", "[z-a]");
+    try expectCompileFailure("regexp: Compile(`abc\\`): error parsing regexp: trailing backslash at end of expression: ``", "Compile", "abc\\");
+    try expectCompileFailure("regexp: Compile(\"a\\xffb\"): error parsing regexp: invalid UTF-8: `\xffb`", "Compile", "a\xffb");
+    try expectCompileFailure("regexp: Compile(`(?P<x y>a)`): error parsing regexp: invalid named capture: `(?P<x y>`", "Compile", "(?P<x y>a)");
+    try expectCompileFailure("regexp: CompilePOSIX(`(?P<x y>a)`): error parsing regexp: missing argument to repetition operator: `?`", "CompilePOSIX", "(?P<x y>a)");
+    try expectCompileFailure("regexp: Compile(`x{2,1}`): error parsing regexp: invalid repeat count: `{2,1}`", "Compile", "x{2,1}");
+    try expectCompileFailure("regexp: Compile(`\\p{Foo}`): error parsing regexp: invalid character class range: `\\p{Foo}`", "Compile", "\\p{Foo}");
+    try expectCompileFailure("regexp: CompilePOSIX(`\\p{Foo}`): error parsing regexp: invalid escape sequence: `\\p`", "CompilePOSIX", "\\p{Foo}");
+    try expectCompileFailure("regexp: CompilePOSIX(`[[:foo:]]`): error parsing regexp: invalid character class range: `[:foo:]`", "CompilePOSIX", "[[:foo:]]");
+    // Out of memory has no Go counterpart.
+    var buf: [64]u8 = undefined;
+    const oom = try std.fmt.bufPrint(&buf, "{f}", .{CompileFailure{ .func = "Compile", .expr = "x", .diag = .{ .err = error.OutOfMemory } }});
+    try std.testing.expectEqualStrings("regexp: Compile(`x`): out of memory", oom);
+}
+
+test "Diagnostic: Go's Error() text, a fragment of the caller's pattern" {
+    const pattern = "a\\x{zz}b";
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidEscape, compileDiagnostic(std.testing.allocator, pattern, &diag));
+    try std.testing.expectEqual(@as(?ParseError, error.InvalidEscape), diag.err);
+    // The fragment points into `pattern` itself, not into a copy.
+    try std.testing.expectEqual(@intFromPtr(pattern.ptr) + 1, @intFromPtr(diag.expr.ptr));
+    try std.testing.expectEqualStrings("\\x{z", diag.expr);
+    var buf: [128]u8 = undefined;
+    // Go: regexp.Compile(`a\x{zz}b`) fails with this Error().
+    try std.testing.expectEqualStrings("error parsing regexp: invalid escape sequence: `\\x{z`", try std.fmt.bufPrint(&buf, "{f}", .{diag}));
+
+    // Success resets it and allocates nothing beyond compile's own needs.
+    var re = try compileDiagnostic(std.testing.allocator, "a+", &diag);
+    defer re.deinit();
+    try std.testing.expectEqual(@as(?ParseError, null), diag.err);
+    try std.testing.expectEqualStrings("", try std.fmt.bufPrint(&buf, "{f}", .{diag}));
+
+    // Out of memory: no fragment.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, compilePOSIXDiagnostic(failing.allocator(), "a(", &diag));
+    try std.testing.expectEqual(@as(?ParseError, error.OutOfMemory), diag.err);
+    try std.testing.expectEqualStrings("", diag.expr);
+    try std.testing.expectEqualStrings("out of memory", try std.fmt.bufPrint(&buf, "{f}", .{diag}));
 }
 
 test "deinit poisons the Regexp against a second deinit" {
