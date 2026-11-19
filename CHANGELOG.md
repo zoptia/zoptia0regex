@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] — 2026-11-19
+
+### Changed
+
+- **Pike VM capture copies are inline.** The Pike VM copies the capture
+  registers for every thread it starts; for the 2 slots of a find-all loop
+  that was a call into libc `memcpy`. Short register sets are now copied
+  inline: the Pike VM find-all rows of the benchmark are 8–13 % faster
+  (`[A-Za-z]+`, `\w+`, `\p{L}+`, the e-mail pattern, the keyword list).
+- **The allocating API's temporary scratch starts on the stack.** A single
+  allocating search (`match`, `find`, `findIndex`, `findSubmatch`, …) gives
+  its temporary `Scratch` a 2 KB stack buffer and falls back to the caller's
+  allocator only beyond that, so a search over a short input usually does
+  no heap allocation: `match` on a 20–60 byte input is 20–35 % faster on
+  the bitstate rows of the Scratch benchmark. Results returned to the caller still come from the caller's
+  allocator.
+
+### Fixed
+
+- **Benchmark tables.** The harnesses reported a single timed batch, and
+  the 0.8.0 tables contained rows inflated by background load (the Scratch
+  table's `email_unanchored`, `alternation` and `charclass_plus` rows, and
+  Go's `literal_hit`). All four harnesses now time five batches at the
+  calibrated iteration count and report the fastest; the tables are
+  regenerated. The compile ratio moved from 0.69× to 0.77× with the new
+  method: the port's compile times are unchanged, Go's were the noisier
+  side.
+
 ## [0.8.0] — 2026-11-19
 
 ### Fixed

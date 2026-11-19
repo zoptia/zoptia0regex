@@ -23,20 +23,33 @@ fn fail(e: anyerror) noreturn {
     std.debug.panic("benchmark operation failed: {s}", .{@errorName(e)});
 }
 
-/// Doubles the iteration count until one batch exceeds the target and
-/// returns ns per call of `f(ctx)`.
+/// Batches timed at the calibrated iteration count. The fastest one is
+/// reported, so a burst of background load cannot inflate a row.
+const batches = 5;
+
+fn timeBatch(io: std.Io, ctx: anytype, comptime f: fn (@TypeOf(ctx)) bool, iters: u64) i128 {
+    const t0 = nowNs(io);
+    var acc: u64 = 0;
+    var i: u64 = 0;
+    while (i < iters) : (i += 1) acc +%= @intFromBool(f(ctx));
+    const ns = nowNs(io) - t0;
+    std.mem.doNotOptimizeAway(acc);
+    return ns;
+}
+
+/// Doubles the iteration count until one batch exceeds the target, times
+/// `batches` batches in all at that count and returns the fastest batch's
+/// ns per call of `f(ctx)`.
 fn calibrate(io: std.Io, ctx: anytype, comptime f: fn (@TypeOf(ctx)) bool) f64 {
     var iters: u64 = 1;
-    while (true) {
-        const t0 = nowNs(io);
-        var acc: u64 = 0;
-        var i: u64 = 0;
-        while (i < iters) : (i += 1) acc +%= @intFromBool(f(ctx));
-        const ns = nowNs(io) - t0;
-        std.mem.doNotOptimizeAway(acc);
-        if (ns > calibrate_ns) return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters));
+    var best = timeBatch(io, ctx, f, iters);
+    while (best <= calibrate_ns) {
         iters *= 2;
+        best = timeBatch(io, ctx, f, iters);
     }
+    var k: usize = 1;
+    while (k < batches) : (k += 1) best = @min(best, timeBatch(io, ctx, f, iters));
+    return @as(f64, @floatFromInt(best)) / @as(f64, @floatFromInt(iters));
 }
 
 const AllocCtx = struct { re: *const regex.Regexp, gpa: std.mem.Allocator, in: []const u8 };

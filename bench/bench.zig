@@ -107,34 +107,58 @@ fn fail(e: anyerror) noreturn {
     std.debug.panic("benchmark operation failed: {s}", .{@errorName(e)});
 }
 
-fn calibrate(io: std.Io, re: *regex.Regexp, op: Op, input: []const u8, arena: *std.heap.ArenaAllocator) f64 {
+/// Batches timed at the calibrated iteration count. The fastest one is
+/// reported, so a burst of background load cannot inflate a row.
+const batches = 5;
+
+/// Doubles the iteration count until one batch of `batch(ctx, iters)`
+/// exceeds `target_ns`, times `batches` batches in all at that count and
+/// returns the fastest batch's ns per iteration.
+fn bestOf(io: std.Io, target_ns: i128, ctx: anytype, comptime batch: fn (@TypeOf(ctx), u64) void) f64 {
     var iters: u64 = 1;
+    var best: i128 = undefined;
     while (true) {
         const t0 = nowNs(io);
-        var acc: u64 = 0;
-        var i: u64 = 0;
-        while (i < iters) : (i += 1) acc +%= runOp(re, op, input, arena);
-        const ns = nowNs(io) - t0;
-        std.mem.doNotOptimizeAway(acc);
-        if (ns > calibrate_ns) return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters));
+        batch(ctx, iters);
+        best = nowNs(io) - t0;
+        if (best > target_ns) break;
         iters *= 2;
     }
+    var k: usize = 1;
+    while (k < batches) : (k += 1) {
+        const t0 = nowNs(io);
+        batch(ctx, iters);
+        best = @min(best, nowNs(io) - t0);
+    }
+    return @as(f64, @floatFromInt(best)) / @as(f64, @floatFromInt(iters));
+}
+
+const OpCtx = struct { re: *regex.Regexp, op: Op, input: []const u8, arena: *std.heap.ArenaAllocator };
+
+fn opBatch(c: OpCtx, iters: u64) void {
+    var acc: u64 = 0;
+    var i: u64 = 0;
+    while (i < iters) : (i += 1) acc +%= runOp(c.re, c.op, c.input, c.arena);
+    std.mem.doNotOptimizeAway(acc);
+}
+
+fn calibrate(io: std.Io, re: *regex.Regexp, op: Op, input: []const u8, arena: *std.heap.ArenaAllocator) f64 {
+    return bestOf(io, calibrate_ns, OpCtx{ .re = re, .op = op, .input = input, .arena = arena }, opBatch);
+}
+
+const CompileCtx = struct { gpa: std.mem.Allocator, pattern: []const u8 };
+
+fn compileBatch(c: CompileCtx, iters: u64) void {
+    var acc: u64 = 0;
+    var i: u64 = 0;
+    while (i < iters) : (i += 1) {
+        var re = regex.compile(c.gpa, c.pattern) catch |e| fail(e);
+        acc +%= re.numSubexp();
+        re.deinit();
+    }
+    std.mem.doNotOptimizeAway(acc);
 }
 
 fn calibrateCompile(io: std.Io, gpa: std.mem.Allocator, pattern: []const u8) f64 {
-    var iters: u64 = 1;
-    while (true) {
-        const t0 = nowNs(io);
-        var acc: u64 = 0;
-        var i: u64 = 0;
-        while (i < iters) : (i += 1) {
-            var re = regex.compile(gpa, pattern) catch |e| fail(e);
-            acc +%= re.numSubexp();
-            re.deinit();
-        }
-        const ns = nowNs(io) - t0;
-        std.mem.doNotOptimizeAway(acc);
-        if (ns > compile_target_ns) return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters));
-        iters *= 2;
-    }
+    return bestOf(io, compile_target_ns, CompileCtx{ .gpa = gpa, .pattern = pattern }, compileBatch);
 }

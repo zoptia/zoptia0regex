@@ -22,7 +22,7 @@ Head-to-head against Go's standard-library `regexp`: same patterns, same
 inputs, same 256 KB corpus, same calibration, Zig built `ReleaseFast`.
 
 <!-- BEGIN GENERATED: bench-headline -->
-Across 22 workloads the port's geometric-mean time is **0.43×** Go's (0.48× without the literal fast-path rows), and it compiles patterns in **0.69×** Go's time.
+Across 22 workloads the port's geometric-mean time is **0.43×** Go's (0.47× without the literal fast-path rows), and it compiles patterns in **0.77×** Go's time.
 <!-- END GENERATED: bench-headline -->
 
 And it doesn't trade correctness for speed: tens of thousands of

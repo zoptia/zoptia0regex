@@ -43,11 +43,16 @@ const compileTargetNs = 100_000_000
 // sink keeps every accumulated result observable.
 var sink uint64
 
-// calibrate doubles the iteration count until one batch exceeds target ns
-// and returns ns per call.
+// batches is how many batches are timed at the calibrated iteration count.
+// The fastest one is reported, so a burst of background load cannot inflate
+// a row.
+const batches = 5
+
+// calibrate doubles the iteration count until one batch exceeds target ns,
+// times batches batches in all at that count and returns the fastest
+// batch's ns per call.
 func calibrate(target int64, fn func() uint64) float64 {
-	iters := int64(1)
-	for {
+	run := func(iters int64) int64 {
 		start := time.Now()
 		var acc uint64
 		for i := int64(0); i < iters; i++ {
@@ -55,11 +60,18 @@ func calibrate(target int64, fn func() uint64) float64 {
 		}
 		ns := time.Since(start).Nanoseconds()
 		sink += acc
-		if ns > target {
-			return float64(ns) / float64(iters)
-		}
-		iters *= 2
+		return ns
 	}
+	iters := int64(1)
+	best := run(iters)
+	for best <= target {
+		iters *= 2
+		best = run(iters)
+	}
+	for k := 1; k < batches; k++ {
+		best = min(best, run(iters))
+	}
+	return float64(best) / float64(iters)
 }
 
 // runOp returns a value derived from one operation's full result; the Zig
